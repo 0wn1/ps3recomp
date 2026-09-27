@@ -361,9 +361,29 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
  * ListGet/ListSet properly when a title needs to pick an existing save; the
  * layouts are the only missing piece, and dispatch_func_stat next door is the
  * shape to copy. */
-static s32 dispatch_func_select(uint32_t func_opd, uint32_t dirCount,
-                                uint32_t userdata_ea, const char* who)
+/* List callback. The directory list is marshalled into the title's own
+ * CellSaveDataSetBuf (SDK: "dirList uses CellSaveDataSetBuf *buf"), and the
+ * directory the title picks is read back out of the GUEST CellSaveDataListSet:
+ * the callers used to inspect a host listSet nothing ever filled, so every
+ * List{Save,Load}2 with no existing saves returned NODATA -- Tornado
+ * Outbreak's "New Game" then showed "Unable to save game data".
+ *
+ * Guest layouts (sysutil_savedata.h, 32-bit pointers):
+ *   ListGet  { dirNum +0; dirListNum +4; dirList* +8; reserved[64] }
+ *   ListSet  { focusPosition +0; focusDirName* +4; fixedListNum +8;
+ *              fixedList* +12; newData* +16; reserved* +20 }
+ *   NewData  { iconPosition +0; dirName* +4; icon* +8; reserved* +12 }
+ *   DirList  { dirName[32]; listParam[8]; reserved[8] }  (48 bytes)
+ *   SetBuf   { dirListMax +0; fileListMax +4; reserved[6]; bufSize +32; buf* +36 }
+ *
+ * `selected` receives the chosen directory ("" when none): the first listed
+ * entry, else the new-save name, else the focus name. For a save with nothing
+ * listed the new-save name wins -- headless, there is no user to pick. */
+static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* dirList,
+                                uint32_t dirCount, uint32_t setBuf_ea, int is_save,
+                                uint32_t userdata_ea, const char* who, char selected[64])
 {
+    selected[0] = '\0';
     if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
 
     scratch_reset();
@@ -371,17 +391,43 @@ static s32 dispatch_func_select(uint32_t func_opd, uint32_t dirCount,
     uint32_t get_ea = scratch_alloc(SAVEDATA_STATGET_SIZE);
     uint32_t set_ea = scratch_alloc(SAVEDATA_STATSET_SIZE);
     if (!cb_ea || !get_ea || !set_ea) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
+    for (uint32_t i = 0; i < 24; i += 4) vm_write32(set_ea + i, 0);
+
+    uint32_t buf_ea = setBuf_ea ? vm_read32(setBuf_ea + 36) : 0;
+    uint32_t cap = setBuf_ea ? vm_read32(setBuf_ea + 32) / 48u : 0;
+    if (setBuf_ea && vm_read32(setBuf_ea + 0) < cap) cap = vm_read32(setBuf_ea + 0);
+    uint32_t listed = buf_ea ? (dirCount < cap ? dirCount : cap) : 0;
+    for (uint32_t i = 0; i < listed; i++)
+        for (uint32_t k = 0; k < 48; k++)
+            vm_write8(buf_ea + i * 48 + k, (uint8_t)((const char*)&dirList[i])[k]);
 
     marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata_ea);
     vm_write32(get_ea + 0, dirCount);        /* dirNum     */
-    vm_write32(get_ea + 4, 0);               /* dirListNum: nothing marshalled */
+    vm_write32(get_ea + 4, listed);          /* dirListNum */
+    vm_write32(get_ea + 8, listed ? buf_ea : 0);
 
-    printf("[cellSaveData] dispatching %s OPD=0x%08X (dirNum=%u)%c",
-           who, func_opd, dirCount, 10);
+    printf("[cellSaveData] dispatching %s OPD=0x%08X (dirNum=%u listed=%u)%c",
+           who, func_opd, dirCount, listed, 10);
     g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
 
     s32 result = marshal_cbresult_read_result(cb_ea);
-    printf("[cellSaveData] %s returned cbResult.result=%d%c", who, result, 10);
+    const uint32_t fixed_n = vm_read32(set_ea + 8), fixed = vm_read32(set_ea + 12);
+    const uint32_t newd = vm_read32(set_ea + 16), focus = vm_read32(set_ea + 4);
+    const uint32_t new_name = newd ? vm_read32(newd + 4) : 0;
+    uint32_t pick = 0;
+    if (is_save && new_name && fixed_n == 0) pick = new_name;
+    else if (fixed_n && fixed)               pick = fixed;
+    else if (new_name)                       pick = new_name;
+    else if (focus)                          pick = focus;
+    if (pick) {
+        for (int i = 0; i < 63; i++) {
+            selected[i] = (char)vm_read8(pick + (uint32_t)i);
+            if (!selected[i]) break;
+        }
+        selected[63] = '\0';
+    }
+    printf("[cellSaveData] %s returned cbResult.result=%d fixed=%u newData=%s -> '%s'%c",
+           who, result, fixed_n, new_name ? "yes" : "no", selected, 10);
     return result;
 }
 
@@ -890,26 +936,19 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
     CellSaveDataListSet listSet;
     memset(&listSet, 0, sizeof(listSet));
 
-    cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList,
-                                          listGet.dirListNum,
-                                          (uint32_t)(uintptr_t)userdata, "funcList");
+    char selectedDir[64];
+    cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList, dirList,
+                                          listGet.dirListNum, (uint32_t)(uintptr_t)setBuf, 1,
+                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
+    (void)listSet;
 
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
-
-    /* Determine selected directory name */
-    const char* selectedDir = NULL;
-    if (listSet.fixedList && listSet.fixedListNum > 0) {
-        selectedDir = listSet.fixedList[0].dirName;
-    } else if (listSet.focusDirName) {
-        selectedDir = listSet.focusDirName;
-    } else if (dirCount > 0) {
-        selectedDir = dirList[0].dirName;
-    }
-
-    if (!selectedDir || selectedDir[0] == '\0') {
+    if (!selectedDir[0] && dirCount > 0)
+        strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
+    if (!selectedDir[0]) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_NODATA;
     }
@@ -957,25 +996,19 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
     CellSaveDataListSet listSet;
     memset(&listSet, 0, sizeof(listSet));
 
-    cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList,
-                                          listGet.dirListNum,
-                                          (uint32_t)(uintptr_t)userdata, "funcList");
+    char selectedDir[64];
+    cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList, dirList,
+                                          listGet.dirListNum, (uint32_t)(uintptr_t)setBuf, 0,
+                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
+    (void)listSet;
 
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
-
-    const char* selectedDir = NULL;
-    if (listSet.fixedList && listSet.fixedListNum > 0) {
-        selectedDir = listSet.fixedList[0].dirName;
-    } else if (listSet.focusDirName) {
-        selectedDir = listSet.focusDirName;
-    } else if (dirCount > 0) {
-        selectedDir = dirList[0].dirName;
-    }
-
-    if (!selectedDir || selectedDir[0] == '\0') {
+    if (!selectedDir[0] && dirCount > 0)
+        strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
+    if (!selectedDir[0]) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_NODATA;
     }

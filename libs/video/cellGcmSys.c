@@ -875,6 +875,17 @@ static void nv3089_blit(void)
                            dl ? 0u : 1u, s_gcm2d.dst_offset + (s_nv3089.out_pt >> 16) * dst_pitch
                                          + (s_nv3089.out_pt & 0xFFFF) * 4u, dst_pitch,
                            out_w, out_h);
+    } else if (rsx_live_draw_enabled()) {
+        /* Scaled: a resolve. Copy it on the GPU into the display buffer; fall
+         * back to presenting the source when that cannot be done. */
+        const u32 sl = s_nv3089.src_dma != 0xFEED0001u ? 0u : 1u;
+        const u32 dl = s_gcm2d.dst_dma  != 0xFEED0001u ? 0u : 1u;
+        const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
+        const int rok = rsx_live_draw_resolve_blit(sl, s_nv3089.in_off + v0 * in_pitch + u0 * 4u, in_pitch,
+                                        s_nv3089.ds_dx, s_nv3089.dt_dy, dl, s_gcm2d.dst_offset,
+                                        dst_pitch, out_x, out_y, out_w, out_h);
+        if (!rok && s_nv3089.in_uv <= 0x00100010u && !s_nv3089.out_pt)
+            rsx_live_draw_note_resolve(sl, s_nv3089.in_off, dl, s_gcm2d.dst_offset);
     }
     /* Only the 32-bit colour formats are handled; anything else would need a
      * per-format converter and is better skipped loudly than written wrong. */
@@ -955,15 +966,38 @@ static void nv3089_blit(void)
     u32 src = cellGcmResolveLocated(src_local, s_nv3089.in_off);
     u32 dst = cellGcmResolveLocated(dst_local, s_gcm2d.dst_offset);
     u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 start */
+    /* Clip to SET_CLIP_POINT/SIZE (destination coordinates). A title tiling a
+     * resolve in 512x512 blocks relies on it to stop at the surface edge:
+     * Tornado Outbreak's bottom band is 512 rows tall with 208 left in the
+     * display buffer, and writing all 512 ran on into the VRAM after it --
+     * where its full-screen quad's vertices were staged, so the quad drew with
+     * all-zero positions. A zero clip size means unclipped. */
+    u32 cx0 = s_nv3089.clip_pt & 0xFFFF, cy0 = s_nv3089.clip_pt >> 16;
+    u32 cx1 = (s_nv3089.clip_sz & 0xFFFF) ? cx0 + (s_nv3089.clip_sz & 0xFFFF) : 0xFFFFFFFFu;
+    u32 cy1 = (s_nv3089.clip_sz >> 16)    ? cy0 + (s_nv3089.clip_sz >> 16)    : 0xFFFFFFFFu;
+    /* Bytes per pixel from the SDK enums (CELL_GCM_TRANSFER_SCALE_FORMAT_*:
+     * 7 = R5G6B5, 8 = Y8 -- not 32-bit as they were once labelled). When the
+     * destination surface format agrees it is a plain copy of that width; a
+     * real format conversion keeps the old 4-byte copy rather than guess. */
+    u32 sbpp = (f == 7) ? 2u : (f == 8) ? 1u : 4u;
+    u32 dbpp = (s_gcm2d.color_fmt == 4u /* R5G6B5 */) ? 2u
+             : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
+    u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
     for (u32 y = 0; y < out_h; y++) {
+        u32 dy = out_y + y;
+        if (dy < cy0 || dy >= cy1) continue;
         u64 sv = ((u64)v0 << 8) + (u64)y * s_nv3089.dt_dy;         /* 20.12 */
         u32 sy = (u32)(sv >> 20);
         for (u32 x = 0; x < out_w; x++) {
+            u32 dx = out_x + x;
+            if (dx < cx0 || dx >= cx1) continue;
             u64 su = ((u64)u0 << 8) + (u64)x * s_nv3089.ds_dx;
             u32 sx = (u32)(su >> 20);
-            u32 s = src + sy * in_pitch + sx * 4;
-            u32 d = dst + (out_y + y) * dst_pitch + (out_x + x) * 4;
-            vm_write32(d, vm_read32(s));
+            u32 s = src + sy * in_pitch + sx * bpp;
+            u32 d = dst + dy * dst_pitch + dx * bpp;
+            if (bpp == 4)      vm_write32(d, vm_read32(s));
+            else if (bpp == 2) vm_write16(d, vm_read16(s));
+            else               vm_write8(d, vm_read8(s));
         }
     }
     { static int _n = 0; static int cap = -1;
@@ -1966,9 +2000,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * There is nothing left to protect at that point. Recycling loses
          * whatever was written past the end; not recycling loses the rest of
          * the run. */
-        if (begin && end > begin && cur >= end) head_consumed = 1;
+        /* Only once the title has been SEEN to overrun. Near `end` is also
+         * where a title whose callback does recycle sits just before calling
+         * it: Tornado Outbreak's steps its context through 64 KB segments of a
+         * larger ring, and recycling under it from this thread rewound put/get
+         * behind its callback's bookkeeping -- which then waited forever for a
+         * GET that could not arrive. A callback that declines (AMGL's) always
+         * overruns first, so the first overrun is recycled by the path above
+         * and near-end recycling is enabled from then on. */
+        static int s_title_overran = 0;
+        if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
-                && head_consumed) {
+                && head_consumed && s_title_overran) {
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
                 u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;

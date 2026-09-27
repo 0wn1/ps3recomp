@@ -689,19 +689,7 @@ skip_inject: ;
           }
           if (held_n > 0) { held_n--;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF);
-              /* A held button also reads full pressure in press mode; titles
-               * that enable it (GH3) can key menus off the pressure words. */
-              static const struct { u16 bit; u8 off; } pm[] = {
-                  { 0x0020, CELL_PAD_BTN_OFFSET_PRESS_RIGHT }, { 0x0080, CELL_PAD_BTN_OFFSET_PRESS_LEFT },
-                  { 0x0010, CELL_PAD_BTN_OFFSET_PRESS_UP },    { 0x0040, CELL_PAD_BTN_OFFSET_PRESS_DOWN },
-                  { 0x1000, CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE }, { 0x2000, CELL_PAD_BTN_OFFSET_PRESS_CIRCLE },
-                  { 0x4000, CELL_PAD_BTN_OFFSET_PRESS_CROSS }, { 0x8000, CELL_PAD_BTN_OFFSET_PRESS_SQUARE },
-                  { 0x0400, CELL_PAD_BTN_OFFSET_PRESS_L1 },    { 0x0800, CELL_PAD_BTN_OFFSET_PRESS_R1 },
-                  { 0x0100, CELL_PAD_BTN_OFFSET_PRESS_L2 },    { 0x0200, CELL_PAD_BTN_OFFSET_PRESS_R2 } };
-              if (s_port_setting[port_no] & CELL_PAD_SETTING_PRESS_ON)
-                  for (unsigned k = 0; k < sizeof pm / sizeof pm[0]; k++)
-                      if (held_mask & pm[k].bit) data->button[pm[k].off] = 255; }
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
       } }
 
     /* Analog sticks */
@@ -712,13 +700,17 @@ skip_inject: ;
      * away to make out. Legit input simulation, same footing as YDKJ_INJECT_PAD. */
     { static int s_st = -1;
       static unsigned char s_v[4] = {128,128,128,128};
+      /* Optional 5th/6th fields: the seconds the hold starts and ends, so the menus
+       * before gameplay are not driven by it (PAD_STICK="128,0,128,128,300,320"). */
+      static double s_from = 0, s_until = 1e30; static unsigned long long s_t0 = 0;
+      if (!s_t0) s_t0 = GetTickCount64();
       if (s_st < 0) { const char* e = getenv("PAD_STICK");
         s_st = e ? 1 : 0;
         if (e) { int a=128,b=128,c=128,d=128;
-                 sscanf(e, "%d,%d,%d,%d", &a,&b,&c,&d);
+                 sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
                  s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
                  s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
-      if (s_st) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+      if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                   hs->connected = 1; }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
@@ -767,6 +759,27 @@ skip_inject: ;
         data->button[CELL_PAD_BTN_OFFSET_PRESS_R1]       = hs->press_r1;
         data->button[CELL_PAD_BTN_OFFSET_PRESS_L2]       = hs->trigger_l2;
         data->button[CELL_PAD_BTN_OFFSET_PRESS_R2]       = hs->trigger_r2;
+        /* A button whose digital bit is set reads full pressure. Injected
+         * input (PAD_FILE/PAD_SCRIPT/PAD_AUTOPRESS, keyboard) only sets the
+         * digital bits, and the host values above zeroed any pressure it had
+         * written -- so a title keying its menus off the pressure words (GH3,
+         * Tornado Outbreak's title screen) never saw the press. */
+        static const struct { u8 word; u8 bit; u8 off; } pm[] = {
+            { CELL_PAD_BTN_OFFSET_DIGITAL1, 0x20, CELL_PAD_BTN_OFFSET_PRESS_RIGHT },
+            { CELL_PAD_BTN_OFFSET_DIGITAL1, 0x80, CELL_PAD_BTN_OFFSET_PRESS_LEFT },
+            { CELL_PAD_BTN_OFFSET_DIGITAL1, 0x10, CELL_PAD_BTN_OFFSET_PRESS_UP },
+            { CELL_PAD_BTN_OFFSET_DIGITAL1, 0x40, CELL_PAD_BTN_OFFSET_PRESS_DOWN },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x10, CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x20, CELL_PAD_BTN_OFFSET_PRESS_CIRCLE },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x40, CELL_PAD_BTN_OFFSET_PRESS_CROSS },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x80, CELL_PAD_BTN_OFFSET_PRESS_SQUARE },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x04, CELL_PAD_BTN_OFFSET_PRESS_L1 },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x08, CELL_PAD_BTN_OFFSET_PRESS_R1 },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x01, CELL_PAD_BTN_OFFSET_PRESS_L2 },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x02, CELL_PAD_BTN_OFFSET_PRESS_R2 } };
+        for (unsigned k = 0; k < sizeof pm / sizeof pm[0]; k++)
+            if ((data->button[pm[k].word] & pm[k].bit) && data->button[pm[k].off] < 255)
+                data->button[pm[k].off] = 255;
     }
 
     /* Sensor data (only meaningful if SENSOR_ON) */

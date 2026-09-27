@@ -86,6 +86,10 @@ typedef struct raw_spu {
     uint32_t     int_mask;
     uint32_t     int_stat;
     volatile long started;      /* the host thread is live */
+    /* Contiguous LS runs filled by proxy GETs since the last start: a program
+     * streamed in this way is resolved by fingerprinting a run (raw_spu_start). */
+    uint32_t     get_lo[8], get_hi[8];
+    int          get_runs;
 #ifdef _WIN32
     HANDLE       thread;
 #endif
@@ -268,6 +272,18 @@ static DWORD WINAPI raw_spu_thread(LPVOID arg)
 static void raw_spu_start(raw_spu* s)
 {
     uint32_t n = (uint32_t)(s - s_spu);
+    /* No image was imported: the PPU streamed the program in by proxy DMA.
+     * Ports register each image's executable segment too (build_spu_workloads
+     * .text fingerprint), so one of the GET runs matches it. */
+    for (int r = 0; !s_pending_entry && r < s->get_runs; r++) {
+        uint64_t fp = spu_workload_fingerprint(vm_base + s->base + s->get_lo[r],
+                                               s->get_hi[r] - s->get_lo[r]);
+        s_pending_entry = spu_workload_find_img(fp, &s_pending_image_id);
+        fprintf(stderr, "[spu-raw] spu%u proxy-loaded LS 0x%05X..0x%05X fp=0x%016llX -> %s\n",
+                n, s->get_lo[r], s->get_hi[r], (unsigned long long)fp,
+                s_pending_entry ? "lifted entry registered" : "no match");
+    }
+    s->get_runs = 0;
     if (!s_pending_entry) {
         fprintf(stderr, "[spu-raw] spu%u run requested but no lifted image is "
                         "registered -- the SPU cannot run. Lift the image and "
@@ -413,8 +429,37 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
         }
         break;
 
+    case SPU_RAW_MFC_CLASS_CMD: {
+        /* MFC proxy command: the PPU DMAs to/from this SPU's local store. The
+         * guest writes LSA, EAH, EAL, Size_Tag, then Class_CMD, and reads
+         * Class_CMD back as MFC_CMDStatus until it is 0 (enqueued). Performed
+         * synchronously -- local store IS the window -- so the command is also
+         * already complete for any tag-status query that follows. Tornado
+         * Outbreak streams its raw-SPU program in 16 KB GETs this way, and
+         * spun forever on the echoed command word. */
+        uint32_t lsa  = be32_load(s->base + SPU_RAW_MFC_LSA) & (SPU_LS_SIZE - 1);
+        uint32_t ea   = be32_load(s->base + SPU_RAW_MFC_EAL);
+        uint32_t size = be32_load(s->base + SPU_RAW_MFC_SIZE_TAG) >> 16;
+        uint32_t cmd  = val & 0xFFFFu;
+        if (lsa + size > SPU_LS_SIZE) size = SPU_LS_SIZE - lsa;
+        uint8_t* ls = vm_base + s->base + lsa;
+        if (cmd & 0x40u) {                                      /* GET: EA -> LS */
+            memcpy(ls, vm_base + ea, size);
+            int r = 0;
+            while (r < s->get_runs && s->get_hi[r] != lsa) r++;
+            if (r < s->get_runs)   s->get_hi[r] += size;
+            else if (r < 8)      { s->get_lo[r] = lsa; s->get_hi[r] = lsa + size; s->get_runs++; }
+        }
+        else if (cmd & 0x20u) memcpy(vm_base + ea, ls, size);   /* PUT: LS -> EA */
+        if (dbg())
+            fprintf(stderr, "[spu-raw] spu%u proxy cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X\n",
+                    (unsigned)(s - s_spu), cmd, lsa, ea, size);
+        be32_store(s->base + SPU_RAW_MFC_CLASS_CMD, 0);         /* CMDStatus: success */
+        break;
+    }
+
     default:
-        break;   /* NPC and the MFC proxy registers are read back from memory */
+        break;   /* NPC and the other proxy registers are read back from memory */
     }
 }
 
@@ -422,7 +467,16 @@ int spu_raw_reg_load(uint32_t ea, uint32_t* out)
 {
     uint32_t off;
     raw_spu* s = spu_for(ea, &off);
-    if (!s || !s->ctx) return 0;
+    if (!s) return 0;
+
+    /* Proxy DMA is synchronous (see the Class_CMD store): the queue is always
+     * empty with all 16 slots free, and every queried tag is complete. Served
+     * before the ctx check -- the PPU loads the program before starting it. */
+    if (off == SPU_RAW_MFC_QSTATUS)   { *out = 0x80000010u; return 1; }
+    if (off == SPU_RAW_PRXY_TAGSTATUS) {
+        *out = be32_load(s->base + SPU_RAW_PRXY_QUERYMASK); return 1;
+    }
+    if (!s->ctx) return 0;
 
     /* Reading the outbound mailbox POPS it -- that is the whole handshake, and
      * it cannot be served out of memory. Everything else the SPU thread keeps
@@ -433,6 +487,16 @@ int spu_raw_reg_load(uint32_t ea, uint32_t* out)
      * moment it does -- the PPU would keep reading "no free slot", never send a
      * second word, and both sides would wait on each other forever. */
     if (off == SPU_RAW_MBOX_STATUS) {
+        /* A PPU spinning here waits on the SPU, and bypasses [HOTREAD] (this
+         * load never reaches memory), so report the SPU side of a long spin. */
+        { static PPU_THREAD_LOCAL unsigned n;
+          if (++n % 20000000u == 0)
+              fprintf(stderr, "[spu-raw] PPU spinning on spu%u Mbox_Stat: spu pc=0x%05X "
+                              "status=0x%X steps=%llu out=%u in=%u lr=0x%08X\n",
+                      (unsigned)(s - s_spu), (unsigned)(s->ctx->pc & SPU_LS_MASK),
+                      s->ctx->status, (unsigned long long)s->ctx->steps,
+                      (unsigned)s->ctx->ch_out_mbox.count, (unsigned)s->ctx->ch_in_mbox.count,
+                      g_active_ctx ? (uint32_t)g_active_ctx->lr : 0); }
         *out = MBOX_STATUS(s->ctx->ch_out_mbox.count,
                            SPU_IN_MBOX_FREE(s->ctx->ch_in_mbox.count),
                            s->ctx->ch_out_intr_mbox.count);

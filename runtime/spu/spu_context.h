@@ -180,6 +180,7 @@ typedef struct spu_channel {
     uint32_t count;   /* number of valid entries, 0..SPU_CHANNEL_CAP */
     uint32_t q[SPU_CHANNEL_CAP];
     uint32_t head;
+    volatile long lock;  /* spu_channel_write/read: producer and consumer are different host threads */
 } spu_channel;
 
 /* ---------------------------------------------------------------------------
@@ -646,9 +647,27 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
  * Channel read/write helpers
  * -----------------------------------------------------------------------*/
 /* `value` stays the head, and `count` the number of entries, so the many places
- * that read those two fields directly keep working unchanged. */
+ * that read those two fields directly keep working unchanged.
+ *
+ * Write and read are serialised by a per-channel spinlock. A mailbox has its
+ * producer and consumer on different host threads (PPU MMIO store vs the SPU's
+ * rdch), and unlocked `count++` / `count--` lose updates: Tornado Outbreak's
+ * raw SPU consumed one mailbox word while the PPU queued the next, count landed
+ * on 0 with a word still queued, and the PPU waited forever for a reply to a
+ * command the SPU never saw. The reader could also see the new count before
+ * the new value. Plain reads of `count` elsewhere stay lock-free. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define SPU_CH_LOCK(ch)   while (_InterlockedExchange(&(ch)->lock, 1)) _mm_pause()
+#define SPU_CH_UNLOCK(ch) _InterlockedExchange(&(ch)->lock, 0)
+#else
+#define SPU_CH_LOCK(ch)   while (__atomic_exchange_n(&(ch)->lock, 1, __ATOMIC_ACQUIRE)) {}
+#define SPU_CH_UNLOCK(ch) __atomic_store_n(&(ch)->lock, 0, __ATOMIC_RELEASE)
+#endif
+
 static inline void spu_channel_write(spu_channel* ch, uint32_t val)
 {
+    SPU_CH_LOCK(ch);
     if (ch->count >= SPU_CHANNEL_CAP) {
         /* Full. Hardware does not accept the write at all -- the sender polls
          * the free-slot count first -- so the NEW word is what is lost.
@@ -660,21 +679,25 @@ static inline void spu_channel_write(spu_channel* ch, uint32_t val)
          * looks plausible. The Orange Box sends CB.SPU a five-word descriptor
          * from five consecutive call sites -- one more than the mailbox is
          * deep -- so it meets this on every send. */
+        SPU_CH_UNLOCK(ch);
         return;
     }
     ch->q[(ch->head + ch->count) % SPU_CHANNEL_CAP] = val;
-    ch->count++;
     ch->value = ch->q[ch->head];
+    ch->count++;
+    SPU_CH_UNLOCK(ch);
 }
 
 static inline uint32_t spu_channel_read(spu_channel* ch)
 {
+    SPU_CH_LOCK(ch);
     uint32_t val = ch->value;
     if (ch->count) {
         ch->head = (ch->head + 1u) % SPU_CHANNEL_CAP;
+        if (ch->count > 1) ch->value = ch->q[ch->head];
         ch->count--;
-        if (ch->count) ch->value = ch->q[ch->head];
     }
+    SPU_CH_UNLOCK(ch);
     return val;
 }
 

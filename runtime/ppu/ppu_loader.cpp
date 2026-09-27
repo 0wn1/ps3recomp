@@ -1166,6 +1166,13 @@ extern "C" void ppu_guard_page(uint32_t guest_ea)
     s_guard_ea   = guest_ea;
     s_guard_page = ((uintptr_t)vm_base + guest_ea) & ~(uintptr_t)0xFFF;
     AddVectoredExceptionHandler(1, ppu_guard_veh);   /* runs before vm_commit_veh */
+    /* Commit first: VirtualProtect fails silently on a reserved page, and a
+     * page nothing has touched yet (VRAM, early in boot) is exactly that --
+     * the guard then reported "no writer" for a buffer that was written. */
+    /* The whole 64 KB demand-commit block: vm_commit_veh commits a block at a
+     * time on first touch, and doing so later re-commits this page read-write,
+     * silently disarming the guard. */
+    VirtualAlloc((void*)(s_guard_page & ~(uintptr_t)0xFFFF), 0x10000, MEM_COMMIT, PAGE_READWRITE);
     DWORD old;
     VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READONLY, &old);
     fprintf(stderr, "[GUARD] armed on guest 0x%08X (host page %p)\n", guest_ea, (void*)s_guard_page);

@@ -211,6 +211,7 @@ typedef struct {
 typedef struct {
     u32 location, offset, pitch, width, height;
     int valid;
+    int resolve_src;   /* surface slot + 1 a scaled blit resolves into this buffer; 0 = none */
 } display_buffer_t;
 typedef struct {
     u32 location, offset;
@@ -1373,6 +1374,10 @@ static void decode_render_state(render_state_t* rs)
     rs->df_rgb = df & 0xFFFF; rs->df_a = df >> 16;
     rs->eq_rgb = eq & 0xFFFF; rs->eq_a = eq >> 16;
     rs->depth_test  = rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1;
+    /* LD_NO_DEPTH=1: disable the depth test on every draw. A probe for draws
+     * that vanish -- Tornado Outbreak's UI text fails its depth test here (not
+     * yet understood), and this is how its menus are readable meanwhile. */
+    { static int nd = -1; if (nd < 0) nd = getenv("LD_NO_DEPTH") ? 1 : 0; if (nd) rs->depth_test = 0; }
     rs->depth_write = rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1;
     rs->depth_func  = rsx_dsp_reg(&g.rsx, M_DEPTH_FUNC);
     rs->cull_enable = rsx_dsp_reg(&g.rsx, M_CULL_FACE_ENABLE) & 1;
@@ -2307,16 +2312,21 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
          * carries the BIOS boot screen), so the question is whether decode
          * preserves it. remap is applied here, and a remap that zeroes channels
          * would produce exactly this. */
-        { static int td = -1; static int tdn = 0;
-          if (td < 0) td = getenv("LD_TEXRGBA_DUMP") ? 1 : 0;
+        { static int td = -1; static int tdn = 0; static u32 tdf = 0;
+          /* LD_TEXRGBA_DUMP=<hex fmt>: only that base format -- the 12-dump
+           * cap otherwise fills with whatever decodes first. */
+          if (td < 0) { const char* e = getenv("LD_TEXRGBA_DUMP");
+                        td = e ? 1 : 0; tdf = e ? (u32)strtoul(e, 0, 16) : 0; }
+          const int td_this = td && !(tdf > 1 && base_fmt != tdf);
           /* No size floor: the floor was picked for one title's full-screen
            * textures and silently skipped every UI atlas, which is the size
            * a 2D layer is made of. The dump is opt-in; dump what was asked. */
-          if (td && m == 0 && tdn < 12 && mw && mh) {
-              u64 nb = 0;
+          if (td_this && m == 0 && tdn < 12 && mw && mh) {
+              u64 nb = 0, na = 0;
               for (u32 q = 0; q < mw * mh; q++) {
                   const u8* px = rgba[n] + (size_t)q * 4;
                   if (px[0] || px[1] || px[2]) nb++;
+                  if (px[3] > 0x1A) na++;
               }
               char fn[160];
               snprintf(fn, sizeof fn, "scratch/tex_%02d_%ux%u_f%02X.ppm",
@@ -2329,9 +2339,9 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
                   fclose(tf);
               }
               fprintf(stderr, "[tex-rgba] %s fmt=0x%02X remap=0x%04X linear=%d"
-                              " pitch=%u nonblack=%llu/%u\n",
+                              " pitch=%u nonblack=%llu/%u alpha>0x1A=%llu\n",
                       fn, base_fmt, remap, linear, pitch,
-                      (unsigned long long)nb, mw * mh);
+                      (unsigned long long)nb, mw * mh, (unsigned long long)na);
               tdn++;
           } }
         levels[n].w = mw;
@@ -3014,6 +3024,116 @@ int rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
           n++;
       } }
     return r;
+}
+
+/* A SCALED NV3089 blit out of a live surface cannot be a CopyTextureRegion.
+ * The one that matters is a supersampled scene resolved into a display buffer
+ * (Tornado Outbreak renders 2x2 and downsamples into its scanout in 512x512
+ * tiles): the guest-memory copy moves black and the flip presented whatever
+ * surface happened to be current. When such a blit lands on a display buffer's
+ * origin, remember the source surface; the flip presents it (at the host
+ * surface's size) when the buffer has no live surface of its own.
+ * ponytail: scanout alias, not a real scaled copy -- a title that samples the
+ * resolved buffer as a texture still sees black; add a draw-based scaled blit
+ * then. */
+/* The copy half of a scaled resolve, done on the GPU. The source is a live
+ * surface the host renders at display size although the guest laid it out
+ * supersampled (Tornado Outbreak: pitch 10240 = 2560 guest pixels, host
+ * surface 1280x720), so a ds x dt guest downsample is a 1:1 copy in host
+ * pixels. Each tile lands in a live surface at the display buffer it writes
+ * into, so the flip presents a snapshot taken at resolve time -- presenting
+ * the source live (the alias below) showed whatever the title rendered into
+ * it next, and the menu flickered to black on two frames in three.
+ * Returns 1 when copied. */
+int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, u32 dt,
+                               u32 dst_loc, u32 dst_abs, u32 dst_pitch,
+                               u32 out_x, u32 out_y, u32 out_w, u32 out_h)
+{
+    if (!g.ready || !src_pitch || !dst_pitch || ds != dt || ds < 0x100000u) return 0;
+    /* Source surface and the rect's guest position inside it. */
+    /* The CLOSEST base at or below the address: surfaces' guest ranges
+     * overlap (a stale surface at 0x0 "contains" 0x12804 too), and taking the
+     * first match copied every 0x10000 tile out of that black surface. */
+    int si = -1; u32 gx = 0, gy = 0;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const surface_t* s = &g.surfaces[i];
+        if (!s->tex || s->location != src_loc || src_abs < s->offset) continue;
+        const u32 d = src_abs - s->offset;
+        if (d / src_pitch >= 2u * s->h) continue;
+        if (si >= 0 && g.surfaces[si].offset > s->offset) continue;
+        si = (int)i; gx = (d % src_pitch) / 4u; gy = d / src_pitch;
+    }
+    if (si < 0) return 0;
+    /* Destination: the display buffer this tile writes into. */
+    int bi = -1;
+    for (u32 b = 0; b < 8; b++) {
+        const display_buffer_t* d = &g.display_buffers[b];
+        if (d->valid && d->location == dst_loc && dst_abs >= d->offset &&
+            dst_abs < d->offset + d->pitch * d->height) { bi = (int)b; break; }
+    }
+    if (bi < 0) return 0;
+    const display_buffer_t* db = &g.display_buffers[bi];
+    const u32 dx = (dst_abs - db->offset) % db->pitch / 4u + out_x;
+    const u32 dy = (dst_abs - db->offset) / db->pitch + out_y;
+    const u32 slot = surface_get(db->location, db->offset, db->width, db->height, g.surfaces[si].fmt);
+    if (slot == LD_INVALID_SURFACE || (int)slot == si) return 0;
+    surface_t* dst = &g.surfaces[slot];
+    if (dst->fmt != g.surfaces[si].fmt) return 0;
+    /* Host source position: guest position over the downsample factor. */
+    const u32 k = ds >> 20;                       /* 20.12 fixed -> integer factor */
+    u32 sx = gx / (k ? k : 1), sy = gy / (k ? k : 1);
+    u32 w = out_w, h = out_h;
+    if (dx >= dst->w || dy >= dst->h || sx >= g.surfaces[si].w || sy >= g.surfaces[si].h) return 0;
+    if (dx + w > dst->w) w = dst->w - dx;
+    if (dy + h > dst->h) h = dst->h - dy;
+    if (sx + w > g.surfaces[si].w) w = g.surfaces[si].w - sx;
+    if (sy + h > g.surfaces[si].h) h = g.surfaces[si].h - sy;
+    ID3D12Resource* s = g.surfaces[si].tex;
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    for (int q = 0; q < 2; q++) {
+        b[q].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[q].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[q].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    b[0].Transition.pResource = s;        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource = dst->tex; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    D3D12_TEXTURE_COPY_LOCATION sl = {0}, dl = {0};
+    sl.pResource = s;        sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dl.pResource = dst->tex; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_BOX box = { sx, sy, 0, sx + w, sy + h, 1 };
+    g.list->lpVtbl->CopyTextureRegion(g.list, &dl, dx, dy, 0, &sl, &box);
+    for (int q = 0; q < 2; q++) {
+        b[q].Transition.StateBefore = b[q].Transition.StateAfter;
+        b[q].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+    ld_surface_note_write(slot, LD_SURFACE_WRITE_COPY);
+    if (s_csv_file && s_csv_gate_open) {
+        fprintf(s_csv_file, "#resolve,%u,%u:0x%X,%u:0x%X,%u,%u,%ux%u\n", g_ld_frames,
+                src_loc, src_abs, dst_loc, dst_abs, sx, sy, w, h);
+        fflush(s_csv_file);
+    }
+    return 1;
+}
+
+void rsx_live_draw_note_resolve(u32 src_loc, u32 src_abs, u32 dst_loc, u32 dst_abs)
+{
+    if (!g.ready) return;
+    for (u32 b = 0; b < 8; b++) {
+        display_buffer_t* d = &g.display_buffers[b];
+        if (!d->valid || d->location != dst_loc || d->offset != dst_abs) continue;
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            const surface_t* s = &g.surfaces[i];
+            if (s->tex && s->location == src_loc && s->offset == src_abs) {
+                if (d->resolve_src != (int)i + 1)
+                    fprintf(stderr, "[live-draw] display buffer %u resolves from surface %u (0x%X)\n",
+                            b, i, s->offset);
+                d->resolve_src = (int)i + 1;
+                return;
+            }
+        }
+    }
 }
 
 static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
@@ -4244,6 +4364,7 @@ static ID3D12PipelineState* get_pso(
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG decompile_begin = ld_profile_qpc();
 #endif
+    rsx_vp_set_branch_base(rsx_dsp_vp_start(&g.rsx));
     const int vi = masked_layout
         ? rsx_vp_decompile_compact_ex(
             vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
@@ -4302,8 +4423,15 @@ static ID3D12PipelineState* get_pso(
      * opposite fixes: the draws reach the GPU and the SAMPLED DATA is black, or
      * they never reach it and the accounting is wrong. Green separates them. */
     { static int fg = -1;
-      if (fg < 0) fg = getenv("LD_FORCE_GREEN") ? 1 : 0;
-      if (fg && fi > 0) {
+      /* LD_FORCE_GREEN=<pso key hex> limits it to one PSO. */
+      static u64 gk = 0;
+      if (fg < 0) { const char* e = getenv("LD_FORCE_GREEN"); fg = e ? 1 : 0;
+                    gk = e ? _strtoui64(e, 0, 16) : 0; if (gk == 1) gk = 0; }
+      if (fg && fi > 0 && (!gk || gk == live_legacy_pso_key())) {
+          /* The emulated alpha test discards before the return, so replacing
+           * only the return still showed nothing for a failing alpha. */
+          for (char* d = strstr(ps_hlsl, "discard;"); d; d = strstr(d, "discard;"))
+              memcpy(d, "        ", 8);
           char* r = strstr(ps_hlsl, "    return ");
           if (r) {
               char* semi = strchr(r, ';');
@@ -4319,6 +4447,15 @@ static ID3D12PipelineState* get_pso(
               }
           }
       } }
+    /* LD_FORCE_COL0=1: every vertex program outputs white COLOR0 -- separates
+     * "the VS computes a wrong colour" from everything downstream of it. */
+    /* LD_FORCE_COL0=<pso key hex> limits it to one PSO. */
+    { static int fc = -1; static u64 fk = 0;
+      if (fc < 0) { const char* e = getenv("LD_FORCE_COL0"); fc = e ? 1 : 0;
+                    fk = e ? _strtoui64(e, 0, 16) : 0; if (fk == 1) fk = 0; }
+      char* c0 = fc && vi > 0 && (!fk || fk == live_legacy_pso_key())
+                 ? strstr(vs_hlsl, "Out.col0 = o[1];") : NULL;
+      if (c0) memcpy(c0, "Out.col0=1+0*_p;", 16); }   /* same length, in place */
     /* LD_HLSL_DUMP=<dir>: files named by the PSO key the draw CSV prints. */
     { static const char* hd = (const char*)-1;
       if (hd == (const char*)-1) hd = getenv("LD_HLSL_DUMP");
@@ -6602,7 +6739,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               fprintf(stderr, "[pso-trace] frame=%u col=%02X%02X%02X%02X\n", g_ld_frames,
                       dc.inl[16], dc.inl[17], dc.inl[18], dc.inl[19]);
       }
-      if (tk && tn < 3 && live_legacy_pso_key() == tk) {
+      /* LD_TRACE_PSO_FROM=<frame>: the first three draws at or after that
+       * frame -- a PSO's first uses can predate the data it later draws. */
+      static long tfrom = -1;
+      if (tfrom < 0) { const char* e = getenv("LD_TRACE_PSO_FROM"); tfrom = e ? atol(e) : 0; }
+      if (tk && tn < 3 && live_legacy_pso_key() == tk && (long)g_ld_frames >= tfrom) {
           tn++;
           if (dc.inl) {
               fprintf(stderr, "[pso-trace] inline stride=%u bytes=%u:", dc.inl_stride, dc.inl_bytes);
@@ -6624,10 +6765,29 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               }
               fprintf(stderr, "\n");
           }
+          /* The raw array registers and base (the attrN lines above print the
+           * decoded offset only), and the constant colour a disabled attr3
+           * feeds -- the two things a draw that vanishes is usually missing. */
+          fprintf(stderr, "[pso-trace] vdata base_offset=0x%X base_index=%u raw attr0 off=0x%08X fmt=0x%08X\n",
+                  rsx_dsp_vertex_data_base_offset(&g.rsx), rsx_dsp_vertex_data_base_index(&g.rsx),
+                  rsx_dsp_reg(&g.rsx, 0x1680), rsx_dsp_reg(&g.rsx, 0x1740));
+          { float d3[4]; rsx_dsp_vertex_default(&g.rsx, 3, d3);
+            fprintf(stderr, "[pso-trace] attr3 const=%g %g %g %g\n", d3[0], d3[1], d3[2], d3[3]); }
+          /* Every non-zero transform constant (raw words), so the VS can be
+           * evaluated offline against exactly what this draw saw. */
+          for (u32 q = 0; q < 512; q++) {
+              const u32* w = g.rsx.constants[q];
+              if (!(w[0] | w[1] | w[2] | w[3])) continue;
+              fprintf(stderr, "[pso-const] %u %08X %08X %08X %08X\n", q, w[0], w[1], w[2], w[3]);
+          }
+          for (u32 ai = 0; ai < 16; ai++) {   /* the constant value each attribute falls back to */
+              float d[4]; rsx_dsp_vertex_default(&g.rsx, ai, d);
+              fprintf(stderr, "[pso-vdef] %u %g %g %g %g\n", ai, d[0], d[1], d[2], d[3]);
+          }
           { u32 fl = 0; const u32 fo = rsx_dsp_fragment_program(&g.rsx, &fl);
-            const u8* fp = guest_ptr(fl, fo, 16 * 8);
+            const u8* fp = guest_ptr(fl, fo, 16 * 16);
             if (fp) { fprintf(stderr, "[pso-trace] fp %u:0x%X:", fl, fo);
-                      for (u32 k = 0; k < 16 * 8; k++) fprintf(stderr, "%s%02X", (k & 15) ? "" : " ", fp[k]);
+                      for (u32 k = 0; k < 16 * 16; k++) fprintf(stderr, "%s%02X", (k & 15) ? "" : " ", fp[k]);
                       fprintf(stderr, "\n"); } }
           rsx_dsp_texture t0; rsx_dsp_get_texture(&g.rsx, 0, &t0);
           const u8* tp = guest_ptr(t0.location, t0.offset, 32);
@@ -7806,6 +7966,7 @@ void rsx_live_draw_set_display_buffer(
     display->width = width;
     display->height = height;
     display->valid = width && height;
+    display->resolve_src = 0;
     fprintf(stderr,
             "[live-draw] display buffer %u = loc%u:0x%08X pitch=%u %ux%u\n",
             buffer_id, location, offset, pitch, width, height);
@@ -8195,6 +8356,11 @@ static void ld_dump_texel_rgb(const u8* p, int fp16, u8* out)
     }
 }
 
+/* --record: when set, ld_dump_surface_ppm appends to this ffmpeg pipe instead
+ * of opening `path`, and skips its per-dump diagnostics (every frame goes
+ * through here while recording). */
+static FILE* g_ld_record_to;
+
 static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
 {
     ID3D12Resource* rt = surface ? surface->tex : NULL;
@@ -8247,13 +8413,13 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
     u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)rb_size};
     if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
         nonblack = 0;
-        {   /* raw texels, to tell an FP16 target from 8-bit data read as one */
+        if (!g_ld_record_to) {   /* raw texels, to tell an FP16 target from 8-bit data read as one */
             const u8* r0 = px + (SIZE_T)(height / 4) * pitch + (width / 4) * texel;
             fprintf(stderr, "[dump-raw] %s fmt=%d texel=%u bytes:", path, (int)surface->fmt, texel);
             for (u32 bi = 0; bi < 16; bi++) fprintf(stderr, " %02X", r0[bi]);
             fprintf(stderr, "\n");
         }
-        FILE* f = fopen(path, "wb");
+        FILE* f = g_ld_record_to ? g_ld_record_to : fopen(path, "wb");
         if (f) {
             fprintf(f, "P6\n%u %u\n255\n", width, height);
             for (u32 y = 0; y < height; y++) {
@@ -8267,8 +8433,10 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
                     fwrite(rgb, 1, 3, f);  /* RGBA->RGB */
                 }
             }
-            fclose(f);
-            fprintf(stderr, "[live-draw] wrote %s\n", path);
+            if (f != g_ld_record_to) {
+                fclose(f);
+                fprintf(stderr, "[live-draw] wrote %s\n", path);
+            }
         } else {
             for (u32 y = 0; y < height; y++) {
                 const u8* row = px + (SIZE_T)y * pitch;
@@ -8514,26 +8682,20 @@ void rsx_live_draw_present(u32 buffer_id)
      * want to see what is on screen. PrintWindow and CopyFromScreen both come
      * back white for a D3D12 swapchain, so a readback here is the only way to
      * answer "what is it actually drawing?". */
-    { static int every = -1; static const char* dir; static unsigned n;
-      if (every < 0) { dir = getenv("LD_FRAME_DUMP");
-                       const char* e = getenv("LD_FRAME_DUMP_EVERY");
-                       every = (dir && dir[0]) ? (e ? atoi(e) : 300) : 0;
-                       if (every <= 0 && dir && dir[0]) every = 300; }
-      if (every > 0 && buffer_id < 8 && g.display_buffers[buffer_id].valid &&
-          (n++ % (unsigned)every) == 0) {
-          for (u32 i = 0; i < g.n_surfaces; i++) {
-              if (g.surfaces[i].location != g.display_buffers[buffer_id].location ||
-                  g.surfaces[i].offset   != g.display_buffers[buffer_id].offset) continue;
-              char path[MAX_PATH * 2];
-              snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dir, n - 1u);
-              const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[i]);
-              fprintf(stderr, "[frame-dump] %s %ux%u nonblack=%llu\n", path,
-                      g.surfaces[i].w, g.surfaces[i].h,
-                      (unsigned long long)(nb == UINT64_MAX ? 0 : nb));
-              fflush(stderr);
-              break;
-          }
-      } }
+    /* The dump itself runs once the presented surface is known (below): a
+     * title that scans out through cellResc never matches a registered display
+     * buffer and presents the fallback surface, so matching here dumped nothing. */
+    static int dump_every = -1; static const char* dump_dir; static unsigned dump_n;
+    if (dump_every < 0) { dump_dir = getenv("LD_FRAME_DUMP");
+                          const char* e = getenv("LD_FRAME_DUMP_EVERY");
+                          dump_every = (dump_dir && dump_dir[0]) ? (e ? atoi(e) : 300) : 0;
+                          if (dump_every <= 0 && dump_dir && dump_dir[0]) dump_every = 300; }
+    /* LD_FRAME_DUMP_FROM=<frame>: start dumping there (dense captures of a
+     * late scene, e.g. frames for a GIF, without thousands of early files). */
+    static long dump_from = -1;
+    if (dump_from < 0) { const char* e = getenv("LD_FRAME_DUMP_FROM"); dump_from = e ? atol(e) : 0; }
+    const int dump_now = dump_every > 0 && (long)g_ld_frames >= dump_from &&
+                         (dump_n++ % (unsigned)dump_every) == 0;
     /* A flip names a registered display buffer. The current color target may
      * be an offscreen shadow/postprocess surface at that instant; copying it
      * caused a010 to present black despite executing the scene's draws. */
@@ -8548,6 +8710,10 @@ void rsx_live_draw_present(u32 buffer_id)
             }
         }
     }
+    if (target == LD_INVALID_SURFACE && buffer_id < 8 &&
+        g.display_buffers[buffer_id].valid && g.display_buffers[buffer_id].resolve_src > 0 &&
+        (u32)g.display_buffers[buffer_id].resolve_src <= g.n_surfaces)
+        target = (u32)g.display_buffers[buffer_id].resolve_src - 1;   /* see note_resolve */
     if (target == LD_INVALID_SURFACE) {
         target = current_surface();
         static u32 fallback_logs = 0;
@@ -8562,6 +8728,42 @@ void rsx_live_draw_present(u32 buffer_id)
         return;
     }
     g_ld_last_present_target = target;
+    if (dump_now) {
+        char path[MAX_PATH * 2];
+        snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dump_dir, dump_n - 1u);
+        const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[target]);
+        fprintf(stderr, "[frame-dump] %s %ux%u nonblack=%llu\n", path,
+                g.surfaces[target].w, g.surfaces[target].h,
+                (unsigned long long)(nb == UINT64_MAX ? 0 : nb));
+        fflush(stderr);
+    }
+    /* LD_RECORD=<out.mp4> (boot_main's --record): every presented frame, as
+     * PPM, into an ffmpeg pipe -- ffmpeg's image2pipe reads concatenated PPMs
+     * as a stream. Fragmented MP4 so a run that is killed rather than exiting
+     * still leaves a playable file. Frames are stamped at a fixed 30 fps, so
+     * playback speed is only right when the title presents at 30.
+     * ponytail: one blocking GPU readback per frame; a ring of readback
+     * buffers if recording ever has to run at full speed. */
+    { static FILE* rec = (FILE*)-1;
+      if (rec == (FILE*)-1) {
+          const char* out = getenv("LD_RECORD");
+          rec = NULL;
+          if (out && out[0]) {
+              char cmd[MAX_PATH * 2];
+              snprintf(cmd, sizeof(cmd),
+                       "ffmpeg -loglevel error -y -f image2pipe -framerate 30 -c:v ppm -i - "
+                       "-vf \"scale=trunc(iw/2)*2:trunc(ih/2)*2\" -pix_fmt yuv420p "
+                       "-movflags frag_keyframe+empty_moov \"%s\"", out);
+              rec = _popen(cmd, "wb");
+              fprintf(stderr, "[record] %s -> %s\n", rec ? "ffmpeg" : "FAILED to start ffmpeg", out);
+          }
+      }
+      if (rec) {
+          g_ld_record_to = rec;
+          ld_dump_surface_ppm(NULL, &g.surfaces[target]);
+          g_ld_record_to = NULL;
+          fflush(rec);
+      } }
     const u32 current = current_surface();
     surface_t* presented_surface = &g.surfaces[target];
     /* LD_PRESENT_DBG=1: is this surface actually finished? A surface whose last
