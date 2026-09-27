@@ -64,6 +64,7 @@
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) \
     X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFormatProperties) \
+    X(vkGetPhysicalDeviceFeatures) \
     X(vkCreateDevice) X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties)
 #define VK_DEVICE_FNS(X) \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkDeviceWaitIdle) \
@@ -181,6 +182,7 @@ typedef struct vk_state {
      * either way -- readback and the tests are unchanged -- and a present
      * additionally blits the frame into the window's swapchain. */
     int              eng_active;      /* the register-file engine drives us */
+    int              bc_ok;           /* textureCompressionBC enabled       */
     int              windowed;
     SDL_Window*      window;
     const char*      inst_exts[16];
@@ -1860,14 +1862,16 @@ static void vk_cb_present(void* ud, u32 buffer_id)
  * -------------------------------------------------------------------------*/
 #define VK_ENG_MAX_OBJ 2048          /* the engine's texture cache is 1024 */
 
-enum { VK_ENG_FREE = 0, VK_ENG_COLOR, VK_ENG_DEPTH, VK_ENG_TEXTURE };
+enum { VK_ENG_FREE = 0, VK_ENG_COLOR, VK_ENG_DEPTH, VK_ENG_TEXTURE, VK_ENG_VIEW };
 
 typedef struct vk_eng_obj {
     u8       kind;
     VkFormat fmt;
     u32      bpp;                    /* bytes per texel, 0 for depth     */
     u32      w, h;
-    vk_image im;
+    vk_image im;                     /* a VIEW owns only im.view            */
+    u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
+    u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
@@ -1892,7 +1896,10 @@ static VkFormat vk_eng_format(rsx_be_format f, u32* bpp)
     case RSX_BE_FMT_R16G16B16A16F: *bpp = 8;  return VK_FORMAT_R16G16B16A16_SFLOAT;
     case RSX_BE_FMT_R32F:          *bpp = 4;  return VK_FORMAT_R32_SFLOAT;
     case RSX_BE_FMT_R32G32B32A32F: *bpp = 16; return VK_FORMAT_R32G32B32A32_SFLOAT;
-    default:                       *bpp = 0;  return VK_FORMAT_UNDEFINED;  /* BC: later */
+    case RSX_BE_FMT_BC1:           *bpp = 8;  return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;  /* per block */
+    case RSX_BE_FMT_BC2:           *bpp = 16; return VK_FORMAT_BC2_UNORM_BLOCK;
+    case RSX_BE_FMT_BC3:           *bpp = 16; return VK_FORMAT_BC3_UNORM_BLOCK;
+    default:                       *bpp = 0;  return VK_FORMAT_UNDEFINED;
     }
 }
 
@@ -1913,14 +1920,14 @@ static vk_eng_obj* vk_eng_get(u32 handle, int kind)
 
 /* Copy `rows` rows of `w` texels from host memory into one level / layer of
  * an image that is in GENERAL. */
-static int vk_eng_upload(VkImage img, u32 layer, u32 mip, u32 w, u32 h, u32 bpp,
-                         const void* src, u32 row_bytes)
+static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
+                              size_t tight, u32 rows, const void* src, u32 row_bytes)
 {
-    const size_t tight = (size_t)w * bpp;
+    if (tight > row_bytes) tight = row_bytes;
     vk_buffer st = {0};
-    if (vk_create_host_buffer(&st, (VkDeviceSize)tight * h, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
+    if (vk_create_host_buffer(&st, (VkDeviceSize)tight * rows, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
         !st.coherent) { vk_destroy_buffer(&st); return -1; }
-    for (u32 y = 0; y < h; y++)
+    for (u32 y = 0; y < rows; y++)
         memcpy((u8*)st.ptr + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
     int rc = vk_begin();
     if (!rc) {
@@ -1936,6 +1943,46 @@ static int vk_eng_upload(VkImage img, u32 layer, u32 mip, u32 w, u32 h, u32 bpp,
     return rc;
 }
 
+static int vk_eng_upload(VkImage img, u32 layer, u32 mip, u32 w, u32 h, u32 bpp,
+                         const void* src, u32 row_bytes)
+{
+    return vk_eng_upload_rows(img, layer, mip, w, h, (size_t)w * bpp, h, src, row_bytes);
+}
+
+/* NV4097 TEXTURE_CONTROL1 crossbar as a Vulkan component mapping: the shared
+ * rsx_texture_component_remap() gives, in A,R,G,B order, which uploaded
+ * channel (0..3 = R,G,B,A) or constant each output takes -- the table the
+ * Metal backend's swizzle_sel reads. */
+static VkComponentSwizzle vk_remap_sel(u8 sel)
+{
+    switch (sel) {
+    case 0: return VK_COMPONENT_SWIZZLE_R;
+    case 1: return VK_COMPONENT_SWIZZLE_G;
+    case 2: return VK_COMPONENT_SWIZZLE_B;
+    case 3: return VK_COMPONENT_SWIZZLE_A;
+    case RSX_REMAP_ONE: return VK_COMPONENT_SWIZZLE_ONE;
+    default: return VK_COMPONENT_SWIZZLE_ZERO;
+    }
+}
+static VkComponentMapping vk_remap(u32 remap, u32 rsx_fmt)
+{
+    u8 sel[4];
+    rsx_texture_component_remap(remap, rsx_fmt & 0x9Fu, sel);
+    VkComponentMapping m = { vk_remap_sel(sel[1]), vk_remap_sel(sel[2]),
+                             vk_remap_sel(sel[3]), vk_remap_sel(sel[0]) };
+    return m;
+}
+static int vk_eng_make_view(VkImage img, VkFormat fmt, u32 levels, VkComponentMapping map,
+                            VkImageView* out)
+{
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt, .components = map,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels ? levels : 1, 0, 1 },
+    };
+    return pvkCreateImageView(s_vk.device, &vci, NULL, out) == VK_SUCCESS ? 0 : -1;
+}
+
 static int vk_eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
@@ -1948,7 +1995,14 @@ static void vk_eng_release(void* user, u32 handle)
 {
     (void)user;
     if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE) return;
-    if (s_eobj[handle].kind != VK_ENG_TEXTURE) vk_eng_drop_framebuffers();
+    if (s_eobj[handle].kind == VK_ENG_COLOR)
+        for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
+            if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
+                vk_destroy_image(&s_eobj[i].im);
+                memset(&s_eobj[i], 0, sizeof s_eobj[i]);
+            }
+    if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
+        vk_eng_drop_framebuffers();
     vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
 }
@@ -2123,15 +2177,93 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
     vk_destroy_buffer(&st);
 }
 
-/* E1 stubs: the next stages fill these in. */
+/* ---- E3: textures ---------------------------------------------------------
+ * The engine decodes every level to host rows (rsx_texture_decode) and hands
+ * them over one upload each; the crossbar is a property of the view, so it
+ * becomes the image view's component mapping. Cube maps are not handled yet:
+ * the pixel decompiler declares cube units as separate bindings, which the
+ * shared set layout does not have, so faces == 6 reports 0 (placeholder). */
 static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                                  u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
-{ (void)user; (void)fmt; (void)w; (void)h; (void)mips; (void)faces; (void)remap; (void)rsx_fmt; return 0; }
+{
+    (void)user;
+    u32 bpp;
+    const VkFormat vf = vk_eng_format(fmt, &bpp);
+    const int bc = (fmt == RSX_BE_FMT_BC1 || fmt == RSX_BE_FMT_BC2 || fmt == RSX_BE_FMT_BC3);
+    if (vf == VK_FORMAT_UNDEFINED || !w || !h || w > 4096u || h > 4096u || (bc && !s_vk.bc_ok))
+        return 0;
+    if (faces == 6) {
+        static int warned_cube;
+        if (!warned_cube) { VK_LOG("engine: cube textures not supported yet\n"); warned_cube = 1; }
+        return 0;
+    }
+    if (!mips) mips = 1;
+    const u32 hd = vk_eng_alloc();
+    if (!hd) return 0;
+    vk_eng_obj* o = &s_eobj[hd];
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = vf, .extent = { w, h, 1 }, .mipLevels = mips, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    VkMemoryRequirements req;
+    u32 type;
+    if (pvkCreateImage(s_vk.device, &ici, NULL, &o->im.img) != VK_SUCCESS) goto fail;
+    pvkGetImageMemoryRequirements(s_vk.device, o->im.img, &req);
+    if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type) &&
+        vk_find_memory_type(req.memoryTypeBits, 0, &type)) goto fail;
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = req.size, .memoryTypeIndex = type };
+    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS ||
+        pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, 0) != VK_SUCCESS ||
+        vk_eng_make_view(o->im.img, vf, mips, vk_remap(remap, rsx_fmt), &o->im.view))
+        goto fail;
+    o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h;
+    o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
+    /* UNDEFINED -> GENERAL for every level before the uploads arrive. */
+    if (vk_begin()) goto fail;
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (vk_submit_and_wait()) goto fail;
+    return hd;
+fail:
+    vk_destroy_image(&o->im);
+    memset(o, 0, sizeof *o);
+    return 0;
+}
+
 static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u32 w, u32 h,
                                   const void* src, u32 row_bytes, u32 rows)
-{ (void)user; (void)texture; (void)face; (void)mip; (void)w; (void)h; (void)src; (void)row_bytes; (void)rows; }
+{
+    (void)user;
+    vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
+    if (!o || !src || !row_bytes || !rows || face) return;
+    /* A BC row is a row of 4x4 blocks; the engine's `rows` already counts them. */
+    const size_t tight = o->block ? (size_t)((w + 3u) / 4u) * o->block : (size_t)w * o->bpp;
+    vk_eng_upload_rows(o->im.img, 0, mip, w, h, tight, rows, src, row_bytes);
+}
+
+/* A colour target sampled with a unit's crossbar: an extra view of the same
+ * image, cached by (surface, crossbar, format) and released with the target. */
 static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
-{ (void)user; (void)surface; (void)remap; (void)rsx_format; return 0; }
+{
+    (void)user;
+    vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
+    if (!t) return 0;
+    for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
+        if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == surface &&
+            s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format)
+            return i;
+    const u32 hd = vk_eng_alloc();
+    if (!hd) return 0;
+    vk_eng_obj* o = &s_eobj[hd];
+    if (vk_eng_make_view(t->im.img, t->fmt, 1, vk_remap(remap, rsx_format), &o->im.view)) {
+        memset(o, 0, sizeof *o); return 0;
+    }
+    o->kind = VK_ENG_VIEW; o->fmt = t->fmt; o->w = t->w; o->h = t->h;
+    o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
+    return hd;
+}
 static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
 { (void)user; (void)depth; (void)w; (void)h; return 0; }
 /* ---- E2: pipelines and draws ---------------------------------------------
@@ -2180,6 +2312,10 @@ static struct {
     vk_buffer    indices;
     u32          warned;
 } s_e2;
+
+#define VK_ENG_SAMP_CACHE 64
+static struct { u64 key; VkSampler s; } s_esamp[VK_ENG_SAMP_CACHE];
+static u32 s_esamp_count;
 
 static void vk_eng_drop_framebuffers(void)
 {
@@ -2441,6 +2577,8 @@ static void vk_eng2_shutdown(void* user)
     vk_destroy_image(&s_e2.scratch_depth);
     vk_destroy_buffer(&s_e2.indices);
     memset(&s_e2, 0, sizeof s_e2);
+    for (u32 i = 0; i < s_esamp_count; i++) pvkDestroySampler(s_vk.device, s_esamp[i].s, NULL);
+    s_esamp_count = 0;
 }
 
 /* Constants go straight into the shared UBO: vertex at 0, pixel at ps_off.
@@ -2545,6 +2683,46 @@ static int vk_eng_ensure_indices(VkDeviceSize bytes)
     return s_e2.indices.coherent ? 0 : -1;
 }
 
+/* rsx_be_sampler_desc is the registers decoded the D3D12 way; the wrap codes
+ * stay the guest's 1..8, which vk_gcm_wrap already translates. */
+static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
+{
+    u32 lo, hi;
+    memcpy(&lo, &d->min_lod, 4); memcpy(&hi, &d->max_lod, 4);
+    const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1) | ((u64)d->mip_linear << 2)
+                  | ((u64)d->mip_present << 3) | ((u64)(d->wrap_s & 0xF) << 4)
+                  | ((u64)(d->wrap_t & 0xF) << 8) | ((u64)(d->wrap_r & 0xF) << 12)
+                  | ((u64)(lo >> 16) << 16) | ((u64)(hi >> 16) << 32);
+    for (u32 i = 0; i < s_esamp_count; i++) if (s_esamp[i].key == key) return s_esamp[i].s;
+    if (s_esamp_count >= VK_ENG_SAMP_CACHE) return s_vk.sampler;
+    float min_lod = d->min_lod, max_lod = d->mip_present ? d->max_lod : d->min_lod;
+    if (max_lod < min_lod) max_lod = min_lod;
+    VkSamplerCreateInfo sci = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = d->mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .minFilter = d->min_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .mipmapMode = d->mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = vk_gcm_wrap(d->wrap_s), .addressModeV = vk_gcm_wrap(d->wrap_t),
+        .addressModeW = vk_gcm_wrap(d->wrap_r),
+        .minLod = min_lod, .maxLod = max_lod,
+        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK };
+    VkSampler smp;
+    if (pvkCreateSampler(s_vk.device, &sci, NULL, &smp) != VK_SUCCESS) return s_vk.sampler;
+    s_esamp[s_esamp_count].key = key;
+    s_esamp[s_esamp_count++].s = smp;
+    return smp;
+}
+
+/* The view a bound engine handle samples through: an uploaded texture, a
+ * colour target (bound directly when surface_view was not asked), or a view. */
+static VkImageView vk_eng_sample_view(u32 handle)
+{
+    if (!handle || handle >= VK_ENG_MAX_OBJ) return VK_NULL_HANDLE;
+    const vk_eng_obj* o = &s_eobj[handle];
+    return (o->kind == VK_ENG_TEXTURE || o->kind == VK_ENG_COLOR || o->kind == VK_ENG_VIEW)
+               ? o->im.view : VK_NULL_HANDLE;
+}
+
 static void vk_eng_write_descriptors(void)
 {
     VkDescriptorBufferInfo bi[2] = {
@@ -2553,8 +2731,10 @@ static void vk_eng_write_descriptors(void)
     };
     VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
-        ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, s_vk.dummy.view, VK_IMAGE_LAYOUT_GENERAL };
-        si[u] = (VkDescriptorImageInfo){ s_vk.sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+        VkImageView v = ((s_e2.tex_mask >> u) & 1u) ? vk_eng_sample_view(s_e2.tex[u]) : VK_NULL_HANDLE;
+        VkSampler smp = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
+        ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, v ? v : s_vk.dummy.view, VK_IMAGE_LAYOUT_GENERAL };
+        si[u] = (VkDescriptorImageInfo){ smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
     }
     VkWriteDescriptorSet w[4] = {
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
@@ -2746,10 +2926,18 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                                     .queueFamilyIndex = s_vk.queue_family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
     static const char* dev_exts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    /* DXT (BC1-3) is how PS3 titles ship most textures; Vulkan gates it
+     * behind a feature, enabled only when the device reports it. */
+    VkPhysicalDeviceFeatures have, want;
+    memset(&want, 0, sizeof want);
+    pvkGetPhysicalDeviceFeatures(s_vk.phys, &have);
+    want.textureCompressionBC = have.textureCompressionBC;
+    s_vk.bc_ok = have.textureCompressionBC ? 1 : 0;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
-                               .ppEnabledExtensionNames = s_vk.windowed ? dev_exts : NULL };
+                               .ppEnabledExtensionNames = s_vk.windowed ? dev_exts : NULL,
+                               .pEnabledFeatures = &want };
     VK_CHECK(pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device), "vkCreateDevice");
     if (vk_load_device_functions()) return -1;
     if (s_vk.windowed && vk_load_wsi_device_functions())
