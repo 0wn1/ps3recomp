@@ -2001,6 +2001,11 @@ static void vk_eng_release(void* user, u32 handle)
                 vk_destroy_image(&s_eobj[i].im);
                 memset(&s_eobj[i], 0, sizeof s_eobj[i]);
             }
+    if (s_eobj[handle].kind == VK_ENG_DEPTH && s_eobj[handle].surface) {
+        const u32 snap = s_eobj[handle].surface;
+        s_eobj[handle].surface = 0;
+        if (vk_eng_get(snap, VK_ENG_TEXTURE)) vk_eng_release(user, snap);
+    }
     if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
         vk_eng_drop_framebuffers();
     vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
@@ -2264,8 +2269,78 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
     return hd;
 }
+/* ---- E4: depth snapshots --------------------------------------------------
+ * A depth target read as a texture, which the engine asks for only after a
+ * depth-writing draw. Metal resolves it with a fullscreen pass into R32Float;
+ * Vulkan can do it with two copies on the GPU, since a D32_SFLOAT depth
+ * aspect copies out as 32-bit floats: depth -> buffer -> an R32_SFLOAT
+ * texture. Other depth formats would need a conversion pass: they report 0.
+ *
+ * Each depth target keeps ONE snapshot texture (its handle in `surface`),
+ * refilled on every request, so nothing accumulates however often the engine
+ * invalidates and asks again; it goes when the depth target goes. */
 static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
-{ (void)user; (void)depth; (void)w; (void)h; return 0; }
+{
+    vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
+    if (!z) return 0;
+    if (s_vk.depth_format != VK_FORMAT_D32_SFLOAT) {
+        static int warned_fmt;
+        if (!warned_fmt) { VK_LOG("engine: depth snapshots need D32_SFLOAT, this device uses %d\n",
+                                  (int)s_vk.depth_format); warned_fmt = 1; }
+        return 0;
+    }
+    if (w > z->w) w = z->w;
+    if (h > z->h) h = z->h;
+    if (!w || !h) return 0;
+
+    u32 snap = z->surface;
+    vk_eng_obj* t = vk_eng_get(snap, VK_ENG_TEXTURE);
+    if (!t || t->w != w || t->h != h) {
+        if (t) vk_eng_release(user, snap);
+        z->surface = 0;
+        snap = vk_eng_alloc();
+        if (!snap) return 0;
+        t = &s_eobj[snap];
+        if (vk_create_image(&t->im, VK_FORMAT_R32_SFLOAT, w, h,
+                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT)) {
+            vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
+        }
+        t->kind = VK_ENG_TEXTURE; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = w; t->h = h;
+        z = vk_eng_get(depth, VK_ENG_DEPTH);          /* same slot; reload for clarity */
+        z->surface = snap;
+        if (vk_begin()) return 0;
+        vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+        if (vk_submit_and_wait()) return 0;
+    }
+
+    vk_buffer st = {0};
+    if (vk_create_host_buffer(&st, (VkDeviceSize)w * h * 4u,
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+        vk_destroy_buffer(&st); return 0;
+    }
+    int rc = vk_begin();
+    if (!rc) {
+        vk_barrier_image(z->im.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        VkBufferImageCopy out = { .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+                                  .imageExtent = { w, h, 1 } };
+        pvkCmdCopyImageToBuffer(s_vk.cmd, z->im.img, VK_IMAGE_LAYOUT_GENERAL, st.buf, 1, &out);
+        VkBufferMemoryBarrier bb = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = st.buf, .offset = 0, .size = VK_WHOLE_SIZE };
+        pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, 0, NULL, 1, &bb, 0, NULL);
+        VkBufferImageCopy in = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                 .imageExtent = { w, h, 1 } };
+        pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+        rc = vk_submit_and_wait();
+    }
+    vk_destroy_buffer(&st);
+    return rc ? 0 : snap;
+}
 /* ---- E2: pipelines and draws ---------------------------------------------
  * A pipeline handle carries the two translated modules and the render state
  * the engine keyed it on. Topology is not part of that key (Metal sets it on
