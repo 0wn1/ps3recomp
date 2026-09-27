@@ -37,6 +37,9 @@
 #include "rsx_vulkan_backend.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include "rsx_vp_decompiler.h"
+#include "rsx_fp_decompiler.h"
+#include "rsx_shader_spirv.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
@@ -151,9 +154,9 @@ typedef struct vk_state {
     VkPipeline       pipelines[VK_PIPELINE_SLOTS];
     VkSampler        sampler;
 
-    vk_image         tex;             /* texture unit 0 (or the dummy)   */
-    u32              tex_w, tex_h;
-    int              tex_ready;       /* a guest texture is bound        */
+    vk_image         dummy;           /* 1x1 magenta: "nothing bound"    */
+    vk_image         tex[RSX_MAX_TEXTURES];   /* decoded guest textures  */
+    int              tex_ready[RSX_MAX_TEXTURES];
 
     vk_buffer        vertices;        /* expanded triangle list          */
     vk_vertex*       cpu_verts;
@@ -480,7 +483,9 @@ static void vk_barrier_image(VkImage img, VkImageAspectFlags aspect, VkImageLayo
  * -------------------------------------------------------------------------*/
 static void vk_write_texture_descriptor(void)
 {
-    VkDescriptorImageInfo ii = { .sampler = s_vk.sampler, .imageView = s_vk.tex.view,
+    VkDescriptorImageInfo ii = { .sampler = s_vk.sampler,
+                                 .imageView = s_vk.tex_ready[0] ? s_vk.tex[0].view
+                                                                : s_vk.dummy.view,
                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
     VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                                .dstSet = s_vk.desc_set, .dstBinding = 0,
@@ -490,8 +495,8 @@ static void vk_write_texture_descriptor(void)
     pvkUpdateDescriptorSets(s_vk.device, 1, &w, 0, NULL);
 }
 
-/* Replace texture unit 0 with w*h RGBA8 texels (tightly packed). */
-static int vk_upload_texture(const u8* rgba, u32 w, u32 h)
+/* Replace *dst with a w*h image of RGBA8 texels (tightly packed). */
+static int vk_upload_texture(vk_image* dst, const u8* rgba, u32 w, u32 h)
 {
     vk_buffer staging = {0};
     if (vk_create_host_buffer(&staging, (VkDeviceSize)w * h * 4u,
@@ -519,11 +524,17 @@ static int vk_upload_texture(const u8* rgba, u32 w, u32 h)
     vk_destroy_buffer(&staging);
     if (rc) { vk_destroy_image(&fresh); return -1; }
 
-    vk_destroy_image(&s_vk.tex);    /* idle: every submission is waited on */
-    s_vk.tex = fresh;
-    s_vk.tex_w = w; s_vk.tex_h = h;
-    vk_write_texture_descriptor();
+    vk_destroy_image(dst);          /* idle: every submission is waited on */
+    *dst = fresh;
     return 0;
+}
+
+/* Unit `unit` has nothing usable bound. The fallback path's descriptor only
+ * ever shows unit 0, so only that one needs rewriting. */
+static void vk_tex_off(u32 unit)
+{
+    s_vk.tex_ready[unit] = 0;
+    if (unit == 0) vk_write_texture_descriptor();
 }
 
 /* Same decode as the headless null backend (rsx_null_backend.c,
@@ -531,31 +542,31 @@ static int vk_upload_texture(const u8* rgba, u32 w, u32 h)
 static void vk_cb_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
 {
     (void)ud;
-    if (unit != 0 || !t || !s_vk.device) return;
-    if (!(t->control0 & 0x80000000u) || !t->offset) { s_vk.tex_ready = 0; return; }
+    if (unit >= RSX_MAX_TEXTURES || !t || !s_vk.device) return;
+    if (!(t->control0 & 0x80000000u) || !t->offset) { vk_tex_off(unit); return; }
 
     u32 w = (t->image_rect >> 16) & 0xFFFFu;
     u32 h =  t->image_rect        & 0xFFFFu;
-    if (!w || !h || w > 4096u || h > 4096u) { s_vk.tex_ready = 0; return; }
+    if (!w || !h || w > 4096u || h > 4096u) { vk_tex_off(unit); return; }
 
     u32 ea = cellGcmResolveLocated((t->format & 3u) == 1u, t->offset);
-    if (!vm_base || ea == 0xFFFFFFFFu) { s_vk.tex_ready = 0; return; }
+    if (!vm_base || ea == 0xFFFFFFFFu) { vk_tex_off(unit); return; }
     const u32 fmt = (t->format >> 8) & 0xFFu;
 
     rsx_tex_layout tl;
     rsx_texture_layout(fmt, w, h, &tl);
-    if (tl.compressed) { s_vk.tex_ready = 0; return; }   /* no BC path yet */
+    if (tl.compressed) { vk_tex_off(unit); return; }   /* no BC path yet */
 
     const u32 pitch = w * 4u;
     u8* buf = (u8*)malloc((size_t)pitch * h);
-    if (!buf) { s_vk.tex_ready = 0; return; }
+    if (!buf) { vk_tex_off(unit); return; }
 
     if (tl.fmt == RSX_TEXFMT_R8G8B8A8) {
         rsx_texture_decode(buf, pitch, vm_base + ea, w, h, &tl, rsx_texture_argb_is_rgba());
     } else {
         u32 srcp = tl.row_bytes;
         u8* tmp = (u8*)malloc((size_t)srcp * h);
-        if (!tmp) { free(buf); s_vk.tex_ready = 0; return; }
+        if (!tmp) { free(buf); vk_tex_off(unit); return; }
         rsx_texture_decode(tmp, srcp, vm_base + ea, w, h, &tl, 0);
         for (u32 y = 0; y < h; y++)
             for (u32 x = 0; x < w; x++) {
@@ -568,8 +579,9 @@ static void vk_cb_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
             }
         free(tmp);
     }
-    s_vk.tex_ready = vk_upload_texture(buf, w, h) == 0;
+    s_vk.tex_ready[unit] = vk_upload_texture(&s_vk.tex[unit], buf, w, h) == 0;
     free(buf);
+    if (unit == 0) vk_write_texture_descriptor();
 }
 
 /* ---------------------------------------------------------------------------
@@ -687,7 +699,9 @@ static int vk_create_pipeline_objects(void)
     /* A 1x1 magenta dummy keeps the descriptor valid before any bind --
      * the same "not bound" colour the null backend's sampler returns. */
     static const u8 magenta[4] = { 0xFF, 0x00, 0xFF, 0xFF };
-    return vk_upload_texture(magenta, 1, 1);
+    if (vk_upload_texture(&s_vk.dummy, magenta, 1, 1)) return -1;
+    vk_write_texture_descriptor();
+    return 0;
 }
 
 /* NV4097 depth function is the GL enum 0x200 NEVER .. 0x207 ALWAYS, which is
@@ -798,31 +812,35 @@ static void vk_emit_tri(const rsx_state* st, u32 i0, u32 i1, u32 i2)
     for (int k = 0; k < 3; k++) vk_push_vertex(p[k], col, uv[k]);
 }
 
+/* Called once per expanded triangle: the fixed-function path records the
+ * null backend's flat-shaded vertex, the guest path all sixteen attributes. */
+typedef void (*vk_tri_fn)(const rsx_state* st, u32 i0, u32 i1, u32 i2);
+
 /* Primitive expansion, identical to the null backend's draw_prim(). */
-static void vk_expand(const rsx_state* st, u32 prim, u32 first, u32 count)
+static void vk_expand(const rsx_state* st, u32 prim, u32 first, u32 count, vk_tri_fn emit)
 {
     switch (prim) {
     case RSX_PRIMITIVE_TRIANGLES:
-        for (u32 i = 0; i + 2 < count; i += 3) vk_emit_tri(st, first + i, first + i + 1, first + i + 2);
+        for (u32 i = 0; i + 2 < count; i += 3) emit(st, first + i, first + i + 1, first + i + 2);
         break;
     case RSX_PRIMITIVE_TRIANGLE_STRIP:
         for (u32 i = 0; i + 2 < count; i++)
-            vk_emit_tri(st, first + i, first + i + 1 + (i & 1), first + i + 2 - (i & 1));
+            emit(st, first + i, first + i + 1 + (i & 1), first + i + 2 - (i & 1));
         break;
     case RSX_PRIMITIVE_TRIANGLE_FAN:
     case RSX_PRIMITIVE_POLYGON:
-        for (u32 i = 1; i + 1 < count; i++) vk_emit_tri(st, first, first + i, first + i + 1);
+        for (u32 i = 1; i + 1 < count; i++) emit(st, first, first + i, first + i + 1);
         break;
     case RSX_PRIMITIVE_QUADS:
         for (u32 i = 0; i + 3 < count; i += 4) {
-            vk_emit_tri(st, first + i, first + i + 1, first + i + 2);
-            vk_emit_tri(st, first + i, first + i + 2, first + i + 3);
+            emit(st, first + i, first + i + 1, first + i + 2);
+            emit(st, first + i, first + i + 2, first + i + 3);
         }
         break;
     case RSX_PRIMITIVE_QUAD_STRIP:
         for (u32 i = 0; i + 3 < count; i += 2) {
-            vk_emit_tri(st, first + i, first + i + 1, first + i + 3);
-            vk_emit_tri(st, first + i, first + i + 3, first + i + 2);
+            emit(st, first + i, first + i + 1, first + i + 3);
+            emit(st, first + i, first + i + 3, first + i + 2);
         }
         break;
     default:
@@ -841,13 +859,498 @@ static int vk_ensure_vertex_buffer(VkDeviceSize bytes)
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Guest programs (stage V3)
+ *
+ * With the HLSL -> SPIR-V translator built and PS3RECOMP_VK_GUEST_PROGRAMS=1,
+ * a draw runs the guest's own vertex and fragment programs, as the Metal
+ * backend's guest path does and keyed the same way: decompiled to HLSL by the
+ * shared decompilers, translated by rsx_shader_spirv.cpp, cached per program.
+ * Constants use the Metal/D3D12 layout: VPConst is the 512 transform
+ * constants plus the viewport epilogue, PSConstants the fragment program's
+ * inline constants plus fp_alpha.
+ *
+ * Vertices are still fetched and expanded on the CPU through the shared
+ * rsx_fetch_attrib(), now all sixteen attributes (a disabled one reads its
+ * constant register, as on the hardware). Every RSX vertex format therefore
+ * arrives as float4, and the pipeline has one fixed input layout: location n
+ * is attribute n, which is what the vertex decompiler declares.
+ *
+ * A program that needs a cube map or a vertex texture falls back to the
+ * fixed-function path, with a message. Not honoured on this path yet: the RSX
+ * viewport and scissor (the whole target is used, as on the fallback path),
+ * blending, stencil, culling, per-unit sampler state.
+ * -------------------------------------------------------------------------*/
+#define VK_VP_CACHE      256
+#define VK_FP_CACHE      512
+#define VK_GPIPE_CACHE   512
+#define VK_FP_MAX_BYTES  4096u              /* bound on a fragment program, as Metal/D3D12 */
+#define VK_HLSL_BYTES    (256u * 1024u)
+#define VK_SPV_WORDS     (256u * 1024u)
+#define VK_VPCONST_BYTES ((RSX_MAX_VERTEX_CONSTANTS + 2u) * 16u)
+#define VK_GUEST_ATTRS   16u
+#define VK_GUEST_FLOATS  (VK_GUEST_ATTRS * 4u)   /* per vertex */
+
+typedef struct { u32 hash; VkShaderModule mod; } vk_vp_entry;
+typedef struct { u64 key; VkShaderModule mod; u32 nconst; } vk_fp_entry;
+typedef struct { int vs, fs; u32 depth_key; VkPipeline pipe; } vk_gpipe_entry;
+
+static struct {
+    int                   on;
+    char*                 hlsl;
+    u32*                  spv;
+    char                  log[4096];
+    VkDescriptorSetLayout set_layout;
+    VkPipelineLayout      pipe_layout;
+    VkDescriptorPool      pool;
+    VkDescriptorSet       set;
+    vk_buffer             ubo;              /* VPConst at 0, PSConstants at ps_off */
+    VkDeviceSize          ps_off;
+    VkDeviceSize          max_ubo_range;
+    vk_buffer             vertices;
+    float*                cpu;
+    size_t                cpu_cap, cpu_count;   /* in vertices */
+    vk_vp_entry           vp[VK_VP_CACHE];     u32 vp_count;
+    vk_fp_entry           fp[VK_FP_CACHE];     u32 fp_count;
+    vk_gpipe_entry        pipes[VK_GPIPE_CACHE]; u32 pipe_count;
+    rsx_fp_constant_block consts;
+    u32                   draws, last_draws;
+    u32                   warned;
+} s_g;
+
+int rsx_vulkan_backend_guest_programs(void)
+{
+    const char* v = getenv("PS3RECOMP_VK_GUEST_PROGRAMS");
+    return rsx_hlsl_to_spirv_available() && v && v[0] && v[0] != '0';
+}
+
+static u32 vk_fnv1a32(const u8* p, u32 n)
+{
+    u32 h = 2166136261u;
+    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+static u64 vk_fnv1a64(const void* d, size_t n, u64 h)
+{
+    const u8* p = (const u8*)d;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+/* Built from the registers, as the Metal and D3D12 backends do. */
+static u32 vk_cube_mask(const rsx_state* st)
+{
+    u32 m = 0;
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        const rsx_texture_state* t = &st->textures[u];
+        const u32 w = (t->image_rect >> 16) & 0xFFFFu, h = t->image_rect & 0xFFFFu;
+        if ((t->control0 & 0x80000000u) && (t->format & 4u) && w && w == h) m |= 1u << u;
+    }
+    return m;
+}
+
+static u32 vk_vtex_mask(const rsx_state* st)
+{
+    u32 m = 0;
+    for (u32 u = 0; u < RSX_MAX_VERTEX_TEXTURES; u++)
+        if (st->vertex_textures[u].control0 & 0x80000000u) m |= 1u << u;
+    return m;
+}
+
+static VkShaderModule vk_guest_module(const char* what, int stage)
+{
+    u32 n = 0;
+    if (rsx_hlsl_to_spirv(s_g.hlsl, stage, s_g.spv, VK_SPV_WORDS, &n,
+                          s_g.log, sizeof s_g.log) != 0) {
+        VK_LOG("%s: %s\n", what, s_g.log);
+        return VK_NULL_HANDLE;
+    }
+    VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                    .codeSize = (size_t)n * 4u, .pCode = s_g.spv };
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (pvkCreateShaderModule(s_vk.device, &ci, NULL, &m) != VK_SUCCESS) {
+        VK_LOG("%s: vkCreateShaderModule failed\n", what);
+        return VK_NULL_HANDLE;
+    }
+    return m;
+}
+
+/* The vertex program, keyed on its own bytes to its end bit (as Metal). */
+static int vk_vp_slot(const rsx_state* st)
+{
+    if (st->vp_ucode_bytes < 16) return -1;
+    u32 vstart = st->transform_program_start * 16u;
+    if (vstart >= st->vp_ucode_bytes) vstart = 0;
+    const u8* uc = st->vp_ucode + vstart;
+    const u32 avail = st->vp_ucode_bytes - vstart;
+    const u32 instrs = rsx_vp_program_size_instrs(uc, avail);
+    const u32 len = instrs ? instrs * 16u : avail;
+    const u32 hash = vk_fnv1a32(uc, len);
+    for (u32 i = 0; i < s_g.vp_count; i++)
+        if (s_g.vp[i].hash == hash) return s_g.vp[i].mod ? (int)i : -1;
+    if (s_g.vp_count >= VK_VP_CACHE) return -1;
+
+    char what[64];
+    snprintf(what, sizeof what, "vertex program %08X", hash);
+    VkShaderModule m = VK_NULL_HANDLE;
+    const int ni = rsx_vp_decompile_ex(uc, len, 0, s_g.hlsl, VK_HLSL_BYTES);
+    if (ni <= 0) VK_LOG("%s: decompile failed (%d)\n", what, ni);
+    else         m = vk_guest_module(what, RSX_SHADER_STAGE_VERTEX);
+    if (s_g.vp_count < 32)
+        VK_LOG("%s: %d instrs -> %s\n", what, ni, m ? "ok" : "FAILED (fixed-function instead)");
+    const int slot = (int)s_g.vp_count++;
+    s_g.vp[slot].hash = hash;
+    s_g.vp[slot].mod  = m;
+    return m ? slot : -1;
+}
+
+/* The fragment program, resolved and keyed as the Metal backend's
+ * fp_slot_for: structure (inline constants live in PSConstants), export
+ * width, and the alpha test patched into the source. No cube units here --
+ * the caller has already sent those to the fixed-function path. */
+static int vk_fp_slot(const rsx_state* st, const u8** uc)
+{
+    if (!vm_base || st->shader_program == 0) return -1;
+    const u32 off = cellGcmResolveLocated((st->shader_program & 3u) == 1u,
+                                          st->shader_program & ~3u);
+    if (off == 0xFFFFFFFFu) return -1;
+    *uc = vm_base + off;
+    u64 key = rsx_fp_structural_hash(*uc, VK_FP_MAX_BYTES, 1469598103934665603ull);
+    if (!key) return -1;                       /* malformed or unterminated */
+    const u32 ctrl     = st->shader_control;
+    const u32 ctrl_key = ctrl & CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS;
+    const u32 alpha_en = (st->alpha_test_enable && st->alpha_func != 0x0207u) ? 1u : 0u;
+    const u32 alpha_fn = alpha_en ? st->alpha_func : 0u;
+    key = vk_fnv1a64(&ctrl_key, sizeof ctrl_key, key);
+    key = vk_fnv1a64(&alpha_en, sizeof alpha_en, key);
+    key = vk_fnv1a64(&alpha_fn, sizeof alpha_fn, key);
+    for (u32 i = 0; i < s_g.fp_count; i++)
+        if (s_g.fp[i].key == key) return s_g.fp[i].mod ? (int)i : -1;
+    if (s_g.fp_count >= VK_FP_CACHE) return -1;
+
+    char what[64];
+    snprintf(what, sizeof what, "fragment program %016llX", (unsigned long long)key);
+    VkShaderModule m = VK_NULL_HANDLE;
+    u32 nconst = 0;
+    int ni = rsx_fp_decompile_buffered_ex(*uc, VK_FP_MAX_BYTES, ctrl, 0,
+                                          s_g.hlsl, VK_HLSL_BYTES, &nconst);
+    if (ni > 0 && alpha_en &&
+        rsx_fp_apply_alpha_test_buffered(s_g.hlsl, VK_HLSL_BYTES, st->alpha_func) < 0)
+        ni = -1;
+    if (ni <= 0) VK_LOG("%s: decompile failed (%d)\n", what, ni);
+    else         m = vk_guest_module(what, RSX_SHADER_STAGE_FRAGMENT);
+    if (s_g.fp_count < 32)
+        VK_LOG("%s: %d instrs, %u constants -> %s\n", what, ni, nconst,
+               m ? "ok" : "FAILED (fixed-function instead)");
+    const int slot = (int)s_g.fp_count++;
+    s_g.fp[slot].key    = key;
+    s_g.fp[slot].mod    = m;
+    s_g.fp[slot].nconst = nconst;
+    return m ? slot : -1;
+}
+
+static VkPipeline vk_guest_pipeline(int vs, int fs, int ztest, int zwrite, u32 cmp)
+{
+    const u32 dkey = (u32)ztest | ((u32)zwrite << 1) | (cmp << 2);
+    for (u32 i = 0; i < s_g.pipe_count; i++)
+        if (s_g.pipes[i].vs == vs && s_g.pipes[i].fs == fs && s_g.pipes[i].depth_key == dkey)
+            return s_g.pipes[i].pipe;
+    if (s_g.pipe_count >= VK_GPIPE_CACHE) return VK_NULL_HANDLE;
+
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = s_g.vp[vs].mod, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = s_g.fp[fs].mod, .pName = "main" },
+    };
+    VkVertexInputBindingDescription vb = { 0, VK_GUEST_FLOATS * 4u, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription va[VK_GUEST_ATTRS];
+    for (u32 a = 0; a < VK_GUEST_ATTRS; a++) {
+        va[a].location = a;
+        va[a].binding  = 0;
+        va[a].format   = VK_FORMAT_R32G32B32A32_SFLOAT;
+        va[a].offset   = a * 16u;
+    }
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &vb,
+        .vertexAttributeDescriptionCount = VK_GUEST_ATTRS, .pVertexAttributeDescriptions = va };
+    VkPipelineInputAssemblyStateCreateInfo ia = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    VkPipelineViewportStateCreateInfo vp = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineDepthStencilStateCreateInfo ds = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = ztest ? VK_TRUE : VK_FALSE,
+        .depthWriteEnable = zwrite ? VK_TRUE : VK_FALSE,
+        .depthCompareOp = (VkCompareOp)cmp };
+    VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = 0xF };
+    VkPipelineColorBlendStateCreateInfo cb = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1, .pAttachments = &cba };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 2, .pDynamicStates = dyn };
+    VkGraphicsPipelineCreateInfo gci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2, .pStages = stages, .pVertexInputState = &vi,
+        .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
+        .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
+        .pDynamicState = &dy, .layout = s_g.pipe_layout, .renderPass = s_vk.render_pass,
+        .subpass = 0 };
+    VkPipeline p = VK_NULL_HANDLE;
+    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    if (r != VK_SUCCESS) {
+        VK_LOG("guest pipeline: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
+        return VK_NULL_HANDLE;
+    }
+    vk_gpipe_entry* e = &s_g.pipes[s_g.pipe_count++];
+    e->vs = vs; e->fs = fs; e->depth_key = dkey; e->pipe = p;
+    return p;
+}
+
+/* One vertex: all sixteen attributes as float4, attribute n at float 4n. */
+static int vk_guest_push(const rsx_state* st, u32 idx)
+{
+    if (s_g.cpu_count == s_g.cpu_cap) {
+        size_t cap = s_g.cpu_cap ? s_g.cpu_cap * 2 : 1024;
+        float* n = (float*)realloc(s_g.cpu, cap * VK_GUEST_FLOATS * sizeof(float));
+        if (!n) return -1;
+        s_g.cpu = n; s_g.cpu_cap = cap;
+    }
+    float* v = s_g.cpu + s_g.cpu_count * VK_GUEST_FLOATS;
+    for (u32 a = 0; a < VK_GUEST_ATTRS; a++) rsx_fetch_attrib(st, (int)a, idx, v + a * 4u);
+    s_g.cpu_count++;
+    return 0;
+}
+
+static void vk_guest_tri(const rsx_state* st, u32 i0, u32 i1, u32 i2)
+{
+    vk_guest_push(st, i0);
+    vk_guest_push(st, i1);
+    vk_guest_push(st, i2);
+}
+
+static int vk_guest_init(void)
+{
+    if (!rsx_vulkan_backend_guest_programs()) return 0;
+    s_g.hlsl = (char*)malloc(VK_HLSL_BYTES);
+    s_g.spv  = (u32*)malloc(VK_SPV_WORDS * sizeof(u32));
+    if (!s_g.hlsl || !s_g.spv) { VK_LOG("guest programs: out of memory\n"); return -1; }
+
+    VkPhysicalDeviceProperties p;
+    pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+    s_g.max_ubo_range = p.limits.maxUniformBufferRange;
+    VkDeviceSize align = p.limits.minUniformBufferOffsetAlignment;
+    if (align == 0) align = 256;
+    s_g.ps_off = (VK_VPCONST_BYTES + align - 1u) / align * align;
+    if (VK_VPCONST_BYTES > s_g.max_ubo_range) {
+        VK_LOG("guest programs: maxUniformBufferRange %llu < VPConst\n",
+               (unsigned long long)s_g.max_ubo_range);
+        return -1;
+    }
+
+    const VkShaderStageFlags both = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutBinding b[4] = {
+        { RSX_SPIRV_VPCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL },
+        { RSX_SPIRV_PSCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL },
+        { RSX_SPIRV_TEXTURE_BINDING, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES,
+          VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+        { RSX_SPIRV_SAMPLER_BINDING, VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES,
+          VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+    };
+    VkDescriptorSetLayoutCreateInfo lci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 4, .pBindings = b };
+    VK_CHECK(pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_g.set_layout),
+             "vkCreateDescriptorSetLayout(guest)");
+    VkDescriptorPoolSize ps[3] = {
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES },
+        { VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES },
+    };
+    VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                       .maxSets = 1, .poolSizeCount = 3, .pPoolSizes = ps };
+    VK_CHECK(pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_g.pool),
+             "vkCreateDescriptorPool(guest)");
+    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                        .descriptorPool = s_g.pool, .descriptorSetCount = 1,
+                                        .pSetLayouts = &s_g.set_layout };
+    VK_CHECK(pvkAllocateDescriptorSets(s_vk.device, &dai, &s_g.set), "vkAllocateDescriptorSets(guest)");
+    VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                        .setLayoutCount = 1, .pSetLayouts = &s_g.set_layout };
+    VK_CHECK(pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_g.pipe_layout),
+             "vkCreatePipelineLayout(guest)");
+    if (vk_create_host_buffer(&s_g.ubo,
+                              s_g.ps_off + (RSX_FP_MAX_INLINE_CONSTANTS + 1u) * 16u,
+                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_g.ubo.coherent) {
+        VK_LOG("guest programs: no host-coherent uniform memory\n");
+        return -1;
+    }
+    s_g.on = 1;
+    VK_LOG("guest programs: on (HLSL -> SPIR-V through glslang)\n");
+    return 0;
+}
+
+static void vk_guest_shutdown(void)
+{
+    if (s_vk.device) {
+        for (u32 i = 0; i < s_g.pipe_count; i++)
+            if (s_g.pipes[i].pipe) pvkDestroyPipeline(s_vk.device, s_g.pipes[i].pipe, NULL);
+        for (u32 i = 0; i < s_g.vp_count; i++)
+            if (s_g.vp[i].mod) pvkDestroyShaderModule(s_vk.device, s_g.vp[i].mod, NULL);
+        for (u32 i = 0; i < s_g.fp_count; i++)
+            if (s_g.fp[i].mod) pvkDestroyShaderModule(s_vk.device, s_g.fp[i].mod, NULL);
+        if (s_g.pipe_layout) pvkDestroyPipelineLayout(s_vk.device, s_g.pipe_layout, NULL);
+        if (s_g.pool)        pvkDestroyDescriptorPool(s_vk.device, s_g.pool, NULL);
+        if (s_g.set_layout)  pvkDestroyDescriptorSetLayout(s_vk.device, s_g.set_layout, NULL);
+        vk_destroy_buffer(&s_g.ubo);
+        vk_destroy_buffer(&s_g.vertices);
+    }
+    free(s_g.hlsl);
+    free(s_g.spv);
+    free(s_g.cpu);
+    memset(&s_g, 0, sizeof s_g);
+}
+
+static int vk_ensure_buffer(vk_buffer* b, VkDeviceSize bytes, VkBufferUsageFlags usage)
+{
+    if (b->buf && b->size >= bytes) return 0;
+    VkDeviceSize size = b->size ? b->size : 64 * 1024;
+    while (size < bytes) size *= 2;
+    vk_destroy_buffer(b);                 /* idle: every submission is waited on */
+    if (vk_create_host_buffer(b, size, usage)) return -1;
+    if (!b->coherent) { VK_LOG("vertex memory is not host-coherent\n"); return -1; }
+    return 0;
+}
+
+
+/* Returns 1 when the draw went through the guest programs (or had nothing to
+ * draw), 0 when the caller must use the fixed-function path instead. */
+static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
+{
+    if (!s_g.on) return 0;
+    if (vk_cube_mask(st) || vk_vtex_mask(st)) {
+        if (!(s_g.warned & 1u)) {
+            VK_LOG("guest programs: cube maps and vertex textures are not supported "
+                   "yet; those draws use the fixed-function path\n");
+            s_g.warned |= 1u;
+        }
+        return 0;
+    }
+    const int vs = vk_vp_slot(st);
+    if (vs < 0) return 0;
+    const u8* fp_uc = NULL;
+    const int fs = vk_fp_slot(st, &fp_uc);
+    if (fs < 0) return 0;
+    /* The constant count must be what the program was compiled against. */
+    if (rsx_fp_collect_constants(fp_uc, VK_FP_MAX_BYTES, &s_g.consts) < 0 ||
+        s_g.consts.count != s_g.fp[fs].nconst)
+        return 0;
+    const u32 nslots = s_g.consts.count ? s_g.consts.count : 1u;
+    const u32 fp_len = (nslots + 1u) * 16u;
+    if (fp_len > s_g.max_ubo_range) return 0;
+
+    const int ztest  = st->depth_test_enable ? 1 : 0;
+    const int zwrite = ztest && st->depth_mask;
+    VkPipeline pipe = vk_guest_pipeline(vs, fs, ztest, zwrite, vk_compare_slot(st->depth_func));
+    if (!pipe) return 0;
+
+    s_g.cpu_count = 0;
+    vk_expand(st, prim, first, count, vk_guest_tri);
+    if (!s_g.cpu_count) return 1;
+    const VkDeviceSize bytes = (VkDeviceSize)s_g.cpu_count * VK_GUEST_FLOATS * sizeof(float);
+    if (vk_ensure_buffer(&s_g.vertices, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) return 0;
+    memcpy(s_g.vertices.ptr, s_g.cpu, (size_t)bytes);
+
+    /* VPConst: the 512 transform constants, then the viewport epilogue as the
+     * Metal and D3D12 backends write it -- x/y identity, and z remapped from
+     * GL clip space to [0, 1] when the guest programmed a z scale. */
+    u8* vpc = (u8*)s_g.ubo.ptr;
+    memcpy(vpc, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16u);
+    float* vpx = (float*)(vpc + RSX_MAX_VERTEX_CONSTANTS * 16u);
+    vpx[0] = vpx[1] = vpx[3] = 1.0f;
+    vpx[4] = vpx[5] = vpx[7] = 0.0f;
+    if (st->viewport_scale[2] != 0.0f) { vpx[2] = st->viewport_scale[2]; vpx[6] = st->viewport_offset[2]; }
+    else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
+    /* PSConstants: inline constants as host-order bit patterns, then fp_alpha. */
+    u8* fpc = (u8*)s_g.ubo.ptr + s_g.ps_off;
+    memset(fpc, 0, fp_len);
+    if (s_g.consts.count) memcpy(fpc, s_g.consts.values, s_g.consts.count * 16u);
+    float* alpha = (float*)(fpc + nslots * 16u);
+    alpha[0] = rsx_fp_alpha_ref(st->alpha_ref, st->surface_format & 0x1Fu);
+
+    /* Descriptors: rewritten per draw, which is safe because every submission
+     * is waited on before the next one is recorded. */
+    VkDescriptorBufferInfo bi[2] = {
+        { s_g.ubo.buf, 0, VK_VPCONST_BYTES },
+        { s_g.ubo.buf, s_g.ps_off, fp_len },
+    };
+    VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE,
+                                         s_vk.tex_ready[u] ? s_vk.tex[u].view : s_vk.dummy.view,
+                                         VK_IMAGE_LAYOUT_GENERAL };
+        si[u] = (VkDescriptorImageInfo){ s_vk.sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+    }
+    VkWriteDescriptorSet w[4] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+          .dstBinding = RSX_SPIRV_VPCONST_BINDING, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[0] },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+          .dstBinding = RSX_SPIRV_PSCONST_BINDING, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[1] },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+          .dstBinding = RSX_SPIRV_TEXTURE_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+          .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = ii },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+          .dstBinding = RSX_SPIRV_SAMPLER_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+          .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = si },
+    };
+    pvkUpdateDescriptorSets(s_vk.device, 4, w, 0, NULL);
+
+    if (vk_begin()) return 0;
+    vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(s_vk.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                  .renderPass = s_vk.render_pass, .framebuffer = s_vk.framebuffer,
+                                  .renderArea = { { 0, 0 }, { s_vk.width, s_vk.height } } };
+    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    VkViewport vpt = { 0.0f, 0.0f, (float)s_vk.width, (float)s_vk.height, 0.0f, 1.0f };
+    VkRect2D sc = { { 0, 0 }, { s_vk.width, s_vk.height } };
+    pvkCmdSetViewport(s_vk.cmd, 0, 1, &vpt);
+    pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
+    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_g.pipe_layout,
+                             0, 1, &s_g.set, 0, NULL);
+    VkDeviceSize off = 0;
+    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &s_g.vertices.buf, &off);
+    pvkCmdDraw(s_vk.cmd, (u32)s_g.cpu_count, 1, 0, 0);
+    pvkCmdEndRenderPass(s_vk.cmd);
+    if (vk_submit_and_wait()) return 0;
+    s_g.draws++;
+    return 1;
+}
+
 static void vk_draw(u32 prim, u32 first, u32 count)
 {
     const rsx_state* st = s_vk.state;
     if (!st || !s_vk.device || count < 3) return;
+    if (vk_guest_draw(st, prim, first, count)) return;
 
     s_vk.cpu_count = 0;
-    vk_expand(st, prim, first, count);
+    vk_expand(st, prim, first, count, vk_emit_tri);
     if (!s_vk.cpu_count) return;
 
     const VkDeviceSize bytes = (VkDeviceSize)s_vk.cpu_count * sizeof(vk_vertex);
@@ -860,7 +1363,7 @@ static void vk_draw(u32 prim, u32 first, u32 count)
     const int zwrite = ztest && st->depth_mask;
     VkPipeline pipe = vk_get_pipeline(ztest, zwrite, vk_compare_slot(st->depth_func));
     if (!pipe) return;
-    const int32_t textured = (s_vk.tex_ready && st->vertex_attribs[8].enabled) ? 1 : 0;
+    const int32_t textured = (s_vk.tex_ready[0] && st->vertex_attribs[8].enabled) ? 1 : 0;
 
     if (vk_begin()) return;
     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -1214,6 +1717,8 @@ static void vk_cb_present(void* ud, u32 buffer_id)
     size_t c = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
     s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
     s_vk.presented++;
+    s_g.last_draws = s_g.draws;
+    s_g.draws = 0;
     if (s_vk.dump_path) vk_dump_ppm(px);
     vk_present_window();
 }
@@ -1313,7 +1818,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                               VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return -1;
     if (vk_create_render_pass()) return -1;
     if (vk_create_pipeline_objects()) return -1;
-    s_vk.tex_ready = 0;              /* the magenta dummy is not a guest bind */
+    if (vk_guest_init()) {
+        VK_LOG("guest programs: setup failed, fixed-function path only\n");
+        vk_guest_shutdown();
+    }
 
     /* Both targets UNDEFINED -> GENERAL once. Colour starts opaque black so a
      * present before the first clear reads defined memory; depth starts at
@@ -1368,6 +1876,7 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         if (pvkDeviceWaitIdle) pvkDeviceWaitIdle(s_vk.device);
+        vk_guest_shutdown();
         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);
         if (s_vk.pipe_layout) pvkDestroyPipelineLayout(s_vk.device, s_vk.pipe_layout, NULL);
@@ -1378,7 +1887,8 @@ void rsx_vulkan_backend_shutdown(void)
         if (s_vk.fs)          pvkDestroyShaderModule(s_vk.device, s_vk.fs, NULL);
         if (s_vk.framebuffer) pvkDestroyFramebuffer(s_vk.device, s_vk.framebuffer, NULL);
         if (s_vk.render_pass) pvkDestroyRenderPass(s_vk.device, s_vk.render_pass, NULL);
-        vk_destroy_image(&s_vk.tex);
+        for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) vk_destroy_image(&s_vk.tex[u]);
+        vk_destroy_image(&s_vk.dummy);
         vk_destroy_image(&s_vk.depth);
         vk_destroy_image(&s_vk.color);
         vk_destroy_buffer(&s_vk.vertices);
@@ -1414,6 +1924,6 @@ u32 rsx_vulkan_backend_readback_center(void)
     return s_vk.presented ? (0xFF000000u | s_vk.last_center) : 0u;
 }
 
-u32 rsx_vulkan_backend_guest_draws(void) { return 0; }
+u32 rsx_vulkan_backend_guest_draws(void) { return s_g.last_draws; }
 
 #endif /* !_WIN32 */

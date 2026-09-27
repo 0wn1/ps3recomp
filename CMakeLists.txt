@@ -60,6 +60,8 @@ if(PS3RECOMP_RSX_VULKAN)
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
     endif()
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+    # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
 endif()
 
 # The Metal backend is Objective-C and Apple-only, so it is added explicitly
@@ -257,6 +259,27 @@ if(UNIX)
         message(STATUS "  Shaders:      guest programs translated to MSL (glslang ${glslang_VERSION}, ${SPVC_LIBS})")
     else()
         message(STATUS "  Shaders:      glslang/spirv-cross not found; Metal backend stays fixed-function")
+    endif()
+endif()
+
+# Guest shaders on Vulkan: HLSL -> SPIR-V. glslang only -- Vulkan consumes
+# SPIR-V, so spirv-cross is not needed. Without glslang
+# libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
+# its fixed-function path.
+if(PS3RECOMP_RSX_VULKAN)
+    if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
+        set_source_files_properties(
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
+            PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_HAVE_SPIRV_TRANSLATION=1)
+        target_link_libraries(ps3recomp_runtime PRIVATE glslang::glslang glslang::SPIRV)
+        if(TARGET glslang::glslang-default-resource-limits)
+            target_link_libraries(ps3recomp_runtime PRIVATE
+                glslang::glslang-default-resource-limits)
+        endif()
+        message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
+                       "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
+    else()
+        message(STATUS "  Vulkan:       glslang not found; guest programs unavailable")
     endif()
 endif()
 
