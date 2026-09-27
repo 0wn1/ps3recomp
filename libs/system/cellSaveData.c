@@ -469,6 +469,50 @@ static u32 savedata_content_type(const char* name)
     return CELL_SAVEDATA_FILETYPE_NORMALFILE;
 }
 
+/* Which files were written as SECUREFILE. A real save records them in
+ * PARAM.PFD; ours keeps one name per line there, and the file stays hidden
+ * from the guest's list (savedata_system_file). Without it every file came
+ * back as NORMALFILE, and a title that looks for its secure payload in the
+ * stat list (The Simpsons Arcade Game) called its own fresh save corrupt. */
+static void pfd_path(const char* save_path, char* out, size_t n)
+{
+    snprintf(out, n, "%s/PARAM.PFD", save_path);
+#ifdef _WIN32
+    for (char* p = out; *p; p++) if (*p == '/') *p = '\\';
+#endif
+}
+
+static int pfd_has(const char* save_path, const char* name)
+{
+    char path[1024], line[64];
+    pfd_path(save_path, path, sizeof(path));
+    FILE* fp = fopen(path, "rb");
+    if (!fp) return 0;
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\r\n")] = 0;
+        found = !strcmp(line, name);
+    }
+    fclose(fp);
+    return found;
+}
+
+static void pfd_add(const char* save_path, const char* name)
+{
+    if (pfd_has(save_path, name)) return;
+    char path[1024];
+    pfd_path(save_path, path, sizeof(path));
+    FILE* fp = fopen(path, "ab");
+    if (fp) { fprintf(fp, "%s\n", name); fclose(fp); }
+}
+
+static u32 savedata_file_type(const char* save_path, const char* name)
+{
+    u32 t = savedata_content_type(name);
+    return t == CELL_SAVEDATA_FILETYPE_NORMALFILE && pfd_has(save_path, name)
+         ? CELL_SAVEDATA_FILETYPE_SECUREFILE : t;
+}
+
 /* Enumerate files in a save directory. Returns count, fills fileList up to max. */
 static u32 enumerate_save_files(const char* save_path,
                                  CellSaveDataFileStat* fileList, u32 max)
@@ -489,7 +533,7 @@ static u32 enumerate_save_files(const char* save_path,
                 continue;
             if (count < max && fileList) {
                 memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
-                fileList[count].fileType = savedata_content_type(fd.cFileName);
+                fileList[count].fileType = savedata_file_type(save_path, fd.cFileName);
                 strncpy(fileList[count].fileName, fd.cFileName,
                         CELL_SAVEDATA_FILENAME_SIZE - 1);
                 ULARGE_INTEGER sz;
@@ -526,7 +570,7 @@ static u32 enumerate_save_files(const char* save_path,
 #endif
             if (count < max && fileList) {
                 memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
-                fileList[count].fileType = savedata_content_type(de->d_name);
+                fileList[count].fileType = savedata_file_type(save_path, de->d_name);
                 strncpy(fileList[count].fileName, de->d_name,
                         CELL_SAVEDATA_FILENAME_SIZE - 1);
                 fileList[count].st_size = (u64)st.st_size;
@@ -631,6 +675,8 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
         int failed = wrote != write_size;
         if (fclose(fp) != 0) failed = 1;
+        if (!failed && set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)
+            pfd_add(save_path, name);
         return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)wrote;
     }
 
