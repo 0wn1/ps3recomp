@@ -128,6 +128,7 @@ typedef struct vk_image {
     VkImageView    view;
 } vk_image;
 
+#define VK_SAMPLER_CACHE 32
 #define VK_PIPELINE_SLOTS (2 * 2 * 8)   /* ztest x zwrite x compare op */
 
 typedef struct vk_state {
@@ -157,6 +158,13 @@ typedef struct vk_state {
     vk_image         dummy;           /* 1x1 magenta: "nothing bound"    */
     vk_image         tex[RSX_MAX_TEXTURES];   /* decoded guest textures  */
     int              tex_ready[RSX_MAX_TEXTURES];
+    /* Guest path only: each unit's sampler, built from its wrap, filter and
+     * LOD registers (the fallback path keeps `sampler`, the null backend's
+     * nearest + repeat). Cached by register value; VK_NULL_HANDLE = use
+     * `sampler`. */
+    VkSampler        tex_sampler[RSX_MAX_TEXTURES];
+    struct { u64 key; VkSampler s; } samp_cache[VK_SAMPLER_CACHE];
+    u32              samp_count;
 
     vk_buffer        vertices;        /* expanded triangle list          */
     vk_vertex*       cpu_verts;
@@ -357,12 +365,13 @@ static int vk_find_memory_type(u32 type_bits, VkMemoryPropertyFlags want, u32* o
     return -1;
 }
 
-static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
-                           VkImageUsageFlags usage, VkImageAspectFlags aspect)
+static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 levels,
+                                  VkImageUsageFlags usage, VkImageAspectFlags aspect)
 {
+    if (!levels) levels = 1;
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
-        .format = fmt, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .format = fmt, .extent = { w, h, 1 }, .mipLevels = levels, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -382,10 +391,16 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
     VkImageViewCreateInfo vci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img,
         .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
-        .subresourceRange = { aspect, 0, 1, 0, 1 },
+        .subresourceRange = { aspect, 0, levels, 0, 1 },
     };
     VK_CHECK(pvkCreateImageView(s_vk.device, &vci, NULL, &im->view), "vkCreateImageView");
     return 0;
+}
+
+static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
+                           VkImageUsageFlags usage, VkImageAspectFlags aspect)
+{
+    return vk_create_image_levels(im, fmt, w, h, 1, usage, aspect);
 }
 
 static void vk_destroy_image(vk_image* im)
@@ -472,7 +487,7 @@ static void vk_barrier_image(VkImage img, VkImageAspectFlags aspect, VkImageLayo
         .oldLayout = old_layout, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = img, .subresourceRange = { aspect, 0, 1, 0, 1 },
+        .image = img, .subresourceRange = { aspect, 0, VK_REMAINING_MIP_LEVELS, 0, 1 },
     };
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
@@ -495,30 +510,40 @@ static void vk_write_texture_descriptor(void)
     pvkUpdateDescriptorSets(s_vk.device, 1, &w, 0, NULL);
 }
 
-/* Replace *dst with a w*h image of RGBA8 texels (tightly packed). */
-static int vk_upload_texture(vk_image* dst, const u8* rgba, u32 w, u32 h)
+/* Replace *dst with an RGBA8 image of `nlv` levels: level m is lw[m] x lh[m]
+ * texels, tightly packed, the levels one after another in `rgba`. */
+static int vk_upload_texture_levels(vk_image* dst, const u8* rgba,
+                                    const u32* lw, const u32* lh, u32 nlv)
 {
+    VkBufferImageCopy regions[RSX_MAX_TEXTURE_LEVELS];
+    if (!nlv || nlv > RSX_MAX_TEXTURE_LEVELS) return -1;
+    VkDeviceSize total = 0;
+    for (u32 m = 0; m < nlv; m++) {
+        regions[m] = (VkBufferImageCopy){
+            .bufferOffset = total,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1 },
+            .imageExtent = { lw[m], lh[m], 1 },
+        };
+        total += (VkDeviceSize)lw[m] * lh[m] * 4u;
+    }
     vk_buffer staging = {0};
-    if (vk_create_host_buffer(&staging, (VkDeviceSize)w * h * 4u,
-                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT) || !staging.coherent) {
+    if (vk_create_host_buffer(&staging, total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
+        !staging.coherent) {
         vk_destroy_buffer(&staging); return -1;
     }
-    memcpy(staging.ptr, rgba, (size_t)w * h * 4u);
+    memcpy(staging.ptr, rgba, (size_t)total);
 
     vk_image fresh = {0};
-    if (vk_create_image(&fresh, VK_FORMAT_R8G8B8A8_UNORM, w, h,
-                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        VK_IMAGE_ASPECT_COLOR_BIT)) {
+    if (vk_create_image_levels(&fresh, VK_FORMAT_R8G8B8A8_UNORM, lw[0], lh[0], nlv,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&fresh); vk_destroy_buffer(&staging); return -1;
     }
     int rc = vk_begin();
     if (!rc) {
         vk_barrier_image(fresh.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-        VkBufferImageCopy region = {
-            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .imageExtent = { w, h, 1 },
-        };
-        pvkCmdCopyBufferToImage(s_vk.cmd, staging.buf, fresh.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        pvkCmdCopyBufferToImage(s_vk.cmd, staging.buf, fresh.img, VK_IMAGE_LAYOUT_GENERAL,
+                                nlv, regions);
         rc = vk_submit_and_wait();
     }
     vk_destroy_buffer(&staging);
@@ -529,11 +554,101 @@ static int vk_upload_texture(vk_image* dst, const u8* rgba, u32 w, u32 h)
     return 0;
 }
 
+static int vk_upload_texture(vk_image* dst, const u8* rgba, u32 w, u32 h)
+{
+    return vk_upload_texture_levels(dst, rgba, &w, &h, 1);
+}
+
+/* NV4097_SET_TEXTURE_ADDRESS wrap field, one per axis -- the table the Metal
+ * backend and the live draw engine use: 1 WRAP, 2 MIRROR, 3 CLAMP_TO_EDGE,
+ * 4 BORDER, 5 CLAMP, 6..8 MIRROR_ONCE. Vulkan 1.0 has MIRROR_CLAMP_TO_EDGE
+ * only behind an extension, so the MIRROR_ONCE family clamps to edge here --
+ * exact for texcoords in [0,1], the mirrored half is what is lost. */
+static VkSamplerAddressMode vk_gcm_wrap(u32 w)
+{
+    switch (w & 0xFu) {
+    case 1:  return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    case 2:  return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case 4:  return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;      /* 3, 5..8, unset */
+    }
+}
+
+/* A unit's sampler from its registers, decoded as the Metal backend's
+ * samp_slot_for does: SET_TEXTURE_FILTER min at [18:16] (1 NEAREST,
+ * 2 LINEAR, 3..6 the four nearest/linear x nearest/linear-mip pairs), mag at
+ * [26:24]; SET_TEXTURE_CONTROL0 max LOD at [18:7], min LOD at [30:19], 4.8
+ * fixed point. The LOD bias (FILTER [12:0]) is not applied, as in Metal.
+ * VK_NULL_HANDLE on failure: the caller falls back to `sampler`. */
+static VkSampler vk_unit_sampler(const rsx_texture_state* t)
+{
+    const u32 minf = (t->filter >> 16) & 7u, magf = (t->filter >> 24) & 7u;
+    const u32 lod  = (t->control0 >> 7) & 0xFFFFFFu;       /* max then min LOD */
+    const u64 key  = (u64)minf | ((u64)magf << 3)
+                   | ((u64)(t->address & 0x000F0F0Fu) << 6) | ((u64)lod << 26);
+    for (u32 i = 0; i < s_vk.samp_count; i++)
+        if (s_vk.samp_cache[i].key == key) return s_vk.samp_cache[i].s;
+    if (s_vk.samp_count >= VK_SAMPLER_CACHE) return VK_NULL_HANDLE;
+
+    const int mip_present = (minf >= 3);
+    const int mip_linear  = (minf == 5 || minf == 6);
+    /* A min filter with no mip term samples level 0 only: pin the range. */
+    const float min_lod = (float)((t->control0 >> 19) & 0xFFFu) / 256.0f;
+    float max_lod = mip_present ? (float)((t->control0 >> 7) & 0xFFFu) / 256.0f : 0.0f;
+    if (max_lod < min_lod) max_lod = min_lod;
+    VkSamplerCreateInfo sci = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = (magf == 2) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .minFilter = (minf == 2 || minf == 4 || minf == 6) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .mipmapMode = mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = vk_gcm_wrap(t->address),
+        .addressModeV = vk_gcm_wrap(t->address >> 8),
+        .addressModeW = vk_gcm_wrap(t->address >> 16),
+        .minLod = min_lod, .maxLod = max_lod,
+        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+    };
+    VkSampler smp = VK_NULL_HANDLE;
+    if (pvkCreateSampler(s_vk.device, &sci, NULL, &smp) != VK_SUCCESS) return VK_NULL_HANDLE;
+    s_vk.samp_cache[s_vk.samp_count].key = key;
+    s_vk.samp_cache[s_vk.samp_count].s   = smp;
+    s_vk.samp_count++;
+    return smp;
+}
+
+/* One level of a guest texture into tightly packed RGBA8, with the null
+ * backend's decode (rsx_null_backend.c, nullsw_bind_texture): formats that
+ * decode to fewer than four bytes are splayed, alpha forced opaque. */
+static int vk_decode_level_rgba8(u8* dst, const u8* src, u32 w, u32 h,
+                                 const rsx_tex_layout* tl)
+{
+    const u32 pitch = w * 4u;
+    if (tl->fmt == RSX_TEXFMT_R8G8B8A8) {
+        rsx_texture_decode(dst, pitch, src, w, h, tl, rsx_texture_argb_is_rgba());
+        return 0;
+    }
+    const u32 srcp = tl->row_bytes;
+    u8* tmp = (u8*)malloc((size_t)srcp * h);
+    if (!tmp) return -1;
+    rsx_texture_decode(tmp, srcp, src, w, h, tl, 0);
+    for (u32 y = 0; y < h; y++)
+        for (u32 x = 0; x < w; x++) {
+            const u8* sp = tmp + (size_t)y * srcp + (size_t)x * tl->bytes_per_texel;
+            u8* dp = dst + (size_t)y * pitch + (size_t)x * 4u;
+            dp[0] = sp[0];
+            dp[1] = tl->bytes_per_texel > 1 ? sp[1] : sp[0];
+            dp[2] = tl->bytes_per_texel > 2 ? sp[2] : sp[0];
+            dp[3] = 255;
+        }
+    free(tmp);
+    return 0;
+}
+
 /* Unit `unit` has nothing usable bound. The fallback path's descriptor only
  * ever shows unit 0, so only that one needs rewriting. */
 static void vk_tex_off(u32 unit)
 {
     s_vk.tex_ready[unit] = 0;
+    s_vk.tex_sampler[unit] = VK_NULL_HANDLE;
     if (unit == 0) vk_write_texture_descriptor();
 }
 
@@ -553,34 +668,33 @@ static void vk_cb_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
     if (!vm_base || ea == 0xFFFFFFFFu) { vk_tex_off(unit); return; }
     const u32 fmt = (t->format >> 8) & 0xFFu;
 
-    rsx_tex_layout tl;
-    rsx_texture_layout(fmt, w, h, &tl);
-    if (tl.compressed) { vk_tex_off(unit); return; }   /* no BC path yet */
+    /* The whole mip chain, as the Metal backend reads it: SET_TEXTURE_FORMAT's
+     * level count above bit 15 and SET_TEXTURE_CONTROL3's row pitch, laid out
+     * by the shared rsx_texture_mip_chain() (which clamps the count to what
+     * the dimensions allow). Cube maps are not handled yet: face 0 only. */
+    const u32 levels    = (t->format >> 16) & 0xFFFFu;
+    const u32 row_pitch = t->control3 & 0xFFFFFu;
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, row_pitch, lv);
+    if (!nlv || lv[0].tl.compressed) { vk_tex_off(unit); return; }   /* no BC path yet */
 
-    const u32 pitch = w * 4u;
-    u8* buf = (u8*)malloc((size_t)pitch * h);
-    if (!buf) { vk_tex_off(unit); return; }
-
-    if (tl.fmt == RSX_TEXFMT_R8G8B8A8) {
-        rsx_texture_decode(buf, pitch, vm_base + ea, w, h, &tl, rsx_texture_argb_is_rgba());
-    } else {
-        u32 srcp = tl.row_bytes;
-        u8* tmp = (u8*)malloc((size_t)srcp * h);
-        if (!tmp) { free(buf); vk_tex_off(unit); return; }
-        rsx_texture_decode(tmp, srcp, vm_base + ea, w, h, &tl, 0);
-        for (u32 y = 0; y < h; y++)
-            for (u32 x = 0; x < w; x++) {
-                const u8* sp = tmp + (size_t)y * srcp + (size_t)x * tl.bytes_per_texel;
-                u8* dp = buf + (size_t)y * pitch + (size_t)x * 4u;
-                dp[0] = sp[0];
-                dp[1] = tl.bytes_per_texel > 1 ? sp[1] : sp[0];
-                dp[2] = tl.bytes_per_texel > 2 ? sp[2] : sp[0];
-                dp[3] = 255;
-            }
-        free(tmp);
+    size_t total = 0, off[RSX_MAX_TEXTURE_LEVELS];
+    u32 lw[RSX_MAX_TEXTURE_LEVELS], lh[RSX_MAX_TEXTURE_LEVELS];
+    for (u32 m = 0; m < nlv; m++) {
+        off[m] = total;
+        lw[m] = lv[m].w; lh[m] = lv[m].h;
+        total += (size_t)lv[m].w * lv[m].h * 4u;
     }
-    s_vk.tex_ready[unit] = vk_upload_texture(&s_vk.tex[unit], buf, w, h) == 0;
+    u8* buf = (u8*)malloc(total);
+    if (!buf) { vk_tex_off(unit); return; }
+    for (u32 m = 0; m < nlv; m++)
+        if (vk_decode_level_rgba8(buf + off[m], vm_base + ea + lv[m].offset,
+                                  lv[m].w, lv[m].h, &lv[m].tl)) {
+            free(buf); vk_tex_off(unit); return;
+        }
+    s_vk.tex_ready[unit] = vk_upload_texture_levels(&s_vk.tex[unit], buf, lw, lh, nlv) == 0;
     free(buf);
+    s_vk.tex_sampler[unit] = s_vk.tex_ready[unit] ? vk_unit_sampler(t) : VK_NULL_HANDLE;
     if (unit == 0) vk_write_texture_descriptor();
 }
 
@@ -1302,7 +1416,8 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
         ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE,
                                          s_vk.tex_ready[u] ? s_vk.tex[u].view : s_vk.dummy.view,
                                          VK_IMAGE_LAYOUT_GENERAL };
-        si[u] = (VkDescriptorImageInfo){ s_vk.sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+        si[u] = (VkDescriptorImageInfo){ s_vk.tex_sampler[u] ? s_vk.tex_sampler[u] : s_vk.sampler,
+                                         VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
     }
     VkWriteDescriptorSet w[4] = {
         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
@@ -1883,6 +1998,8 @@ void rsx_vulkan_backend_shutdown(void)
         if (s_vk.desc_pool)   pvkDestroyDescriptorPool(s_vk.device, s_vk.desc_pool, NULL);
         if (s_vk.set_layout)  pvkDestroyDescriptorSetLayout(s_vk.device, s_vk.set_layout, NULL);
         if (s_vk.sampler)     pvkDestroySampler(s_vk.device, s_vk.sampler, NULL);
+        for (u32 i = 0; i < s_vk.samp_count; i++)
+            pvkDestroySampler(s_vk.device, s_vk.samp_cache[i].s, NULL);
         if (s_vk.vs)          pvkDestroyShaderModule(s_vk.device, s_vk.vs, NULL);
         if (s_vk.fs)          pvkDestroyShaderModule(s_vk.device, s_vk.fs, NULL);
         if (s_vk.framebuffer) pvkDestroyFramebuffer(s_vk.device, s_vk.framebuffer, NULL);
