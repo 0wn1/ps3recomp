@@ -194,7 +194,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           static int _n = 0;
           if (_n++ < 64)
               fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
-                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size); } }
+                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+          /* ...and every 5 s, the bytes PUT into / GOT from the range. */
+          { static volatile long long s_put, s_get; static unsigned long long s_t0;
+            extern unsigned long long ps3_ms_now(void);
+            if ((cmd & 0xF0) == 0x20) s_put += size; else if ((cmd & 0xF0) == 0x40) s_get += size;
+            unsigned long long now = ps3_ms_now();
+            if (!s_t0) s_t0 = now;
+            if (now - s_t0 >= 5000) {
+                fprintf(stderr, "[dma-range] %.0f B/s put, %.0f B/s get\n",
+                        s_put * 1000.0 / (now - s_t0), s_get * 1000.0 / (now - s_t0));
+                s_put = s_get = 0; s_t0 = now; } } } }
     /* Malformed transfers are REJECTED, as the hardware MFC does. The rules
      * are the ones the SDK's own dma.h asserts: a non-zero size, at most
      * 16 KB, a multiple of 16 once >= 16 bytes, and LSA/EA sharing 16-byte

@@ -32,8 +32,22 @@ extern "C" {
  * ===========================================================================*/
 #if defined(_MSC_VER)
 #include <intrin.h>
+#include <windows.h>   /* SwitchToThread */
 static volatile long g_lockline = 0;
-void spu_lockline_lock(void)   { while (_InterlockedExchange(&g_lockline, 1)) { } }
+/* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
+ * pause, and yield after a long wait. The bare exchange loop let GH3's four
+ * idle job-policy pollers saturate the line and delay every other SPU atomic
+ * -- FMOD's mixer task among them, 25-40 ms at a time. */
+void spu_lockline_lock(void)
+{
+    unsigned spins = 0;
+    while (_InterlockedExchange(&g_lockline, 1)) {
+        do {
+            _mm_pause();
+            if (++spins >= 4096) { spins = 0; SwitchToThread(); }
+        } while (g_lockline);
+    }
+}
 void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
 #else
 #include <stdatomic.h>
@@ -116,6 +130,28 @@ void spu_coh_unregister(spu_context* ctx)
     spu_lockline_lock();
     for (int i = 0; i < SPU_COH_MAX_CTX; i++)
         if (s_coh_ctxs[i] == ctx) { s_coh_ctxs[i] = NULL; break; }
+    spu_lockline_unlock();
+}
+
+/* Drop every registered context that lies in [lo, hi) -- a host thread's
+ * stack, called as that thread exits. A stack-local context still registered
+ * then has leaked past its unregister; the next walker would read an unmapped
+ * stack (GH3 at the end of a Havok task: spu_coh_notify_write faulting).
+ * ponytail: safety net that also names the leak; find the path that skips
+ * spu_coh_unregister if it keeps firing. */
+void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
+{
+    spu_lockline_lock();
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+        uintptr_t c = (uintptr_t)s_coh_ctxs[i];
+        if (c >= lo && c < hi) {
+            static int _n = 0;
+            if (_n++ < 16)
+                fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
+                        (void*)c, s_coh_ctxs[i]->image_id);
+            s_coh_ctxs[i] = NULL;
+        }
+    }
     spu_lockline_unlock();
 }
 

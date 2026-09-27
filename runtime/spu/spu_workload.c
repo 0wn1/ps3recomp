@@ -790,7 +790,12 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
      * instead of killing the process silently with 0x80000001. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
-    spu_async_run((spu_async_job*)p); return 0;
+    spu_async_run((spu_async_job*)p);
+    /* Nothing on this stack may stay in the lock-line reserver set. */
+    { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
+      extern void spu_coh_forget_range(uintptr_t, uintptr_t);
+      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi); }
+    return 0;
 }
 #else
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
@@ -1005,6 +1010,28 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
     { static int _n = 0; if (_n++ < 24)
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
+    /* SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
+    { static int s_on = -1; if (s_on < 0) s_on = getenv("SPU_SIG_STATS") ? 1 : 0;
+      if (s_on) {
+          static uint32_t ts[32], tk[32]; static uintptr_t ca[32]; static unsigned cnt[32];
+          static unsigned long long t0;
+          extern unsigned long long ps3_ms_now(void);
+          const uintptr_t c = (uintptr_t)__builtin_return_address(0);
+          for (int i = 0; i < 32; i++) {
+              if (cnt[i] && ts[i] == taskset_ea && tk[i] == taskId && ca[i] == c) { cnt[i]++; break; }
+              if (!cnt[i] && !ts[i]) { ts[i] = taskset_ea; tk[i] = taskId; ca[i] = c; cnt[i] = 1; break; }
+          }
+          unsigned long long now = ps3_ms_now();
+          if (!t0) t0 = now;
+          if (now - t0 >= 5000) {
+              for (int i = 0; i < 32 && ts[i]; i++) {
+                  fprintf(stderr, "[sig-stats] taskset=0x%08X task=%u caller=%p %.1f/s\n",
+                          ts[i], tk[i], (void*)ca[i], cnt[i] * 1000.0 / (now - t0));
+                  cnt[i] = 0; ts[i] = 0;
+              }
+              t0 = now;
+          }
+      } }
 }
 
 /* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by

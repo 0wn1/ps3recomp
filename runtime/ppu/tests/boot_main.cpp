@@ -812,6 +812,8 @@ static void prof_hit(int tab, uint64_t key)
 }
 static void dbg_prof(DWORD tid, unsigned sec)
 {
+    /* Suspending ourselves never resumes: the console would hang for good. */
+    if (tid == GetCurrentThreadId()) { dbg_printf("  tid %lu is the console%c", (unsigned long)tid, 10); return; }
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
     if (!h) { dbg_printf("  cannot open tid %lu%c", (unsigned long)tid, 10); return; }
     memset(s_prof_key, 0, sizeof s_prof_key); memset(s_prof_ct, 0, sizeof s_prof_ct);

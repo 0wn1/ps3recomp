@@ -21,6 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+#ifndef _WIN32
+#include <sched.h>   /* sched_yield */
+#endif
 #include <time.h>
 #include "../platform/win32_compat.h"
 
@@ -66,6 +69,11 @@ static uint64_t spu_host_ns(void)
 #else
 #  define SPU_TLS __thread
 #endif
+/* Called after an SPU atomic commits a 128-byte line, with the lock-line lock
+ * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
+ * when a task sets the flag, instead of on its next 2 ms poll. */
+void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+
 static SPU_TLS jmp_buf s_spu_halt_env;
 static SPU_TLS int     s_spu_halt_armed = 0;
 
@@ -703,6 +711,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
+        if (ctx->atomic_stat == 0 && g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;
 
     case MFC_PUTLLUC_CMD:
@@ -719,6 +728,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_lockline_unlock();
+        if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;
 
     default:
@@ -2044,6 +2054,14 @@ void spu_indirect_branch(spu_context* ctx)
     if (ctx->pc == SPURS_TASKSET_PM_SYSCALL_LS) {
         uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
                     | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
+            /* A real SPU spins here on its own core; a host thread doing the
+             * same competes with the PPU and the SPURS tasks. Give the core up
+             * if anything else is ready (no-op otherwise). */
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
         /* A task dispatched standalone (no policy module in this local store)
          * runs on the SpursTasksetContext spu_workload.c plants, whose
          * syscallAddr is this address; nothing is lifted at 0xA70 for it, so
