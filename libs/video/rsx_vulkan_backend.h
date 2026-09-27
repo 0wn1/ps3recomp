@@ -72,8 +72,11 @@ u32  rsx_vulkan_backend_readback_center(void);
 u32  rsx_vulkan_backend_guest_draws(void);
 
 /* 1 when draws run the guest's own programs: the HLSL -> SPIR-V translator
- * was built (glslang found) and PS3RECOMP_VK_GUEST_PROGRAMS=1 opts in. Opt-in
- * while the path grows; needs no initialised backend. */
+ * was built (glslang found) and PS3RECOMP_VK_GUEST_PROGRAMS=1 opts in. Then
+ * the shared register-file draw engine (rsx_draw_engine.h) is the default
+ * path, as it is Metal's; PS3RECOMP_RSX_ENGINE=vtable selects the older
+ * rsx_state path instead. Opt-in while the path grows; needs no initialised
+ * backend. */
 int  rsx_vulkan_backend_guest_programs(void);
 
 #ifdef __cplusplus

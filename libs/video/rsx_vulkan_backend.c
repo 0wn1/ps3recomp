@@ -3081,9 +3081,15 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
     }
     /* One path at a time: the FIFO walker feeds both the rsx_state vtable
      * and the register-file engine, so registering both would record every
-     * draw twice (the rule the Metal backend's init follows). The engine is
-     * opt-in here while it grows: PS3RECOMP_RSX_ENGINE=dispatch. */
+     * draw twice (the rule the Metal backend's init follows).
+     *
+     * With guest programs on, the engine is the default -- as it became
+     * Metal's once every host mode passed through it. It builds every
+     * pipeline from the guest's programs, so without them it has nothing to
+     * draw with, and the vtable's fixed-function path stays the default.
+     * Either way PS3RECOMP_RSX_ENGINE=dispatch|vtable overrides. */
     rsx_draw_engine_set_backend(&s_vk_engine_backend);
+    rsx_draw_engine_set_default(s_g.on ? 1 : 0);
     if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
         s_vk.eng_active = 1;
     else
