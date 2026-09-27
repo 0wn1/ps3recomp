@@ -95,6 +95,11 @@ static u32 s_current_display_buffer_id = 0;
  * presenting on a raw flip-count change raced the drain and showed empty or
  * mixed batches (wave: black flashes, layout flicker). */
 static volatile int s_flip_pending = 0;
+/* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
+#define GCM_FLIP_MARKER 0xFEAD0100u
+/* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
+ * derive it from the observed per-frame volume if a title outgrows it. */
+#define GCM_FLIP_WRAP_BYTES 0x40000u
 
 int cellGcm_take_flip_pending(void)
 {
@@ -1630,7 +1635,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
                   fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
                           flips, 10); }
-            cellGcmSetFlipCommand(w & 0xFFu);
+            if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
+                /* Queued by _cellGcmSetFlipCommand, which already did the
+                 * guest-visible half of the request. */
+                s_current_display_buffer_id = w & 7u;
+                s_flip_pending = 1;
+                s_flip_request_count++;
+            } else {
+                cellGcmSetFlipCommand(w & 0xFFu);
+            }
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
              * behind it is a deadlock, because the title's ring can only be
@@ -2000,6 +2013,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * There is nothing left to protect at that point. Recycling loses
          * whatever was written past the end; not recycling loses the rest of
          * the run. */
+        /* A pass that stopped at a flip has a backlog on purpose (the next
+         * frame), and teleporting `get` to `begin` would drop it -- fence
+         * writes included, so the title then waits on a reference that never
+         * comes (The Simpsons Arcade Game froze at its 4th recycle). The next
+         * pass drains to `put` and recycles then. */
+        if (!strcmp(why, "flip") && s_fifo_getoff != put) head_consumed = 0;
         /* Only once the title has been SEEN to overrun. Near `end` is also
          * where a title whose callback does recycle sits just before calling
          * it: Tornado Outbreak's steps its context through 64 KB segments of a
@@ -2168,7 +2187,7 @@ u32 cellGcm_display_buffer_count(void)
     return n;
 }
 
-s32 cellGcmSetFlipCommand(u32 bufferId)
+static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
@@ -2221,12 +2240,16 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
 
-    s_current_display_buffer_id = bufferId;
+    /* in_fifo: the flip sits in the command stream as a GCM_FLIP_MARKER, and
+     * the drain does this half when it reaches it (see the 0xFEAD case). */
+    if (!in_fifo) {
+        s_current_display_buffer_id = bufferId;
+        s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
+        s_flip_request_count++;
+    }
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
-    s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
-    s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
     /* Invoke via OPD resolution, not a raw call into guest code.
@@ -2242,6 +2265,44 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);  /* head 0 = primary display */
 
     return CELL_OK;
+}
+
+s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); }
+
+/* The real _cellGcmSetFlipCommand appends the flip to the command buffer, so
+ * the RSX flips once it has executed everything queued before it. Firing it
+ * at call time instead presented whatever the drain had reached by then --
+ * and the title has not even flushed its frame's tail yet: The Simpsons Arcade
+ * Game calls it with ctx->current ~2.4 KB past put, so frames showed without
+ * their last draws (a dialog, a dimming overlay) for one flip. Write a marker
+ * at ctx->current instead; the drain stops at it and fires the flip there,
+ * exactly as it does for the 0xFEAD words a statically-linked libgcm emits.
+ * Returns 0 when there is no room or ctx is not a mapped command buffer. */
+static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+{
+    if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
+        !s_display_buffer_set[bufferId]) return 0;
+    const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
+    /* Never near the end: those bytes are the title's reserve before its
+     * ring wraps, and the recycle above keys on them. */
+    if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
+    vm_write32(cur, GCM_FLIP_MARKER | bufferId);
+    /* Wrap here, on the guest thread, once the ring is nearly used -- what the
+     * SDK's buffer-full callback does. Otherwise the drain thread recycles it
+     * (see "recycled the title's own ring"), rewriting ctx->current and put
+     * while the guest may be between advancing current and flushing: put
+     * then lands on begin, the guest's closing fence is never executed, and
+     * it spins on `ref` for good. Safe when the walker has left the head of
+     * the ring well behind, which is the region the guest writes next. */
+    const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
+    if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+        s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
+        vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
+        vm_write32(ctx + 8, begin);
+        return 1;
+    }
+    vm_write32(ctx + 8, cur + 4);
+    return 1;
 }
 
 /* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
@@ -2962,7 +3023,8 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
 /* NID: 0x21397818 */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
-    (void)ctx;
+    if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
+        return gcm_flip_request(bufferId, 1);
     return cellGcmSetFlipCommand(bufferId);
 }
 
