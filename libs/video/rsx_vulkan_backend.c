@@ -88,6 +88,7 @@
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
+    X(vkCmdSetStencilReference) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
@@ -1871,6 +1872,10 @@ typedef struct vk_eng_obj {
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
 
+/* Defined with the E2 pipeline state further down. */
+static void vk_eng_drop_framebuffers(void);
+static void vk_eng2_shutdown(void* user);
+
 static struct {
     u32 rt[RSX_BE_MAX_COLOR_TARGETS], nrt, depth;
 } s_eng_bound;
@@ -1943,12 +1948,14 @@ static void vk_eng_release(void* user, u32 handle)
 {
     (void)user;
     if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE) return;
+    if (s_eobj[handle].kind != VK_ENG_TEXTURE) vk_eng_drop_framebuffers();
     vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
 }
 
 static void vk_eng_shutdown(void* user)
 {
+    vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
 }
 
@@ -2127,24 +2134,523 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
 { (void)user; (void)surface; (void)remap; (void)rsx_format; return 0; }
 static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
 { (void)user; (void)depth; (void)w; (void)h; return 0; }
+/* ---- E2: pipelines and draws ---------------------------------------------
+ * A pipeline handle carries the two translated modules and the render state
+ * the engine keyed it on. Topology is not part of that key (Metal sets it on
+ * the encoder), but Vulkan 1.0 bakes it into the pipeline, so each handle
+ * builds its VkPipeline per topology on first use.
+ *
+ * Bindings are the translator's contract (rsx_shader_spirv.h), and the set
+ * layout, pipeline layout, descriptor set and constant UBO are the ones the
+ * vtable guest path already creates. Vertex inputs are the engine's compact
+ * layout: slot n is a float4 at n*16, at location n, as Metal reads it.
+ * Known gaps, stated rather than guessed: vertex-texture units (their
+ * samplers s0..s3 would alias the pixel samplers' binding), FP16 and other
+ * non-RGBA8 colour targets, depth-only passes, and stencil (the depth format
+ * has no stencil aspect yet, so the test is inert). */
+#define VK_ENG_MAX_PIPE   512
+#define VK_ENG_TOPOLOGIES 5
+#define VK_ENG_FB_CACHE   64
+
+typedef struct vk_eng_pipe {
+    int                 used;
+    VkShaderModule      vs, fs;
+    rsx_be_render_state rs;
+    u32                 nslots, stride, rt_count;
+    VkPipeline          variant[VK_ENG_TOPOLOGIES];
+} vk_eng_pipe;
+
+static vk_eng_pipe s_epipe[VK_ENG_MAX_PIPE];
+
+static struct {
+    VkRenderPass rp[RSX_BE_MAX_COLOR_TARGETS + 1];      /* by colour count */
+    struct { u32 key[RSX_BE_MAX_COLOR_TARGETS + 1]; VkFramebuffer fb; } fb[VK_ENG_FB_CACHE];
+    u32          fb_count;
+    vk_image     scratch_depth;                          /* when no zeta is bound */
+    u32          scratch_w, scratch_h;
+    u32          pipeline;
+    u32          vs_bytes, ps_bytes;
+    u32          tex[RSX_BE_MAX_TEXTURES];
+    rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES];
+    u32          tex_mask;
+    float        vp[4];
+    u32          sc[4];
+    int          have_vp, have_sc;
+    u32          stencil_ref;
+    vk_buffer    indices;
+    u32          warned;
+} s_e2;
+
+static void vk_eng_drop_framebuffers(void)
+{
+    for (u32 i = 0; i < s_e2.fb_count; i++)
+        if (s_e2.fb[i].fb) pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
+    s_e2.fb_count = 0;
+}
+
+/* The render pass for `n` RGBA8 colour attachments plus depth, LOAD/STORE in
+ * GENERAL like the vtable path's: clears are separate operations. */
+static VkRenderPass vk_eng_render_pass(u32 n)
+{
+    if (n < 1 || n > RSX_BE_MAX_COLOR_TARGETS) return VK_NULL_HANDLE;
+    if (s_e2.rp[n]) return s_e2.rp[n];
+    VkAttachmentDescription att[RSX_BE_MAX_COLOR_TARGETS + 1];
+    VkAttachmentReference   cref[RSX_BE_MAX_COLOR_TARGETS];
+    for (u32 i = 0; i <= n; i++) {
+        att[i] = (VkAttachmentDescription){
+            .format = (i < n) ? VK_FORMAT_R8G8B8A8_UNORM : s_vk.depth_format,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL };
+        if (i < n) cref[i] = (VkAttachmentReference){ i, VK_IMAGE_LAYOUT_GENERAL };
+    }
+    VkAttachmentReference dref = { n, VK_IMAGE_LAYOUT_GENERAL };
+    VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                 .colorAttachmentCount = n, .pColorAttachments = cref,
+                                 .pDepthStencilAttachment = &dref };
+    VkRenderPassCreateInfo rci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+                                   .attachmentCount = n + 1, .pAttachments = att,
+                                   .subpassCount = 1, .pSubpasses = &sub };
+    if (pvkCreateRenderPass(s_vk.device, &rci, NULL, &s_e2.rp[n]) != VK_SUCCESS)
+        s_e2.rp[n] = VK_NULL_HANDLE;
+    return s_e2.rp[n];
+}
+
+/* Tables carried from the Metal backend, itself copied from the D3D12 live
+ * draw engine a title has shipped on. */
+static VkBlendFactor vk_gcm_blend_factor(u32 f)
+{
+    switch (f) {
+    case 0x0000: return VK_BLEND_FACTOR_ZERO;
+    case 0x0001: return VK_BLEND_FACTOR_ONE;
+    case 0x0300: return VK_BLEND_FACTOR_SRC_COLOR;
+    case 0x0301: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case 0x0302: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case 0x0303: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case 0x0304: return VK_BLEND_FACTOR_DST_ALPHA;
+    case 0x0305: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case 0x0306: return VK_BLEND_FACTOR_DST_COLOR;
+    case 0x0307: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case 0x0308: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+    default:     return VK_BLEND_FACTOR_ONE;
+    }
+}
+static VkBlendOp vk_gcm_blend_op(u32 e)
+{
+    switch (e) {
+    case 0x8007: return VK_BLEND_OP_MIN;
+    case 0x8008: return VK_BLEND_OP_MAX;
+    case 0x800A: return VK_BLEND_OP_SUBTRACT;
+    case 0x800B: return VK_BLEND_OP_REVERSE_SUBTRACT;
+    default:     return VK_BLEND_OP_ADD;                  /* FUNC_ADD 0x8006 */
+    }
+}
+static VkCompareOp vk_gcm_compare(u32 f)
+{
+    return (f >= 0x0200u && f <= 0x0206u) ? (VkCompareOp)(f - 0x0200u) : VK_COMPARE_OP_ALWAYS;
+}
+static VkStencilOp vk_gcm_stencil_op(u32 op)
+{
+    switch (op) {
+    case 0x0000: return VK_STENCIL_OP_ZERO;
+    case 0x1E01: return VK_STENCIL_OP_REPLACE;
+    case 0x1E02: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+    case 0x1E03: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+    case 0x150A: return VK_STENCIL_OP_INVERT;
+    case 0x8507: return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+    case 0x8508: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+    default:     return VK_STENCIL_OP_KEEP;               /* GL_KEEP 0x1E00 */
+    }
+}
+static VkStencilOpState vk_gcm_stencil_face(u32 func, u32 fail, u32 zfail, u32 zpass,
+                                            u32 cmp_mask, u32 write_mask)
+{
+    VkStencilOpState s = { .failOp = vk_gcm_stencil_op(fail), .passOp = vk_gcm_stencil_op(zpass),
+                           .depthFailOp = vk_gcm_stencil_op(zfail),
+                           .compareOp = vk_gcm_compare(func),
+                           .compareMask = cmp_mask & 0xFFu, .writeMask = write_mask & 0xFFu,
+                           .reference = 0 };                /* dynamic */
+    return s;
+}
+
+static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out)
+{
+    u32 words = 0;
+    if (rsx_hlsl_to_spirv(hlsl, stage, s_g.spv, VK_SPV_WORDS, &words, s_g.log, sizeof s_g.log) || !words) {
+        VK_LOG("engine: %s translation failed: %s\n",
+               stage == RSX_SHADER_STAGE_VERTEX ? "vertex" : "fragment", s_g.log);
+        return -1;
+    }
+    VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                    .codeSize = (size_t)words * 4u, .pCode = s_g.spv };
+    return pvkCreateShaderModule(s_vk.device, &ci, NULL, out) == VK_SUCCESS ? 0 : -1;
+}
+
 static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                   const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
                                   u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
-{ (void)user; (void)vs_hlsl; (void)ps_hlsl; (void)rs; (void)layout; (void)vertex_stride; (void)rt_fmt; (void)rt_count; return 0; }
-static void vk_eng_pipeline_release(void* user, u32 pipeline) { (void)user; (void)pipeline; }
-static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; (void)pipeline; }
-static void vk_eng_bind_constants(void* user, const void* data, u32 bytes)
-{ (void)user; (void)data; (void)bytes; }
-static void vk_eng_bind_textures(void* user, const u32* textures, const rsx_be_sampler_desc* samplers, u32 mask)
-{ (void)user; (void)textures; (void)samplers; (void)mask; }
+{
+    (void)user;
+    /* Same gate as Metal: no guest programs, no engine pipelines. */
+    if (!s_g.on || !vs_hlsl || !ps_hlsl || !rs || !layout || !vertex_stride) return 0;
+    if (rt_fmt != RSX_BE_FMT_R8G8B8A8) {
+        if (!(s_e2.warned & 1u)) { VK_LOG("engine: colour format %d not supported yet\n", (int)rt_fmt); s_e2.warned |= 1u; }
+        return 0;
+    }
+    if (!rt_count) rt_count = 1;
+    if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
+    u32 slot = VK_ENG_MAX_PIPE;
+    for (u32 i = 0; i < VK_ENG_MAX_PIPE; i++) if (!s_epipe[i].used) { slot = i; break; }
+    if (slot == VK_ENG_MAX_PIPE) return 0;
+    vk_eng_pipe* P = &s_epipe[slot];
+    memset(P, 0, sizeof *P);
+    if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
+    if (vk_eng_translate(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs)) {
+        pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P); return 0;
+    }
+    P->rs = *rs;
+    P->nslots = layout->count;
+    P->stride = vertex_stride;
+    P->rt_count = rt_count;
+    P->used = 1;
+    return slot + 1u;
+}
+
+static void vk_eng_pipeline_release(void* user, u32 pipeline)
+{
+    (void)user;
+    if (!pipeline || pipeline > VK_ENG_MAX_PIPE || !s_epipe[pipeline - 1].used) return;
+    vk_eng_pipe* P = &s_epipe[pipeline - 1];
+    for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
+        if (P->variant[t]) pvkDestroyPipeline(s_vk.device, P->variant[t], NULL);
+    if (P->vs) pvkDestroyShaderModule(s_vk.device, P->vs, NULL);
+    if (P->fs) pvkDestroyShaderModule(s_vk.device, P->fs, NULL);
+    memset(P, 0, sizeof *P);
+    if (s_e2.pipeline == pipeline) s_e2.pipeline = 0;
+}
+
+static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+{
+    static const VkPrimitiveTopology topo[VK_ENG_TOPOLOGIES] = {
+        VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+        VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+    if (P->variant[topo_idx]) return P->variant[topo_idx];
+    VkRenderPass rp = vk_eng_render_pass(P->rt_count);
+    if (!rp || P->nslots > VK_GUEST_ATTRS) return VK_NULL_HANDLE;
+    const rsx_be_render_state* rs = &P->rs;
+
+    VkPipelineShaderStageCreateInfo st[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = P->vs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = P->fs, .pName = "main" } };
+    VkVertexInputBindingDescription vb = { 0, P->stride, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription va[VK_GUEST_ATTRS];
+    for (u32 s = 0; s < P->nslots; s++)
+        va[s] = (VkVertexInputAttributeDescription){ s, 0, VK_FORMAT_R32G32B32A32_SFLOAT, s * 16u };
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &vb,
+        .vertexAttributeDescriptionCount = P->nslots, .pVertexAttributeDescriptions = va };
+    VkPipelineInputAssemblyStateCreateInfo ia = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = topo[topo_idx] };
+    VkPipelineViewportStateCreateInfo vps = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1, .scissorCount = 1 };
+    /* CULL_FACE FRONT 0x0404 / BACK 0x0405 / FRONT_AND_BACK 0x0408 (front, as
+     * in D3D12 and Metal); FRONT_FACE CCW 0x0901 maps directly: both APIs
+     * judge winding on screen, and the Y flip in the vertex stage makes this
+     * screen the same one D3D's viewport produces. */
+    VkPipelineRasterizationStateCreateInfo ras = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .cullMode = !rs->cull_enable ? VK_CULL_MODE_NONE
+                  : (rs->cull_face == 0x0404u || rs->cull_face == 0x0408u) ? VK_CULL_MODE_FRONT_BIT
+                                                                           : VK_CULL_MODE_BACK_BIT,
+        .frontFace = (rs->front_face == 0x0901u) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                                 : VK_FRONT_FACE_CLOCKWISE,
+        .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkStencilOpState front = vk_gcm_stencil_face(rs->s_func, rs->s_fail, rs->s_zfail, rs->s_zpass,
+                                                 rs->s_func_mask, rs->s_write_mask);
+    VkStencilOpState back = rs->stencil_two_sided
+        ? vk_gcm_stencil_face(rs->bs_func, rs->bs_fail, rs->bs_zfail, rs->bs_zpass,
+                              rs->s_func_mask, rs->s_write_mask)
+        : front;
+    VkPipelineDepthStencilStateCreateInfo ds = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = rs->depth_test ? VK_TRUE : VK_FALSE,
+        .depthWriteEnable = (rs->depth_test && rs->depth_write) ? VK_TRUE : VK_FALSE,
+        .depthCompareOp = vk_gcm_compare(rs->depth_func),
+        .stencilTestEnable = rs->stencil_enable ? VK_TRUE : VK_FALSE,
+        .front = front, .back = back };
+    /* nv40 COLOR_MASK: B [0:7], G [8:15], R [16:23], A [24:31], any bit set.
+     * Every attachment takes target A's blend and mask (see rsx_draw_engine.h). */
+    VkColorComponentFlags wm = 0;
+    if ((rs->color_mask >> 16) & 0xFFu) wm |= VK_COLOR_COMPONENT_R_BIT;
+    if ((rs->color_mask >>  8) & 0xFFu) wm |= VK_COLOR_COMPONENT_G_BIT;
+    if ((rs->color_mask >>  0) & 0xFFu) wm |= VK_COLOR_COMPONENT_B_BIT;
+    if ((rs->color_mask >> 24) & 0xFFu) wm |= VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendAttachmentState cba[RSX_BE_MAX_COLOR_TARGETS];
+    for (u32 r = 0; r < P->rt_count; r++)
+        cba[r] = (VkPipelineColorBlendAttachmentState){
+            .blendEnable = rs->blend_enable ? VK_TRUE : VK_FALSE,
+            .srcColorBlendFactor = vk_gcm_blend_factor(rs->sf_rgb),
+            .dstColorBlendFactor = vk_gcm_blend_factor(rs->df_rgb),
+            .colorBlendOp = vk_gcm_blend_op(rs->eq_rgb),
+            .srcAlphaBlendFactor = vk_gcm_blend_factor(rs->sf_a),
+            .dstAlphaBlendFactor = vk_gcm_blend_factor(rs->df_a),
+            .alphaBlendOp = vk_gcm_blend_op(rs->eq_a),
+            .colorWriteMask = wm };
+    VkPipelineColorBlendStateCreateInfo cb = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = P->rt_count, .pAttachments = cba };
+    VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                              VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+    VkPipelineDynamicStateCreateInfo dy = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 3, .pDynamicStates = dyn };
+    VkGraphicsPipelineCreateInfo gci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+        .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
+        .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
+        .layout = s_g.pipe_layout, .renderPass = rp, .subpass = 0 };
+    if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
+                                   &P->variant[topo_idx]) != VK_SUCCESS) {
+        VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
+        P->variant[topo_idx] = VK_NULL_HANDLE;
+    }
+    return P->variant[topo_idx];
+}
+
+static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e2.pipeline = pipeline; }
+
+static void vk_eng2_shutdown(void* user)
+{
+    for (u32 i = 1; i <= VK_ENG_MAX_PIPE; i++) vk_eng_pipeline_release(user, i);
+    vk_eng_drop_framebuffers();
+    for (u32 n = 0; n <= RSX_BE_MAX_COLOR_TARGETS; n++)
+        if (s_e2.rp[n]) pvkDestroyRenderPass(s_vk.device, s_e2.rp[n], NULL);
+    vk_destroy_image(&s_e2.scratch_depth);
+    vk_destroy_buffer(&s_e2.indices);
+    memset(&s_e2, 0, sizeof s_e2);
+}
+
+/* Constants go straight into the shared UBO: vertex at 0, pixel at ps_off.
+ * Every operation is waited on, so overwriting per draw is safe. */
+static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
+{
+    (void)user;
+    if (!s_g.on || !data) { s_e2.vs_bytes = 0; return; }
+    const u32 cap = (u32)s_g.ps_off;
+    if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
+    memcpy(s_g.ubo.ptr, data, bytes);
+    s_e2.vs_bytes = bytes;
+}
+static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
+{
+    (void)user;
+    if (!s_g.on || !data) { s_e2.ps_bytes = 0; return; }
+    const u32 cap = (u32)(s_g.ubo.size - s_g.ps_off);
+    if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 4u)) { VK_LOG("engine: PS constants truncated\n"); s_e2.warned |= 4u; } }
+    memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, data, bytes);
+    s_e2.ps_bytes = bytes;
+}
+static void vk_eng_bind_textures(void* user, const u32* textures,
+                                 const rsx_be_sampler_desc* samplers, u32 mask)
+{
+    (void)user;
+    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+        const int on = (mask >> u) & 1u;
+        s_e2.tex[u] = on ? textures[u] : 0;
+        if (on && samplers) s_e2.samp[u] = samplers[u];
+    }
+    s_e2.tex_mask = mask;
+}
+static void vk_eng_bind_vertex_textures(void* user, const u32* textures,
+                                        const rsx_be_sampler_desc* samplers, u32 mask)
+{
+    (void)user; (void)textures; (void)samplers;
+    if (mask && !(s_e2.warned & 8u)) { VK_LOG("engine: vertex textures not supported yet\n"); s_e2.warned |= 8u; }
+}
 static void vk_eng_set_viewport(void* user, float x, float y, float w, float h)
-{ (void)user; (void)x; (void)y; (void)w; (void)h; }
+{
+    (void)user;
+    s_e2.vp[0] = x; s_e2.vp[1] = y; s_e2.vp[2] = w; s_e2.vp[3] = h; s_e2.have_vp = 1;
+}
 static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
-{ (void)user; (void)x; (void)y; (void)w; (void)h; }
-static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; (void)ref; }
+{
+    (void)user;
+    s_e2.sc[0] = x; s_e2.sc[1] = y; s_e2.sc[2] = w; s_e2.sc[3] = h; s_e2.have_sc = 1;
+}
+static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_e2.stencil_ref = ref; }
+
+static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, VkImageView dview,
+                                        u32 dkey, u32 w, u32 h)
+{
+    u32 key[RSX_BE_MAX_COLOR_TARGETS + 1] = { 0 };
+    for (u32 i = 0; i < n; i++) key[i] = rt[i];
+    key[RSX_BE_MAX_COLOR_TARGETS] = dkey;
+    for (u32 i = 0; i < s_e2.fb_count; i++)
+        if (!memcmp(s_e2.fb[i].key, key, sizeof key)) return s_e2.fb[i].fb;
+    if (s_e2.fb_count >= VK_ENG_FB_CACHE) vk_eng_drop_framebuffers();
+    VkImageView views[RSX_BE_MAX_COLOR_TARGETS + 1];
+    for (u32 i = 0; i < n; i++) views[i] = s_eobj[rt[i]].im.view;
+    views[n] = dview;
+    VkFramebufferCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                                    .renderPass = rp, .attachmentCount = n + 1, .pAttachments = views,
+                                    .width = w, .height = h, .layers = 1 };
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    if (pvkCreateFramebuffer(s_vk.device, &fci, NULL, &fb) != VK_SUCCESS) return VK_NULL_HANDLE;
+    memcpy(s_e2.fb[s_e2.fb_count].key, key, sizeof key);
+    s_e2.fb[s_e2.fb_count++].fb = fb;
+    return fb;
+}
+
+/* Depth when the draw names no zeta: one scratch image, grown as needed and
+ * cleared to the far plane when (re)created. Key 0xFFFFFFFF in the cache. */
+static VkImageView vk_eng_scratch_depth(u32 w, u32 h)
+{
+    if (s_e2.scratch_depth.view && s_e2.scratch_w >= w && s_e2.scratch_h >= h)
+        return s_e2.scratch_depth.view;
+    vk_eng_drop_framebuffers();
+    vk_destroy_image(&s_e2.scratch_depth);
+    if (vk_create_image(&s_e2.scratch_depth, s_vk.depth_format, w, h,
+                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        VK_IMAGE_ASPECT_DEPTH_BIT) || vk_begin())
+        return VK_NULL_HANDLE;
+    vk_barrier_image(s_e2.scratch_depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    VkClearDepthStencilValue far_plane = { 1.0f, 0 };
+    VkImageSubresourceRange r = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    pvkCmdClearDepthStencilImage(s_vk.cmd, s_e2.scratch_depth.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
+    if (vk_submit_and_wait()) return VK_NULL_HANDLE;
+    s_e2.scratch_w = w; s_e2.scratch_h = h;
+    return s_e2.scratch_depth.view;
+}
+
+static int vk_eng_ensure_indices(VkDeviceSize bytes)
+{
+    if (s_e2.indices.buf && s_e2.indices.size >= bytes) return 0;
+    VkDeviceSize size = s_e2.indices.size ? s_e2.indices.size : 64 * 1024;
+    while (size < bytes) size *= 2;
+    vk_destroy_buffer(&s_e2.indices);
+    if (vk_create_host_buffer(&s_e2.indices, size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) return -1;
+    return s_e2.indices.coherent ? 0 : -1;
+}
+
+static void vk_eng_write_descriptors(void)
+{
+    VkDescriptorBufferInfo bi[2] = {
+        { s_g.ubo.buf, 0, s_e2.vs_bytes ? s_e2.vs_bytes : 16u },
+        { s_g.ubo.buf, s_g.ps_off, s_e2.ps_bytes ? s_e2.ps_bytes : 16u },
+    };
+    VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, s_vk.dummy.view, VK_IMAGE_LAYOUT_GENERAL };
+        si[u] = (VkDescriptorImageInfo){ s_vk.sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+    }
+    VkWriteDescriptorSet w[4] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+          .dstBinding = RSX_SPIRV_VPCONST_BINDING, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[0] },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+          .dstBinding = RSX_SPIRV_PSCONST_BINDING, .descriptorCount = 1,
+          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi[1] },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+          .dstBinding = RSX_SPIRV_TEXTURE_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+          .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = ii },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s_g.set,
+          .dstBinding = RSX_SPIRV_SAMPLER_BINDING, .descriptorCount = RSX_MAX_TEXTURES,
+          .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = si },
+    };
+    pvkUpdateDescriptorSets(s_vk.device, 4, w, 0, NULL);
+}
+
 static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                         u32 stride, const u32* indices, u32 index_count)
-{ (void)user; (void)topology; (void)vertices; (void)vertex_count; (void)stride; (void)indices; (void)index_count; }
+{
+    (void)user;
+    if (!s_e2.pipeline || !vertices || !vertex_count || !stride) return;
+    if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
+    vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
+    if (!P->used || stride != P->stride) return;
+
+    /* Targets: every member of a set is target A's size (engine contract). */
+    const u32 n = s_eng_bound.nrt;
+    if (n < 1 || n != P->rt_count) {
+        if (!(s_e2.warned & 16u)) { VK_LOG("engine: draw with %u colour targets for a %u-target pipeline skipped\n", n, P->rt_count); s_e2.warned |= 16u; }
+        return;
+    }
+    vk_eng_obj* rt0 = vk_eng_get(s_eng_bound.rt[0], VK_ENG_COLOR);
+    if (!rt0) return;
+    for (u32 i = 1; i < n; i++)
+        if (!vk_eng_get(s_eng_bound.rt[i], VK_ENG_COLOR)) return;
+    const u32 w = rt0->w, h = rt0->h;
+    vk_eng_obj* zo = vk_eng_get(s_eng_bound.depth, VK_ENG_DEPTH);
+    VkImageView dview = (zo && zo->w >= w && zo->h >= h) ? zo->im.view : vk_eng_scratch_depth(w, h);
+    if (!dview) return;
+    const u32 dkey = (zo && dview == zo->im.view) ? s_eng_bound.depth : 0xFFFFFFFFu;
+
+    VkPipeline pipe = vk_eng_variant(P, (u32)topology - 1u);
+    VkRenderPass rp = vk_eng_render_pass(n);
+    VkFramebuffer fb = vk_eng_framebuffer(rp, s_eng_bound.rt, n, dview, dkey, w, h);
+    if (!pipe || !rp || !fb) return;
+
+    const VkDeviceSize vbytes = (VkDeviceSize)vertex_count * stride;
+    if (vk_ensure_vertex_buffer(vbytes)) return;
+    memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
+    if (indices && index_count) {
+        if (vk_eng_ensure_indices((VkDeviceSize)index_count * 4u)) return;
+        memcpy(s_e2.indices.ptr, indices, (size_t)index_count * 4u);
+    }
+    vk_eng_write_descriptors();
+
+    if (vk_begin()) return;
+    /* Everything submitted before is complete (each submission is waited
+     * on); this orders memory for the surfaces this draw touches. */
+    for (u32 i = 0; i < n; i++)
+        vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                  .renderPass = rp, .framebuffer = fb,
+                                  .renderArea = { { 0, 0 }, { w, h } } };
+    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+    if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
+        vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1]; vp.width = s_e2.vp[2]; vp.height = s_e2.vp[3];
+    }
+    VkRect2D sc = { { 0, 0 }, { w, h } };
+    if (s_e2.have_sc) {                       /* clamped: Vulkan rejects negative or over-size */
+        u32 x0 = s_e2.sc[0] < w ? s_e2.sc[0] : w, y0 = s_e2.sc[1] < h ? s_e2.sc[1] : h;
+        u32 x1 = s_e2.sc[0] + s_e2.sc[2], y1 = s_e2.sc[1] + s_e2.sc[3];
+        if (x1 > w) x1 = w;
+        if (y1 > h) y1 = h;
+        sc.offset.x = (int32_t)x0; sc.offset.y = (int32_t)y0;
+        sc.extent.width = x1 > x0 ? x1 - x0 : 0; sc.extent.height = y1 > y0 ? y1 - y0 : 0;
+    }
+    pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
+    pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
+    pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
+    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_g.pipe_layout,
+                             0, 1, &s_g.set, 0, NULL);
+    VkDeviceSize off = 0;
+    pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &s_vk.vertices.buf, &off);
+    if (indices && index_count) {
+        pvkCmdBindIndexBuffer(s_vk.cmd, s_e2.indices.buf, 0, VK_INDEX_TYPE_UINT32);
+        pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
+    } else {
+        pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+    }
+    pvkCmdEndRenderPass(s_vk.cmd);
+    vk_submit_and_wait();
+}
 
 static const rsx_draw_backend s_vk_engine_backend = {
     .user                 = NULL,
@@ -2164,10 +2670,10 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .pipeline_release     = vk_eng_pipeline_release,
     .bind_targets         = vk_eng_bind_targets,
     .bind_pipeline        = vk_eng_bind_pipeline,
-    .bind_vs_constants    = vk_eng_bind_constants,
-    .bind_ps_constants    = vk_eng_bind_constants,
+    .bind_vs_constants    = vk_eng_bind_vs_constants,
+    .bind_ps_constants    = vk_eng_bind_ps_constants,
     .bind_textures        = vk_eng_bind_textures,
-    .bind_vertex_textures = vk_eng_bind_textures,
+    .bind_vertex_textures = vk_eng_bind_vertex_textures,
     .set_viewport         = vk_eng_set_viewport,
     .set_scissor          = vk_eng_set_scissor,
     .set_stencil_ref      = vk_eng_set_stencil_ref,
