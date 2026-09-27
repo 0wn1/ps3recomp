@@ -81,7 +81,9 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #if defined(YZ_PERF_CLEAN)
 #define LD_DIAG_ENABLED(name) 0
 #else
-#define LD_DIAG_ENABLED(name) (getenv(name) != NULL)
+/* Cached per call site: several of these sit on per-draw paths. */
+#define LD_DIAG_ENABLED(name) ({ static int _ld_diag = -1; \
+    if (_ld_diag < 0) _ld_diag = getenv(name) != NULL; _ld_diag; })
 #endif
 #include <string.h>
 
@@ -6847,7 +6849,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                   }
               }
           } }
-        if (sampled < 0 && getenv("LD_ALIAS_DBG")) {
+        if (sampled < 0 && LD_DIAG_ENABLED("LD_ALIAS_DBG")) {
             static u32 n_dbg = 0;
             if (n_dbg++ < 24) {
                 fprintf(stderr, "[alias-miss] tex %u:0x%08X fmt=0x%02X %ux%u target=%u surf:",

@@ -3195,7 +3195,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                     (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
                     (unsigned)ctx->lr);
             fflush(stderr); } }
-        if (getenv("PS3_SCBLOCK_PROF")) {
+        static int s_sbp = -1; if (s_sbp < 0) s_sbp = getenv("PS3_SCBLOCK_PROF") ? 1 : 0;
+        if (s_sbp) {
             static ULONGLONG s_acc[1024]={0}; static uint32_t s_cnt[1024]={0}; static ULONGLONG s_win=0;
             uint32_t _a3=(uint32_t)ctx->gpr[3], _a4=(uint32_t)ctx->gpr[4], _a5=(uint32_t)ctx->gpr[5];
             ULONGLONG _t0 = GetTickCount64();

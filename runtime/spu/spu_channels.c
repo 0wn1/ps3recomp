@@ -73,6 +73,43 @@ static uint64_t spu_host_ns(void)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
+ * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
+#define SPU_WATCH_MAX 4
+int g_spu_ls_watch_n = -1;
+int g_spu_ls_probe = -1;      /* spu_ls_read_probe gate (SPU_LS_LOWREAD) */
+int g_spu_smc_watch = -1;     /* spu_ls_write_probe_smc gate (SPU_SMC_WATCH) */
+static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
+unsigned* spu_ls_watch_list(int* out_n)
+{
+    if (g_spu_ls_watch_n < 0) {
+        int n = 0; const char* e = getenv("SPU_LS_WATCH");
+        while (e && *e && n < SPU_WATCH_MAX) {
+            s_spu_ls_watch[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
+            while (*e == ',' || *e == ' ') e++;
+        }
+        g_spu_ls_watch_n = n;
+    }
+    *out_n = g_spu_ls_watch_n;
+    return s_spu_ls_watch;
+}
+void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
+{
+    int n; spu_ls_watch_list(&n);
+    if (!n) return;
+    uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
+    for (int i = 0; i < g_spu_ls_watch_n; i++) {
+        if (s_spu_ls_watch[i] == a) {
+            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
+                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                is_write ? "WR" : "rd", a, pc, lr,
+                p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+                p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+            fflush(stderr);
+            break;
+        }
+    }
+}
 
 static SPU_TLS jmp_buf s_spu_halt_env;
 static SPU_TLS int     s_spu_halt_armed = 0;
@@ -2043,6 +2080,14 @@ void spu_indirect_branch(spu_context* ctx)
                         n, ctx->gpr[3]._u32[0]);
             ctx->gpr[3] = spu_make_preferred_u32(0);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+            /* A real SPU spins here on its own core; a host thread doing the
+             * same competes with the PPU and the SPURS tasks. Give the core up
+             * if anything else is ready (no-op otherwise). */
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
             return;
         }
     }
@@ -2054,14 +2099,6 @@ void spu_indirect_branch(spu_context* ctx)
     if (ctx->pc == SPURS_TASKSET_PM_SYSCALL_LS) {
         uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
                     | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
-            /* A real SPU spins here on its own core; a host thread doing the
-             * same competes with the PPU and the SPURS tasks. Give the core up
-             * if anything else is ready (no-op otherwise). */
-#ifdef _WIN32
-            SwitchToThread();
-#else
-            sched_yield();
-#endif
         /* A task dispatched standalone (no policy module in this local store)
          * runs on the SpursTasksetContext spu_workload.c plants, whose
          * syscallAddr is this address; nothing is lifted at 0xA70 for it, so

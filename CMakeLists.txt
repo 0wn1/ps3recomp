@@ -252,6 +252,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
         $<$<CONFIG:Release,RelWithDebInfo>:-O2>
+        # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
+        # hottest SPU op in lifted audio code.
+        -msse4.1
     )
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.

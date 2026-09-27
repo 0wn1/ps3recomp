@@ -73,6 +73,7 @@ void     ps3_load_prx_modules(void) {}
 
 #ifdef _WIN32
 #include <windows.h>
+#include <intrin.h>   /* _ReturnAddress */
 /* timeBeginPeriod: windows.h is included with WIN32_LEAN_AND_MEAN, which
  * excludes the multimedia timer API, so it must be asked for by name -- and
  * AFTER windows.h, since timeapi.h uses UINT and friends. */
@@ -117,7 +118,28 @@ char* __cdecl cached_getenv(const char* name)
         const char* k = s_env[i].key;
         MemoryBarrier();
         if (!k) break;
-        if (!_stricmp(k, name)) return (char*)s_env[i].val;
+        if (!_stricmp(k, name)) {
+            /* GETENV_STATS=1: which gate is being polled on a hot path. */
+            static int st = -1;
+            if (st < 0) st = env_lookup_os("GETENV_STATS") ? 1 : 0;
+            if (st) {
+                static unsigned cnt[1024]; static void* ra[1024]; static unsigned long long tot;
+                cnt[i]++; ra[i] = _ReturnAddress();
+                if ((++tot & ((1u << 22) - 1)) == 0) {
+                    const uintptr_t exe = (uintptr_t)GetModuleHandleA(NULL);
+                    for (int r = 0; r < 5; r++) {
+                        unsigned b = 0;
+                        for (unsigned j = 1; j <= mask; j++) if (cnt[j] > cnt[b]) b = j;
+                        if (!cnt[b]) break;
+                        fprintf(stderr, "[getenv-stats] %-28s %u calls  caller rva=0x%llX%c",
+                                s_env[b].key, cnt[b], (unsigned long long)((uintptr_t)ra[b] - exe), 10);
+                        cnt[b] = 0;
+                    }
+                    memset(cnt, 0, sizeof cnt);
+                }
+            }
+            return (char*)s_env[i].val;
+        }
     }
     AcquireSRWLockExclusive(&s_env_lock);
     const char* val = NULL; int found = 0;

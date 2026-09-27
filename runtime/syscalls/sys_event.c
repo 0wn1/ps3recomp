@@ -283,6 +283,9 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
             queue_id);
 }
 
+/* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
+static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
+
 int64_t sys_event_queue_receive(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
@@ -298,7 +301,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
     /* PS3_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
      * exact game function the main thread is stuck polling in the flip loop. */
-    if (getenv("PS3_WAITBT")) {
+    if ((s_ps3_waitbt < 0 ? (s_ps3_waitbt = getenv("PS3_WAITBT") ? 1 : 0) : s_ps3_waitbt)) {
         static unsigned char seen[8][8] = {{0}};
         unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
         if (!seen[t][qk]) {
@@ -362,7 +365,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * 0x004F5F80) against the recorded SPURS context. It claims the ready task
      * from libsre's taskset and runs the task body -- real recompiled SPU code,
      * not a synthesized completion. Gated by YDKJ_SPUTASK; fire once. */
-    if (getenv("YDKJ_SPUTASK") && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
+    if ((s_ydkj_sputask < 0 ? (s_ydkj_sputask = getenv("YDKJ_SPUTASK") ? 1 : 0) : s_ydkj_sputask) && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
         static int s_fired = 0;
         if (!s_fired) {
             s_fired = 1;
@@ -383,7 +386,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * returns. Synthesize a ready event so init returns -> see whether the PPU
      * then reaches CreateTaskset and the running policy dispatches the cri task.
      * Returns a zero-ish SPU-thread-group event; refine the format if init rejects it. */
-    if (getenv("YDKJ_SPURS_READY") && (queue_id == 1 || queue_id == 4)
+    if ((s_ydkj_spurs_ready < 0 ? (s_ydkj_spurs_ready = getenv("YDKJ_SPURS_READY") ? 1 : 0) : s_ydkj_spurs_ready) && (queue_id == 1 || queue_id == 4)
             && timeout_us == 0 && q->count == 0) {
         static int s_fire[8] = {0};
         if (s_fire[queue_id] < 64) {
@@ -409,7 +412,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * main thread times out after 30s and the title tears down. Synthesize a
      * completion so the wait returns -> see whether the game then advances to
      * asset load + menu draw (content). Returns immediately with a zero event. */
-    if (getenv("YDKJ_FAKECOMPLETE") && (queue_id == 2 || queue_id == 3) && q->count == 0) {
+    if ((s_ydkj_fakecomplete < 0 ? (s_ydkj_fakecomplete = getenv("YDKJ_FAKECOMPLETE") ? 1 : 0) : s_ydkj_fakecomplete) && (queue_id == 2 || queue_id == 3) && q->count == 0) {
         if (event_addr != 0) {
             uint64_t* out = (uint64_t*)vm_to_host(event_addr);
             out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
@@ -419,7 +422,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* YDKJ_HLE_DRAW (diagnostic): also unblock the AsyncLoad q=1 wait (timeout=0,
      * blocks forever) so the loader thread proceeds. Tests whether the game's
      * render/draw code is reachable once the completion waits are satisfied. */
-    if (getenv("YDKJ_HLE_DRAW") && queue_id == 1 && timeout_us == 0 && q->count == 0) {
+    if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && q->count == 0) {
         static int s_n1 = 0;
         if (s_n1 < 256) { s_n1++;
             if (event_addr != 0) {
