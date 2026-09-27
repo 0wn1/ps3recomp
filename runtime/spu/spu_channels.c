@@ -2080,14 +2080,6 @@ void spu_indirect_branch(spu_context* ctx)
                         n, ctx->gpr[3]._u32[0]);
             ctx->gpr[3] = spu_make_preferred_u32(0);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
-            /* A real SPU spins here on its own core; a host thread doing the
-             * same competes with the PPU and the SPURS tasks. Give the core up
-             * if anything else is ready (no-op otherwise). */
-#ifdef _WIN32
-            SwitchToThread();
-#else
-            sched_yield();
-#endif
             return;
         }
     }
