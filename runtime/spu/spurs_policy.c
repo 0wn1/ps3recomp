@@ -265,7 +265,18 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     unsigned batch_before = g_wws_batch_gets;
     unsigned claim_before = g_spu_putllc_sync_hit;
 
-    spu_run_with_halt(entry, ctx);
+    const int pm_halted = spu_run_with_halt(entry, ctx);
+    /* A lane's run should only end through exitToKernel. Anything else strands
+     * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
+    if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {
+        extern unsigned spu_recent_pcs(uint32_t*, unsigned);
+        uint32_t r[32]; unsigned n = spu_recent_pcs(r, 32);
+        static volatile long s_pe; if (__atomic_add_fetch(&s_pe, 1, __ATOMIC_RELAXED) <= 64) {
+            fprintf(stderr, "[pm-end] lane %u ctx=%p halted=%d status=0x%X pc=0x%05X lr=0x%05X r3=0x%08X depth=%u recent:",
+                    spu_num, (void*)ctx, pm_halted, ctx->status, (uint32_t)ctx->pc & SPU_LS_MASK,
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], ctx->host_depth);
+            for (unsigned k = 0; k < n; k++) fprintf(stderr, " %05X", r[k]);
+            fprintf(stderr, "\n"); fflush(stderr); } }
 
     if (s_claimlog) {
         unsigned claims = g_spu_putllc_sync_hit - claim_before;

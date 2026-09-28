@@ -933,19 +933,45 @@ static DWORD WINAPI debug_console(LPVOID param)
             dump_threads("console", self);
         } else if (!strcmp(verb, "find32") && sscanf(cmd, "%*s %x", &a) == 1) {
             /* find32 <hex>: every aligned big-endian u32 equal to <hex> in committed
-             * guest memory below 0xC0000000 (first 64 hits). */
+             * guest memory below 0xC0000000 (first 4096 hits). */
             const uint32_t be = ((a & 0xFF) << 24) | ((a & 0xFF00) << 8) | ((a >> 8) & 0xFF00) | (a >> 24);
             int hits = 0;
-            for (uintptr_t p = 0; p < 0xC0000000u && hits < 64 && vm_base; ) {
+            for (uintptr_t p = 0; p < 0xC0000000u && hits < 4096 && vm_base; ) {
                 MEMORY_BASIC_INFORMATION mi;
                 if (!VirtualQuery(vm_base + p, &mi, sizeof mi)) break;
                 const uintptr_t end = (uintptr_t)((uint8_t*)mi.BaseAddress + mi.RegionSize) - (uintptr_t)vm_base;
                 if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-                    for (uintptr_t q = p & ~3u; q + 4 <= end && q < 0xC0000000u && hits < 64; q += 4)
+                    for (uintptr_t q = p & ~3u; q + 4 <= end && q < 0xC0000000u && hits < 4096; q += 4)
                         if (*(const uint32_t*)(vm_base + q) == be) { dbg_printf("  0x%08X%c", (unsigned)q, 10); hits++; }
                 p = end;
             }
             dbg_printf("  %d hit(s)%c", hits, 10);
+        } else if (!strcmp(verb, "qbset") && sscanf(cmd, "%*s %x %x", &a, &b) == 2) {
+            /* qbset <name-crc> <value>: set every integer QB struct member with
+             * that name. A member is 16 bytes: xx 01|81 00 00 | name | value | next,
+             * big-endian (GH3: bot_play, unlocked). Prints how many it set. */
+            const uint32_t be_name = ((a & 0xFF) << 24) | ((a & 0xFF00) << 8) | ((a >> 8) & 0xFF00) | (a >> 24);
+            const uint32_t be_val  = ((b & 0xFF) << 24) | ((b & 0xFF00) << 8) | ((b >> 8) & 0xFF00) | (b >> 24);
+            unsigned n = 0;
+            for (uintptr_t p = 0; p < 0xC0000000u && vm_base; ) {
+                MEMORY_BASIC_INFORMATION mi;
+                if (!VirtualQuery(vm_base + p, &mi, sizeof mi)) break;
+                const uintptr_t end = (uintptr_t)((uint8_t*)mi.BaseAddress + mi.RegionSize) - (uintptr_t)vm_base;
+                if (mi.State == MEM_COMMIT && (mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
+                    for (uintptr_t q = (p + 4) & ~3u; q + 8 <= end; q += 4)
+                        if (*(const uint32_t*)(vm_base + q) == be_name) {
+                            /* type word: any flags byte, then 0x01 or 0x81 (integer), 00 00;
+                             * only 0/1 values change -- an unlocked tag is a flag. */
+                            const uint8_t* t = vm_base + q - 4;
+                            const uint32_t v = *(const uint32_t*)(vm_base + q + 4);
+                            if ((t[1] == 0x01 || t[1] == 0x81) && !t[2] && !t[3] &&
+                                (v == 0 || v == 0x01000000u)) {
+                                *(uint32_t*)(vm_base + q + 4) = be_val; n++;
+                            }
+                        }
+                p = end;
+            }
+            dbg_printf("  qbset 0x%08X = %u: %u member(s)%c", a, b, n, 10);
         } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
             dbg_prof((DWORD)a, b ? b : 5);
         } else if (!strcmp(verb, "hle")) {

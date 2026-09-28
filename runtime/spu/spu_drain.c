@@ -46,8 +46,20 @@ void* volatile    g_pm_flow_ctx = 0;
  * set the done bit on the pending records -- the faithful sync equivalent of
  * the completion interrupt. Env SPU_JOBDRAIN (default off while validating). */
 extern void spu_halt(spu_context*);
+/* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
+ * ended where it should not have (spurs_policy.c, [pm-end]). */
+static _Thread_local uint32_t t_recent[32];
+static _Thread_local uint32_t t_recent_n;
+unsigned spu_recent_pcs(uint32_t* out, unsigned max)
+{
+    unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
+    for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
+    return k;
+}
+
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
+    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
