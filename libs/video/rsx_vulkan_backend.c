@@ -1,23 +1,32 @@
 /*
  * ps3recomp - Vulkan RSX Backend. See rsx_vulkan_backend.h.
  *
- * Stage V1: the fallback draw path. Same contract as the headless null
- * backend's software rasteriser, so the two can be compared pixel for pixel:
- *   - position is attribute 0, flat colour is attribute 3 of each triangle's
- *     first vertex, texcoord0 is attribute 8;
- *   - vertices are fetched and primitives expanded on the CPU through the
- *     shared rsx_fetch_attrib(), exactly as the null backend does;
- *   - one texture unit (0), decoded through the shared rsx_texture_decode(),
- *     point-sampled with wrapping;
- *   - NV4097 depth test/function/mask honoured; no blending, no stencil.
- * Guest vertex/fragment programs are the next stage.
+ * The file, in order:
+ *   loader and device      libvulkan by dlopen, Vulkan 1.0 entry points only;
+ *                          device choice, BC textures when the device has them
+ *   memory, images, submit helpers
+ *   vtable fallback path   the null backend's fixed-function contract:
+ *                          position = attribute 0, flat colour = attribute 3
+ *                          of each triangle's first vertex, texcoord0 =
+ *                          attribute 8, fetched and expanded through the
+ *                          shared rsx_fetch_attrib(); unit 0 decoded through
+ *                          rsx_texture_decode(); depth test, no blend/stencil
+ *   vtable guest programs  the same path running the decompilers' HLSL, with
+ *                          whole mip chains and per-unit samplers
+ *   optional window        SDL2 + swapchain; a present blits the frame into it
+ *   draw engine backend    rsx_draw_backend: targets, clears, present and
+ *                          readback (E1), pipelines and draws (E2), textures,
+ *                          surface views and samplers (E3), depth snapshots
+ *                          (E4) -- the stage names in the commit history
+ *   public entry points    init picks the path, shutdown undoes everything
  *
- * Still deliberately synchronous: every clear, draw and present is one
- * one-shot command buffer, submitted and waited on. Slow, trivially correct.
+ * Deliberately synchronous: every clear, draw and present is one one-shot
+ * command buffer, submitted and waited on. Slow and trivially correct; it is
+ * what lets the engine's submit_and_wait and staging reuse cost nothing, and
+ * batching is the first thing to change once correctness is settled.
  *
- * Both render targets stay in VK_IMAGE_LAYOUT_GENERAL for their whole life:
- * legal for transfer clears, copies and as attachments, so no layout
- * bookkeeping is needed yet.
+ * Images stay in VK_IMAGE_LAYOUT_GENERAL for their whole life: legal for
+ * transfers, sampling and as attachments, so there is no layout bookkeeping.
  *
  * Shaders: libs/video/vulkan/rsx_vk_fallback.{vert,frag}, embedded as SPIR-V.
  * Regenerate after editing them with:
