@@ -250,11 +250,40 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
 
+| `PS3RECOMP_VK_GUEST_PROGRAMS=1` | Run the guest's own vertex/fragment programs (needs the translator, below); also makes the draw engine the default path |
+| `PS3RECOMP_RSX_ENGINE=dispatch\|vtable` | Pick the draw path explicitly -- the engine's own switch, shared with Metal |
+
 Without a GPU, Mesa's lavapipe runs every check, e.g.
 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./build/ps3recomp_host --tex`
-(the ICD file name varies by distribution). The modes that need guest programs
-(`--shader`, `--mip`, `--rtt`, `--depthtex`, `--mrt`, `--mrt-a`) report that
-and are skipped, as on the null backend.
+(the ICD file name varies by distribution). Without guest programs, the modes
+that need them (`--shader`, `--mip`, `--rtt`, `--depthtex`, `--mrt`,
+`--mrt-a`) report that and are skipped, as on the null backend.
+
+#### Guest programs and the draw engine
+
+The guest's programs go through the shared decompilers to HLSL, then through
+glslang to SPIR-V (`libs/video/rsx_shader_spirv.cpp`), so they need glslang's
+CMake package at build time; CMake reports whether it found it
+(`Vulkan: guest programs available`). On Debian/Ubuntu that is `glslang-dev`
+plus `spirv-tools`. glslang must be built **with** SPIRV-Tools: the HLSL path
+runs its legalization passes, and a glslang without them emits different --
+possibly invalid -- SPIR-V, silently. That matters when cross-compiling glslang
+yourself: its `update_glslang_sources.py` fetches the SPIRV-Tools revision it
+expects.
+
+```bash
+PS3RECOMP_VK_GUEST_PROGRAMS=1 ./build/ps3recomp_host --rtt
+```
+
+With guest programs on, the backend runs on the register-file draw engine
+(`rsx_draw_engine.h`), as the Metal backend does: the engine owns surfaces,
+render-to-texture, MRT, depth textures, vertex compaction and pipeline keys,
+and every `ps3recomp_host` scene passes. Not handled yet, and logged once when
+a title reaches them: cube maps, vertex-texture units, colour targets other
+than RGBA8 (e.g. the FP16 HDR target), depth-only passes, stencil (the depth
+format has no stencil aspect), and depth snapshots on devices whose depth
+format is not `D32_SFLOAT`. Everything is submitted synchronously for now:
+correct first, fast later.
 
 ### `RSX_LIVE_DRAW` is not required
 
