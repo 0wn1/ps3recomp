@@ -209,25 +209,11 @@ unsigned spu_sn_defer_ticks(void)
  * the irete). State the handler legitimately publishes lives in LS/channels
  * and is untouched. Per-ctx slots; no nesting (interrupts stay disabled
  * until iret). */
-#define SPU_IRQ_SLOTS 8
-struct spu_irq_save {
-    spu_context* ctx;          /* NULL = free */
-    uint32_t     resume_pc;    /* srr0 at take */
-    u128         gpr[128];
-};
-static struct spu_irq_save g_irq_save[SPU_IRQ_SLOTS];
-
 static void spu_irq_regs_save(spu_context* ctx)
 {
-    struct spu_irq_save* s = 0;
-    for (int i = 0; i < SPU_IRQ_SLOTS; i++)
-        if (g_irq_save[i].ctx == ctx) { s = &g_irq_save[i]; break; }
-    if (!s) for (int i = 0; i < SPU_IRQ_SLOTS; i++)
-        if (!g_irq_save[i].ctx) { s = &g_irq_save[i]; break; }
-    if (!s) return;                        /* out of slots: behave as before */
-    s->ctx = ctx;
-    s->resume_pc = ctx->srr0;
-    memcpy(s->gpr, ctx->gpr, sizeof s->gpr);
+    ctx->irq_saved = 1;
+    ctx->irq_resume_pc = ctx->srr0;
+    memcpy(ctx->irq_gpr, ctx->gpr, sizeof ctx->irq_gpr);
 }
 
 /* Called from spu_indirect_branch on every dispatch. Restores + clears when
@@ -238,18 +224,17 @@ static void spu_irq_regs_save(spu_context* ctx)
  * context's registers wholesale. A fresh run must never do that. */
 void spu_irq_regs_forget(spu_context* ctx)
 {
-    for (int i = 0; i < SPU_IRQ_SLOTS; i++)
-        if (g_irq_save[i].ctx == ctx) g_irq_save[i].ctx = 0;
+    ctx->irq_saved = 0;
 }
 
 int spu_irq_regs_maybe_restore(spu_context* ctx)
 {
-    for (int i = 0; i < SPU_IRQ_SLOTS; i++) {
-        if (g_irq_save[i].ctx == ctx) {
-            if ((ctx->pc & SPU_LS_MASK) == (g_irq_save[i].resume_pc & SPU_LS_MASK) &&
+    {
+        if (ctx->irq_saved) {
+            if ((ctx->pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK) &&
                 ctx->int_enable) {
-                memcpy(ctx->gpr, g_irq_save[i].gpr, sizeof g_irq_save[i].gpr);
-                g_irq_save[i].ctx = 0;
+                memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
+                ctx->irq_saved = 0;
                 /* The iret completed below the frame that took the interrupt:
                  * abandon the handler's host frames and resume there. */
                 spu_irq_frame* f = (spu_irq_frame*)ctx->irq_frame;
@@ -407,7 +392,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
-#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; } while (0)
+#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
             if (g_spu_trampoline_fn == spu_indirect_branch &&
@@ -418,6 +403,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             }
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
+            ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             yz_lockstep_tick(ctx);
             spu_task_launch_check(ctx, (void*)fn);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {

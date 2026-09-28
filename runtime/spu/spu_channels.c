@@ -228,6 +228,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * recursion guard halted the SPU at 2000 after a few minutes of idling. */
     ctx->host_depth = 0;
     ctx->irq_frame = 0;
+    ctx->drain_ret_pc = 0;
     /* Nest-safe: a job run synchronously from inside another SPU's execution
      * re-enters here on the same host thread. The halt target is per-thread,
      * so save the outer one and put it back on the way out -- otherwise the

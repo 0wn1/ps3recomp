@@ -373,6 +373,22 @@ typedef struct spu_context {
     uint64_t list_stall_ea_base[32];      /* ea base (hi32 carries), per tag */
     uint32_t list_stall_cmd[32];          /* base (non-list) MFC command, per tag */
 
+    /* Register file saved when an interrupt is taken, restored at its iret
+     * (spu_drain.c). Per context: it used to be an 8-slot global table claimed
+     * without a lock, and two SPU threads taking interrupts at once could take
+     * the same slot -- one lost its save and returned from the handler with
+     * the handler's registers. */
+    int      irq_saved;
+    uint32_t irq_resume_pc;
+    u128     irq_gpr[128];
+
+    /* Return pc of the innermost spu_drain_call (0 = none). The interpreter
+     * rejoins there: a return point sits mid-function, so it is no lifted
+     * entry, and without this the interpreter ran a job's return straight on
+     * through the caller's code until the next lifted entry -- GH3's job
+     * manager then ran its buffer loop a second time on the job's registers
+     * and died in its own assert (the song-freeze). */
+    uint32_t drain_ret_pc;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
