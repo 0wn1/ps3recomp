@@ -72,13 +72,12 @@ int main(void) {
     assert(lc.status == SPU_STATUS_STOPPED_BY_STOP);
 
     /* --- a drain's return point is a rejoin point: il $2,5 then il $3,7 at
-     * drain_ret_pc = 4 -- the interpreter must stop before the second il. */
+     * stop at 4 -- the interpreter must stop before the second il. */
     static spu_context dc;
     memset(&dc, 0, sizeof dc);
     spu_context_init(&dc, 0);
     memcpy(dc.ls, PROG, sizeof PROG);
-    dc.drain_ret_pc = 4;
-    spu_interp_run(&dc, 0);
+    spu_interp_run_until(&dc, 0, 4);
     assert(dc.pc == 4 && dc.gpr[2]._u32[0] == 5 && dc.gpr[3]._u32[0] == 0);
 
     printf("spu_interp_selftest: PASS\n");

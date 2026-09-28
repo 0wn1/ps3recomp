@@ -2027,7 +2027,10 @@ static int spu_smc_microstep(spu_context* ctx)
                       " microstep set -- handing to the interpreter (steps=%d)\n",
                       ctx->image_id, pc, w, steps); }
         ctx->pc = pc;
-        return spu_interp_run(ctx, pc) ? 1 : 0;
+        /* Stop at the drain's return point too: it sits mid-function, so it is
+         * no lifted entry, and a job's return would otherwise run on through
+         * the caller's code (GH3's song-freeze; see drain_ret_pc). */
+        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
     }
     { static int _n = 0; if (_n++ < 4)
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
