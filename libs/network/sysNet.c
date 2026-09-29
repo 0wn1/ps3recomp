@@ -316,10 +316,17 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
          * the vport at offset 8. */
         s_sockets[s].vport = vm_read16(EA(addr) + 8);
         a.sin_port = htons(np_psnr_p2p_port());
+        /* ...on every interface. Titles bind the console's own IP (what
+         * cellNetCtl reports), and Windows then refuses to send from that
+         * socket to a peer on 127.0.0.1 (WSAEADDRNOTAVAIL) -- Simpsons
+         * Arcade's every packet failed that way. The port is what peers use. */
+        a.sin_addr.s_addr = htonl(INADDR_ANY);
     }
     if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR)
         return host_fail();
-    printf("[sys_net] bind(%d, port %u)\n", s, ntohs(a.sin_port));
+    char ip[16];
+    printf("[sys_net] bind(%d, %s:%u%s)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port),
+           s_sockets[s].p2p ? ", p2p" : "");
     return 0;
 }
 

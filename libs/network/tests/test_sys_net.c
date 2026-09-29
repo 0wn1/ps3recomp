@@ -24,7 +24,7 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t addr) { (void)addr; }
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
-uint16_t np_psnr_p2p_port(void) { return 3658; }
+uint16_t np_psnr_p2p_port(void) { return 36658; }
 
 static struct { uint32_t nid; void (*fn)(ppu_context*); } s_reg[64];
 static int s_nreg;
@@ -155,6 +155,27 @@ int main(void)
     uint32_t h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
     assert(h && vm_read32(h + 12) == 4);
     assert(vm_read32(vm_read32(vm_read32(h + 16))) == LOOP);   /* *h_addr_list[0] */
+
+    /* P2P: the title binds its own IP and port 3658 with vport 1000; the host
+     * socket lands on this instance's P2P port on every interface, so a peer
+     * on loopback reaches it, and received addresses carry the vport back. */
+    int32_t p2p = C3("socket", SYS_NET_AF_INET, 6 /* SOCK_DGRAM_P2P */, 0);
+    put_sockaddr(ADDR_A, 0x0A000001u /* 10.0.0.1: not ours */, 3658);
+    vm_write16(ADDR_A + 8, 1000);
+    assert(C3("bind", p2p, ADDR_A, 16) == 0);
+    vm_write32(LEN, 16);
+    assert(C3("getsockname", p2p, ADDR_B, LEN) == 0);
+    assert(vm_read16(ADDR_B + 2) == 36658 && vm_read32(ADDR_B + 4) == 0);
+    put_sockaddr(ADDR_A, LOOP, 36658);
+    memcpy(vm_base + BUF, "p2p", 3);
+    assert(call("sendto", p2p, BUF, 3, 0, ADDR_A, 16) == 3);   /* to itself */
+    assert(C3("socketpoll", POLLFD, 0, 0) == 0);
+    vm_write32(POLLFD, (uint32_t)p2p);
+    vm_write16(POLLFD + 4, SYS_NET_POLLIN);
+    assert(C3("socketpoll", POLLFD, 1, 1000) == 1);
+    assert(call("recvfrom", p2p, BUF, 64, 0, ADDR_B, LEN) == 3);
+    assert(vm_read16(ADDR_B + 8) == 1000);
+    assert(C1("socketclose", p2p) == 0);
 
     /* A bad fd is EBADF (9), and closing works. */
     assert(C1("socketclose", 99) == -1 && errno_cell() == SYS_NET_EBADF);
