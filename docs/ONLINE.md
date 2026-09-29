@@ -43,23 +43,22 @@ PS3_NET_ONLINE=1 PSNR_SERVER=127.0.0.1 PS3_NP_ONLINE_ID=bart  PS3_NET_P2P_PORT=3
 Simpsons Arcade (NPUB30563) was run as two instances on one machine:
 - the host creates a match and the other player finds it with Quick Match;
 - both appear in each other's online lobby and pick characters;
-- the host starts the game;
-- the room goes through psnr, and lobby traffic runs peer to peer over UDP
+- the host starts the game, sends its game setup (58 KB, zlib-compressed by
+  the title, over a TCP P2P socket), and both instances play Stage 1
+  together; one player's moves show on both screens;
+- the room goes through psnr, and game traffic runs peer to peer over UDP
   and TCP P2P sockets.
 
-The match does not start yet. The title sends its game setup as a zlib stream
-over TCP, and the host's compressor emits a 10-byte "stream" whose bytes change
-from run to run for a 58 KB setup. The receiver drops it, and both sides sit on
-"TRANSFERRING GAME SETUP". The compressor is the title's own statically linked
-zlib, running as lifted code, so this is a recompiler or runtime correctness
-problem, not a networking one.
+The setup transfer needs ps3recomp#202: the title's zlib is lifted code, and a
+lifter bug left its compressor emitting a 10-byte stream.
 
 Offline, with none of the variables set, Simpsons boots, reports NP offline,
 shows its "sign in to post scores" notice, and plays Stage 1.
 
 Tests: `libs/network/tests/test_np_matching2.c` covers response relocation,
 attribute packing and the room structures a title reads. `test_sys_net.c`
-covers sockets over loopback, including a P2P bind and receive.
+covers sockets over loopback, including a P2P bind and receive, and two P2P
+stream sockets sharing the port with the peer seeing that port on accept.
 
 What it took to get the lobby up, each of which a title will hit:
 - **RoomMemberDataInternal layout.** userInfo is at +4 and memberId at +56,
@@ -71,7 +70,10 @@ What it took to get the lobby up, each of which a title will hit:
 - **Distinct console identity.** Each player needs their own OpenPSID; the
   title hashes it into the key each player announces.
 - **P2P sockets.** They bind all interfaces. Stream sockets connect to the
-  vport, and spare binds go to ephemeral ports.
+  port in sin_vport, and every stream socket shares the P2P port, so a
+  connection comes from the port signaling reported. Accept reports that
+  port in sin_vport, the way connect takes it: the title matches the
+  connection to a room member by it and drops data from anyone else.
 - **libnet errors.** A failing call returns `0x80010200 | errno` in-band.
 
 ## Why it is shaped this way
