@@ -387,11 +387,29 @@ static int host_recv_flags(int32_t flags)
     return f;
 }
 
+/* PS3_NET_TRACE=1: log every packet sent and every one received (not the
+ * empty polls), with its peer. How a title's own session handshake is seen. */
+static int net_trace(void)
+{
+    static int t = -1;
+    if (t < 0) t = getenv("PS3_NET_TRACE") ? 1 : 0;
+    return t;
+}
+
+static void trace(const char* op, int32_t s, int n, const struct sockaddr_in* a)
+{
+    char ip[16] = "-";
+    if (a) ip_str(&a->sin_addr, ip);
+    printf("[sys_net] %s(%d) %s:%u -> %d%s\n", op, s, ip, a ? ntohs(a->sin_port) : 0, n,
+           n < 0 ? " (error)" : "");
+}
+
 int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flags)
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
     int n = send(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, 0);
+    if (net_trace()) trace("send", s, n, NULL);
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
 }
 
@@ -406,6 +424,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
     int n = sendto(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, 0,
                    (struct sockaddr*)&a, sizeof(a));
+    if (net_trace()) trace("sendto", s, n, &a);
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
 }
 
@@ -414,6 +433,7 @@ int32_t sys_net_bnet_recv(int32_t s, void* buf, uint32_t len, int32_t flags)
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (would_block(s, flags, POLLIN)) return fail(SYS_NET_EWOULDBLOCK);
     int n = recv(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len, host_recv_flags(flags));
+    if (net_trace() && n != HOST_SOCKET_ERROR) trace("recv", s, n, NULL);
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
 }
 
@@ -429,6 +449,7 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
     int n = recvfrom(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len,
                      host_recv_flags(flags), (struct sockaddr*)&a, &alen);
     if (n == HOST_SOCKET_ERROR) return host_fail();
+    if (net_trace()) trace("recvfrom", s, n, &a);
     write_sockaddr(EA(from), EA(fromlen), &a);
     if (from && s_sockets[s].p2p) vm_write16(EA(from) + 8, s_sockets[s].vport);
     return n;
