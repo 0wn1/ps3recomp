@@ -132,9 +132,9 @@ int main(void)
     assert(vm_read32(rd + 40) == 1);               /* membersNum */
     u32 mem = vm_read32(rd + 36);
     assert(mem && vm_read32(rd + 44) == mem && vm_read32(rd + 48) == mem);   /* me, owner */
-    assert(vm_read16(mem + 60) == 1);              /* memberId */
-    assert(!memcmp(vm_base + mem + 16, "homer", 5));
-    assert(vm_read32(mem + 72) == MEMBER_FLAG_OWNER);
+    assert(vm_read16(mem + 56) == 1);              /* memberId */
+    assert(!memcmp(vm_base + mem + 4, "homer", 5));  /* userInfo.npId */
+    assert(vm_read32(mem + 60) == MEMBER_FLAG_OWNER);
     assert(vm_read32(mem + 80) == 1);              /* the member's bin attr came back */
     u32 ba = vm_read32(mem + 76);
     assert(vm_read16(ba) == 0x59 && vm_read32(ba + 8) == 3 && !memcmp(vm_base + vm_read32(ba + 4), "abc", 3));

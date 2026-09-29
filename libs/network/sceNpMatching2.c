@@ -444,16 +444,20 @@ static void rb_userinfo(rb_t* r, u32 at, const char* online_id)
 }
 
 /* SceNpMatching2RoomMemberDataInternal                                     88 bytes
- *   0 next | 8 joinDate u64 | 16 userInfo (44) | 60 memberId u16 | 62 teamId
- *   64 roomGroup | 68 natType | 72 flagAttr | 76 binAttrInternal | 80 num */
+ *   0 next | 4 userInfo (44) | 48 joinDate u64 | 56 memberId u16 | 60 flagAttr
+ *   64 teamId | 68 roomGroup | 72 natType | 76 binAttrInternal | 80 num
+ * Checked against Simpsons Arcade, which reads the NP ID at +4 and the member
+ * id at +56 to assign its transport channels. With joinDate ahead of
+ * userInfo (an earlier guess) it read the top of a pointer as the member id,
+ * matched no peer, and never sent a packet. */
 static u32 rb_member(rb_t* r, const m2_room* room, const m2_member* m)
 {
     u32 o = rb_alloc(r, 88, 8);
-    rb_64(r, o + 8, m->joined);
-    rb_userinfo(r, o + 16, m->online_id);
-    rb_16(r, o + 60, m->id);
-    rb_8(r, o + 68, 2);   /* NAT type 2 */
-    rb_32(r, o + 72, m->id == room->owner ? MEMBER_FLAG_OWNER : 0);
+    rb_userinfo(r, o + 4, m->online_id);
+    rb_64(r, o + 48, m->joined);
+    rb_16(r, o + 56, m->id);
+    rb_32(r, o + 60, m->id == room->owner ? MEMBER_FLAG_OWNER : 0);
+    rb_8(r, o + 72, 2);   /* NAT type 2 */
     u32 n, arr = rb_attrs(r, &m->data, 1, &n);
     if (n) rb_ptr(r, o + 76, arr);
     rb_32(r, o + 80, n);
