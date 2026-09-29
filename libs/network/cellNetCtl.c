@@ -188,13 +188,22 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     case CELL_NET_CTL_INFO_ETHER_ADDR:
-        /* Fake PS3-like MAC: 00:04:1F:xx:xx:xx (Sony OUI) */
-        info->ether_addr.data[0] = 0x00;
-        info->ether_addr.data[1] = 0x04;
-        info->ether_addr.data[2] = 0x1F;
-        info->ether_addr.data[3] = 0xAB;
-        info->ether_addr.data[4] = 0xCD;
-        info->ether_addr.data[5] = 0xEF;
+        /* Fake PS3-like MAC: 00:04:1F:xx:xx:xx (Sony OUI). The low three bytes
+         * come from the player's online ID, so two instances are two consoles:
+         * titles key their peers on the MAC. Simpsons Arcade's host took a
+         * joining player with the same MAC for itself and never gave them a
+         * slot. */
+        {
+            extern const char* np_psnr_online_id(void);
+            uint32_t h = 2166136261u;   /* FNV-1a */
+            for (const char* p = np_psnr_online_id(); *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+            info->ether_addr.data[0] = 0x00;
+            info->ether_addr.data[1] = 0x04;
+            info->ether_addr.data[2] = 0x1F;
+            info->ether_addr.data[3] = (uint8_t)(h >> 16);
+            info->ether_addr.data[4] = (uint8_t)(h >> 8);
+            info->ether_addr.data[5] = (uint8_t)h;
+        }
         break;
 
     case CELL_NET_CTL_INFO_MTU:
