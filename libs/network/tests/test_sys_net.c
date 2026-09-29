@@ -195,7 +195,7 @@ int main(void)
     assert(C3("connect", out, ADDR_A, 16) == 0);
     vm_write32(LEN, 16);
     int32_t in = C3("accept", l1, ADDR_B, LEN);
-    assert(in >= 0 && vm_read16(ADDR_B + 2) == 36659);
+    assert(in >= 0 && vm_read16(ADDR_B + 2) == 36659 && vm_read16(ADDR_B + 8) == 36659);
     s_p2p_port = 36658;
     assert(C1("socketclose", in) == 0 && C1("socketclose", out) == 0);
     assert(C1("socketclose", l2) == 0 && C1("socketclose", l1) == 0);

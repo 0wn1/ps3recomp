@@ -387,6 +387,11 @@ int32_t sys_net_bnet_accept(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen
     if (net_trace()) printf("[sys_net] accept(%d) -> %d\n", s, slot);
     s_sockets[slot].vport = s_sockets[s].vport;
     write_sockaddr(EA(addr), EA(addrlen), &a);
+    /* The mirror of connect: titles name a stream peer by the P2P port in
+     * sin_vport, and the peer connects from its P2P port (see bind). Simpsons
+     * Arcade keys the host's connection on it; left at 0, the host's game
+     * setup matched no member and was dropped. */
+    if (addr && s_sockets[s].p2p) vm_write16(EA(addr) + 8, ntohs(a.sin_port));
     return slot;
 }
 
