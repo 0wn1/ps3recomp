@@ -398,10 +398,15 @@ static int net_trace(void)
 
 static void trace(const char* op, int32_t s, int n, const struct sockaddr_in* a)
 {
+#ifdef _WIN32
+    int err = n < 0 ? WSAGetLastError() : 0;
+#else
+    int err = n < 0 ? errno : 0;
+#endif
     char ip[16] = "-";
     if (a) ip_str(&a->sin_addr, ip);
-    printf("[sys_net] %s(%d) %s:%u -> %d%s\n", op, s, ip, a ? ntohs(a->sin_port) : 0, n,
-           n < 0 ? " (error)" : "");
+    printf("[sys_net] %s(%d) %s:%u -> %d (host error %d)\n", op, s, ip,
+           a ? ntohs(a->sin_port) : 0, n, err);
 }
 
 int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flags)
