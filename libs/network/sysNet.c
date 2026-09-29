@@ -95,6 +95,8 @@ static int32_t  s_errno = 0;   /* ponytail: one errno for every thread, per-thre
  * +40, the address at +48, the name at +64. */
 #define HOSTENT_SCRATCH 320u
 
+static int net_trace(void);   /* PS3_NET_TRACE; defined with the send/recv paths */
+
 static uint32_t scratch(uint32_t* ea, uint32_t size)
 {
     if (!*ea && s_alloc) *ea = s_alloc(size, 16);
@@ -345,6 +347,7 @@ int32_t sys_net_bnet_listen(int32_t s, int32_t backlog)
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (listen(s_sockets[s].host_fd, backlog) == HOST_SOCKET_ERROR) return host_fail();
+    printf("[sys_net] listen(%d)\n", s);
     return 0;
 }
 
@@ -364,6 +367,7 @@ int32_t sys_net_bnet_accept(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen
     }
     s_sockets[slot].p2p = s_sockets[s].p2p;
     s_sockets[slot].stream = 1;
+    if (net_trace()) printf("[sys_net] accept(%d) -> %d\n", s, slot);
     s_sockets[slot].vport = s_sockets[s].vport;
     write_sockaddr(EA(addr), EA(addrlen), &a);
     return slot;
@@ -390,7 +394,9 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
 #ifdef _WIN32
         if (WSAGetLastError() == WSAEWOULDBLOCK) return fail(SYS_NET_EINPROGRESS);
 #endif
-        return host_fail();
+        int32_t r = host_fail();
+        if (net_trace()) printf("[sys_net] connect(%d) failed, errno %d\n", s, s_errno);
+        return r;
     }
     return 0;
 }
