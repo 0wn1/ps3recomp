@@ -107,7 +107,7 @@ s32 cellVdecEndSeq(CellVdecHandle handle);
 
 s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auInfo);
 
-s32 cellVdecGetPicture(CellVdecHandle handle, const CellVdecPicItem** picItem);
+s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff);
 s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem);
 
 s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode);

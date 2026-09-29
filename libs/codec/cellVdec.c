@@ -11,6 +11,7 @@
 #include <string.h>
 #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
+#include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -194,24 +195,104 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     return CELL_OK;
 }
 
-s32 cellVdecGetPicture(CellVdecHandle handle, const CellVdecPicItem** picItem)
-{
-    if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
-        return (s32)CELL_VDEC_ERROR_ARG;
+/* Guest-resident pic items. cellVdecGetPicItem hands the title a POINTER to a
+ * CellVdecPicItem, so it has to live in guest memory, big-endian; writing
+ * &host_struct through the guest's out-pointer crashed Resistance: Fall of Man
+ * inside its PICOUT callback. One 0x100-byte block per decoder after cellAdec's
+ * scratch (VM_HLE_INJECT_BASE + 0x40000..0x50000): the item at +0, the codec
+ * info it points to at +0x80.
+ *
+ * Guest CellVdecPicItem: +0x00 codecType, +0x04 startAddr, +0x08 size,
+ * +0x0C u8 auNum, +0x10 auPts[2] {upper,lower}, +0x20 auDts[2],
+ * +0x30 u64 auUserData[2], +0x40 status, +0x44 attr (0 normal, 1 skipped),
+ * +0x48 picInfo. CellVdecAvcInfo and CellVdecMpeg2Info both begin with
+ * u16 horizontalSize, u16 verticalSize; the rest of the info block is zero. */
+#define VDEC_ITEM_EA(h)  (VM_HLE_INJECT_BASE + 0x50000u + (u32)(h) * 0x100u)
+#define VDEC_INFO_EA(h)  (VDEC_ITEM_EA(h) + 0x80u)
 
+static void vdec_write_item(CellVdecHandle handle)
+{
+    const VdecSlot* v = &s_vdec[handle];
+    const CellVdecPicItem* p = &v->lastPic;
+    u32 it = VDEC_ITEM_EA(handle), info = VDEC_INFO_EA(handle);
+    for (u32 o = 0; o < 0x100; o += 4) vm_write32(it + o, 0);
+    vm_write32(it + 0x00, v->codecType);
+    vm_write32(it + 0x04, p->startAddr);
+    vm_write32(it + 0x08, p->size);
+    vm_write8 (it + 0x0C, 1);                          /* one AU per picture */
+    vm_write32(it + 0x10, (u32)(p->pts >> 32));        /* auPts[0] */
+    vm_write32(it + 0x14, (u32)p->pts);
+    vm_write32(it + 0x18, 0xFFFFFFFFu);                /* auPts[1]: unused */
+    vm_write32(it + 0x1C, 0xFFFFFFFFu);
+    vm_write32(it + 0x20, (u32)(p->dts >> 32));        /* auDts[0] */
+    vm_write32(it + 0x24, (u32)p->dts);
+    vm_write32(it + 0x28, 0xFFFFFFFFu);
+    vm_write32(it + 0x2C, 0xFFFFFFFFu);
+    vm_write64(it + 0x30, p->userData);                /* auUserData[0] */
+    vm_write32(it + 0x40, 0);                          /* status: OK */
+    vm_write32(it + 0x44, 0);                          /* attr: normal */
+    vm_write32(it + 0x48, info);
+    vm_write16(info + 0, p->width);
+    vm_write16(info + 2, p->height);
+}
+
+/* cellVdecGetPicItem(handle, &item): the NEXT picture's item, without
+ * consuming it; cellVdecGetPicture is what takes it off the queue. */
+s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
+{
+    u32 out = (u32)(uintptr_t)picItem;
+    if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !out)
+        return (s32)CELL_VDEC_ERROR_ARG;
     if (!s_vdec[handle].hasPic)
         return (s32)CELL_VDEC_ERROR_EMPTY;
-
-    if (picItem)
-        *picItem = &s_vdec[handle].lastPic;
-
-    s_vdec[handle].hasPic = 0;
+    vdec_write_item(handle);
+    vm_write32(out, VDEC_ITEM_EA(handle));
     return CELL_OK;
 }
 
-s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
+/* cellVdecGetPicture(handle, format, outBuff): copy the next picture out in
+ * the requested format and consume it. format is a guest CellVdecPicFormat
+ * { u32 formatType; u32 colorMatrixType; u8 alpha; }; formatType 0 ARGB32,
+ * 1 RGBA32, 2 UYVY422, 3 YUV420 planar.
+ * ponytail: there is no H.264/MPEG-2 decoder behind this, so the picture is
+ * black at the item's size (1280x720 unless set). Real frames need a decoder;
+ * titles that only pace playback on PICOUT/GetPicture run as they should. */
+s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
 {
-    return cellVdecGetPicture(handle, picItem);
+    u32 fmt_ea = (u32)(uintptr_t)format, dst = (u32)(uintptr_t)outBuff;
+    if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !fmt_ea)
+        return (s32)CELL_VDEC_ERROR_ARG;
+    VdecSlot* v = &s_vdec[handle];
+    if (!v->hasPic)
+        return (s32)CELL_VDEC_ERROR_EMPTY;
+    v->hasPic = 0;
+    if (!dst)
+        return CELL_OK;                                /* a skip: consume only */
+
+    u32 type  = vm_read32(fmt_ea + 0);
+    u8  alpha = vm_read8(fmt_ea + 8);
+    u32 w = v->lastPic.width, h = v->lastPic.height;
+    u8 row[4096 * 4];
+    u32 rowlen;
+    switch (type) {
+    case 0: case 1:                                    /* ARGB32 / RGBA32 */
+        rowlen = w * 4; memset(row, 0, rowlen);
+        for (u32 x = 0; x < w; x++) row[x * 4 + (type == 0 ? 0 : 3)] = alpha;
+        break;
+    case 2:                                            /* UYVY: U Y V Y */
+        rowlen = w * 2;
+        for (u32 x = 0; x < rowlen; x += 2) { row[x] = 0x80; row[x + 1] = 0x10; }
+        break;
+    default: {                                         /* YUV420 planar */
+        memset(row, 0x10, w);
+        for (u32 y = 0; y < h; y++) guest_struct_store(dst + y * w, row, w);
+        memset(row, 0x80, w / 2);
+        u32 c = dst + w * h;
+        for (u32 y = 0; y < h; y++) guest_struct_store(c + y * (w / 2), row, w / 2);
+        return CELL_OK; }
+    }
+    for (u32 y = 0; y < h; y++) guest_struct_store(dst + y * rowlen, row, rowlen);
+    return CELL_OK;
 }
 
 s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode)
