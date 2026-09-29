@@ -49,6 +49,7 @@
 #include "../../runtime/ppu/ppu_context.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../include/ps3emu/nid.h"
+#include "np_psnr.h"   /* np_psnr_p2p_port */
 
 #include <stdio.h>
 #include <string.h>
@@ -76,6 +77,8 @@ typedef struct {
     host_socket_t host_fd;
     int           in_use;
     int           nonblocking;
+    int           p2p;      /* SOCK_DGRAM_P2P / SOCK_STREAM_P2P */
+    uint16_t      vport;    /* the P2P vport it was bound to */
 } net_socket_slot;
 
 static net_socket_slot s_sockets[SYS_NET_MAX_SOCKETS];
@@ -159,6 +162,8 @@ static int alloc_slot(host_socket_t fd)
             s_sockets[i].host_fd = fd;
             s_sockets[i].in_use = 1;
             s_sockets[i].nonblocking = 0;
+            s_sockets[i].p2p = 0;
+            s_sockets[i].vport = 0;
             return i;
         }
     return -1;
@@ -269,9 +274,10 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
         case SYS_NET_SOCK_STREAM:
         case SYS_NET_SOCK_STREAM_P2P: host_type = SOCK_STREAM; break;
         case SYS_NET_SOCK_DGRAM:
-        /* ponytail: P2P sockets are plain UDP/TCP here -- no vport multiplexing
-         * over one port. Enough while both ends are this runtime; the signaling
-         * layer is where real vports would go. */
+        /* ponytail: a P2P socket is plain UDP/TCP on this instance's P2P port
+         * (see bind), with no vport multiplexing: one DGRAM_P2P and any number
+         * of STREAM_P2P sockets per instance, which is what titles use so far.
+         * Two DGRAM_P2P sockets on different vports would need a demux layer. */
         case SYS_NET_SOCK_DGRAM_P2P:  host_type = SOCK_DGRAM;  break;
         default: return fail(SYS_NET_EINVAL);
     }
@@ -284,6 +290,7 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
         host_closesocket(fd);
         return fail(SYS_NET_ENOMEM);
     }
+    s_sockets[slot].p2p = (type == SYS_NET_SOCK_DGRAM_P2P || type == SYS_NET_SOCK_STREAM_P2P);
     printf("[sys_net] socket(%d, %d, %d) -> %d\n", domain, type, protocol, slot);
     return slot;
 }
@@ -302,6 +309,14 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
     struct sockaddr_in a;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (read_sockaddr(EA(addr), &a)) return fail(SYS_NET_EINVAL);
+    if (s_sockets[s].p2p) {
+        /* P2P sockets live on this instance's P2P port (PS3_NET_P2P_PORT,
+         * default 3658), whatever port the title names: that is the port psnr
+         * hands to peers, and peers send straight to it. sockaddr_in_p2p keeps
+         * the vport at offset 8. */
+        s_sockets[s].vport = vm_read16(EA(addr) + 8);
+        a.sin_port = htons(np_psnr_p2p_port());
+    }
     if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR)
         return host_fail();
     printf("[sys_net] bind(%d, port %u)\n", s, ntohs(a.sin_port));
@@ -329,6 +344,8 @@ int32_t sys_net_bnet_accept(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen
         host_closesocket(fd);
         return fail(SYS_NET_ENOMEM);
     }
+    s_sockets[slot].p2p = s_sockets[s].p2p;
+    s_sockets[slot].vport = s_sockets[s].vport;
     write_sockaddr(EA(addr), EA(addrlen), &a);
     return slot;
 }
@@ -413,6 +430,7 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
                      host_recv_flags(flags), (struct sockaddr*)&a, &alen);
     if (n == HOST_SOCKET_ERROR) return host_fail();
     write_sockaddr(EA(from), EA(fromlen), &a);
+    if (from && s_sockets[s].p2p) vm_write16(EA(from) + 8, s_sockets[s].vport);
     return n;
 }
 

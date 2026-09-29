@@ -10,6 +10,8 @@
 #include <string.h>
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "np_psnr.h"
+#include "../system/cellSysutil.h"
 
 
 /* ---------------------------------------------------------------------------
@@ -33,11 +35,17 @@ void sceNpSetFakeUsername(const char* username)
     }
 }
 
-/* Build a fake NP ID from the current username */
+const char* np_fake_username(void)
+{
+    return s_fake_username;
+}
+
+/* Build a fake NP ID from the current username (PS3_NP_ONLINE_ID wins, so
+ * two instances on one machine can be two players). */
 static void np_build_fake_id(SceNpId* npId)
 {
     memset(npId, 0, sizeof(SceNpId));
-    strncpy(npId->handle.data, s_fake_username, SCE_NP_ONLINEID_MAX_LENGTH);
+    strncpy(npId->handle.data, np_psnr_online_id(), SCE_NP_ONLINEID_MAX_LENGTH);
     npId->handle.term = '\0';
 }
 
@@ -219,8 +227,12 @@ s32 sceNpManagerGetStatus(s32* status)
      * parameters straight through as guest values, so dereferencing one
      * writes to whatever host address shares that number. Same trap as
      * cellGcmSys had. Tokyo Jungle calls this during its online init. */
-    vm_write32((uint32_t)(uintptr_t)status, (uint32_t)SCE_NP_MANAGER_STATUS_OFFLINE);
-    printf("[sceNp] ManagerGetStatus() -> OFFLINE\n");
+    /* Signed in when there is a psnr server to be signed in to. */
+    s32 st = np_psnr_enabled() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
+    vm_write32((uint32_t)(uintptr_t)status, (uint32_t)st);
+    { static s32 last = -2;
+      if (st != last) printf("[sceNp] ManagerGetStatus() -> %s\n", st < 0 ? "OFFLINE" : "ONLINE");
+      last = st; }
     return CELL_OK;
 }
 
@@ -228,10 +240,16 @@ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
 {
     if (!s_np_initialized)
         return SCE_NP_ERROR_NOT_INITIALIZED;
-    /* Stored for bookkeeping; we never transition online so never fire it. */
     s_npmgr_cb     = callback;
     s_npmgr_cb_arg = arg;
     printf("[sceNp] ManagerRegisterCallback()\n");
+    /* Online: tell the title it is signed in, as the console does once the
+     * manager reaches ONLINE. Delivered on its next cellSysutilCheckCallback. */
+    if (np_psnr_enabled() && callback) {
+        const u64 args[8] = { (u64)(u32)SCE_NP_MANAGER_STATUS_ONLINE, 0,
+                              (u64)(u32)(uintptr_t)arg, 0, 0, 0, 0, 0 };
+        cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)callback, args);
+    }
     return CELL_OK;
 }
 
