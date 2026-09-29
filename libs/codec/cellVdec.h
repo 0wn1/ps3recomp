@@ -91,6 +91,7 @@ typedef u32 (*CellVdecCbMsg)(CellVdecHandle handle, u32 msgType,
  * Functions
  * -----------------------------------------------------------------------*/
 
+s32 cellVdecQueryAttr(const CellVdecType* type, void* attr);
 s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
                   CellVdecCbMsg cbFunc, void* cbArg, CellVdecHandle* handle);
 s32 cellVdecClose(CellVdecHandle handle);

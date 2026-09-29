@@ -35,6 +35,26 @@ static VdecSlot s_vdec[MAX_VDEC];
  * API implementations
  * -----------------------------------------------------------------------*/
 
+/* cellVdecQueryAttr: how much work memory the decoder wants, before Open.
+ * CellVdecAttr (guest, big-endian): +0 u32 memSize, +4 u8 cmdDepth,
+ * +8 u32 decoderVerUpper, +0xC u32 decoderVerLower.
+ * Decoding is host-side, so the guest's buffer is never touched; memSize only
+ * has to be something the title can allocate. cmdDepth sizes the title's own
+ * AU queue, so it must not be 0. Unimplemented, the call left the struct
+ * unfilled and a movie player (Resistance: Fall of Man) gave up and retried
+ * forever. */
+s32 cellVdecQueryAttr(const CellVdecType* type, void* attr)
+{
+    u32 ea = (u32)(uintptr_t)attr;
+    if (!type || !ea)
+        return (s32)CELL_VDEC_ERROR_ARG;
+    vm_write32(ea + 0x0, 0x100000);   /* memSize: 1 MB */
+    vm_write8 (ea + 0x4, 4);          /* cmdDepth */
+    vm_write32(ea + 0x8, 0x00010000); /* decoderVerUpper */
+    vm_write32(ea + 0xC, 0);          /* decoderVerLower */
+    return CELL_OK;
+}
+
 s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
                   CellVdecCbMsg cbFunc, void* cbArg, CellVdecHandle* handle)
 {
