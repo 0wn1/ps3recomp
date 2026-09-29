@@ -78,6 +78,7 @@ typedef struct {
     int           in_use;
     int           nonblocking;
     int           p2p;      /* SOCK_DGRAM_P2P / SOCK_STREAM_P2P */
+    int           stream;   /* SOCK_STREAM or SOCK_STREAM_P2P */
     uint16_t      vport;    /* the P2P vport it was bound to */
 } net_socket_slot;
 
@@ -163,6 +164,7 @@ static int alloc_slot(host_socket_t fd)
             s_sockets[i].in_use = 1;
             s_sockets[i].nonblocking = 0;
             s_sockets[i].p2p = 0;
+            s_sockets[i].stream = 0;
             s_sockets[i].vport = 0;
             return i;
         }
@@ -291,6 +293,7 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
         return fail(SYS_NET_ENOMEM);
     }
     s_sockets[slot].p2p = (type == SYS_NET_SOCK_DGRAM_P2P || type == SYS_NET_SOCK_STREAM_P2P);
+    s_sockets[slot].stream = (host_type == SOCK_STREAM);
     printf("[sys_net] socket(%d, %d, %d) -> %d\n", domain, type, protocol, slot);
     return slot;
 }
@@ -322,8 +325,16 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
          * Arcade's every packet failed that way. The port is what peers use. */
         a.sin_addr.s_addr = htonl(INADDR_ANY);
     }
-    if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR)
-        return host_fail();
+    if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR) {
+        /* A second P2P stream socket -- one that will connect out -- can't
+         * have the port the listener holds. On a console many P2P sockets
+         * share the UDP P2P port; here only the listener needs it, so any
+         * other takes an ephemeral one. */
+        if (!(s_sockets[s].p2p && s_sockets[s].stream)) return host_fail();
+        a.sin_port = 0;
+        if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR)
+            return host_fail();
+    }
     char ip[16];
     printf("[sys_net] bind(%d, %s:%u%s)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port),
            s_sockets[s].p2p ? ", p2p" : "");
@@ -352,6 +363,7 @@ int32_t sys_net_bnet_accept(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen
         return fail(SYS_NET_ENOMEM);
     }
     s_sockets[slot].p2p = s_sockets[s].p2p;
+    s_sockets[slot].stream = 1;
     s_sockets[slot].vport = s_sockets[s].vport;
     write_sockaddr(EA(addr), EA(addrlen), &a);
     return slot;
@@ -363,6 +375,14 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
     struct sockaddr_in a;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (read_sockaddr(EA(addr), &a)) return fail(SYS_NET_EINVAL);
+    if (s_sockets[s].p2p && s_sockets[s].stream && vm_read16(EA(addr) + 8)) {
+        /* A stream P2P endpoint is (address, vport): titles put their own
+         * constant in sin_port and the peer's P2P port -- what signaling
+         * reported, 3658 on a console -- in sin_vport. The peer's listener is
+         * on that port here (see bind), so that is where to connect. Seen in
+         * Simpsons Arcade: port 4099, vport 3659. */
+        a.sin_port = htons(vm_read16(EA(addr) + 8));
+    }
 
     char ip[16];
     printf("[sys_net] connect(%d, %s:%u)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port));
