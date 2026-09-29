@@ -511,6 +511,73 @@ static void room_event(m2_ctx* c, u16 event, rb_t* img)
     queue_cb(c->room_cb, ctx_id(c), c->room.id, event, key, 0, size, c->room_arg, 0);
 }
 
+/* "Established" is deferred. On PSN it arrives only after the peers have
+ * reached each other -- hundreds of milliseconds after the member joined --
+ * and titles count on having processed the join by then. Simpsons Arcade's
+ * host gives a newcomer a transport channel while handling MemberJoined; told
+ * "established" in the same breath, it had no channel for the peer yet, never
+ * registered its address, and never answered it ("HOMER IS NOT RESPONDING").
+ * PS3_NP_SIGNALING_DELAY_MS sets the delay; default 1000. */
+#define SIG_PENDING_MAX 16
+static struct { int used; u16 ctx; u64 room; u16 member; u64 due; } s_sig[SIG_PENDING_MAX];
+
+static u64 now_ms(void)
+{
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000u + (u64)ts.tv_nsec / 1000000u;
+#endif
+}
+
+static void establish_later(m2_ctx* c, u16 member)
+{
+    static long delay = -1;
+    if (delay < 0) {
+        const char* e = getenv("PS3_NP_SIGNALING_DELAY_MS");
+        delay = e ? atol(e) : 1000;
+    }
+    LOCK();
+    for (int i = 0; i < SIG_PENDING_MAX; i++)
+        if (!s_sig[i].used) {
+            s_sig[i].used = 1;
+            s_sig[i].ctx = ctx_id(c);
+            s_sig[i].room = c->room.id;
+            s_sig[i].member = member;
+            s_sig[i].due = now_ms() + (u64)delay;
+            break;
+        }
+    UNLOCK();
+}
+
+static void cancel_signal(u16 ctx, u16 member)   /* member 0 = all */
+{
+    LOCK();
+    for (int i = 0; i < SIG_PENDING_MAX; i++)
+        if (s_sig[i].used && s_sig[i].ctx == ctx && (!member || s_sig[i].member == member))
+            s_sig[i].used = 0;
+    UNLOCK();
+}
+
+static void m2_tick(void)
+{
+    u64 now = now_ms();
+    for (int i = 0; i < SIG_PENDING_MAX; i++) {
+        LOCK();
+        int due = s_sig[i].used && s_sig[i].due <= now;
+        u16 ctx = s_sig[i].ctx, member = s_sig[i].member;
+        u64 room = s_sig[i].room;
+        if (due) s_sig[i].used = 0;
+        UNLOCK();
+        if (!due) continue;
+        m2_ctx* c = ctx_get(ctx);
+        if (c && c->room.in && c->room.id == room && room_member(&c->room, member))
+            signal_member(c, member, SIG_EV_Established);
+    }
+}
+
 /* SceNpMatching2RoomMemberUpdateInfo { u32 member; u8 eventCause; u8 pad[3];
  * PresenceOptionData optData (20) }                                       28 bytes */
 static void member_event(m2_ctx* c, const m2_member* m, u16 event, u8 cause)
@@ -525,6 +592,7 @@ static void member_event(m2_ctx* c, const m2_member* m, u16 event, u8 cause)
 /* Leaving, by choice or not: every connection goes down. */
 static void room_gone(m2_ctx* c)
 {
+    cancel_signal(ctx_id(c), 0);
     for (int i = 0; i < c->room.n; i++)
         if (c->room.m[i].id != c->room.me) signal_member(c, c->room.m[i].id, SIG_EV_Dead);
     c->room.in = 0;
@@ -549,7 +617,7 @@ static void on_push(const psnr_msg* m)
         printf("[sceNpMatching2] room %llu: %s joined as member %u\n",
                (unsigned long long)r->id, nm->online_id, nm->id);
         member_event(c, nm, ROOM_EV_MemberJoined, 0);
-        signal_member(c, nm->id, SIG_EV_Established);
+        establish_later(c, nm->id);
         break;
     }
     case PSNR_MEMBER_LEFT: {
@@ -558,6 +626,7 @@ static void on_push(const psnr_msg* m)
         m2_member* gm = room_member(r, gone);
         if (!gm) return;
         printf("[sceNpMatching2] room %llu: %s left\n", (unsigned long long)r->id, gm->online_id);
+        cancel_signal(ctx_id(c), gone);
         signal_member(c, gone, SIG_EV_Dead);
         member_event(c, gm, ROOM_EV_MemberLeft, CAUSE_LEAVE_ACTION);
         *gm = r->m[--r->n];
@@ -655,6 +724,7 @@ static s32 m2_init(void)
     memset(s_ctx, 0, sizeof(s_ctx));
     s_init = 1;
     np_psnr_on_push(on_push);
+    np_psnr_on_tick(m2_tick);
     printf("[sceNpMatching2] Init (%s)\n", np_psnr_enabled() ? "online via psnr" : "offline");
     return CELL_OK;
 }
@@ -1024,7 +1094,7 @@ static void on_joined(void* user, const psnr_msg* m)
     answer(op, 0, &img);
     /* Mesh signaling: everyone already here is reachable now. */
     for (int i = 0; i < r->n; i++)
-        if (r->m[i].id != r->me) signal_member(c, r->m[i].id, SIG_EV_Established);
+        if (r->m[i].id != r->me) establish_later(c, r->m[i].id);
     free(op);
 }
 

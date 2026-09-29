@@ -46,6 +46,7 @@ uint32_t np_psnr_request(uint8_t type, const void* body, uint32_t len, np_psnr_r
     return 1;
 }
 void np_psnr_on_push(void (*fn)(const psnr_msg*)) { s_push = fn; }
+void np_psnr_on_tick(void (*fn)(void)) { (void)fn; }
 
 /* sysutil: remember the last callback queued */
 static u32 s_cb_opd;
@@ -149,6 +150,10 @@ int main(void)
     s_ctx[ctx].sig_cb = 0x5100; s_ctx[ctx].room_cb = 0x1100;
     psnr_msg push = { PSNR_MEMBER_JOINED, 0, r, (u32)(w - r) };
     s_push(&push);
+    assert(s_cb_opd == 0x1100 && s_cb[2] == 0x1101);                  /* MemberJoined now... */
+    m2_tick();                                                         /* ...established later */
+    assert(s_cb_opd == 0x1100);
+    for (s_sig[0].due = 0; s_cb_opd != 0x5100; ) m2_tick();
     assert(s_cb_opd == 0x5100 && s_cb[2] == 2 && s_cb[3] == 0x5102);   /* Established for member 2 */
     vm_write32(REQ, 0);
     assert(sceNpMatching2SignalingGetConnectionStatus(ctx, 9, 2, REQ, REQ + 4, REQ + 8) == 0);

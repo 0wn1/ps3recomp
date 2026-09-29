@@ -109,9 +109,16 @@ void np_psnr_on_push(void (*fn)(const psnr_msg*))
     s_push_fn = fn;
 }
 
+static void (*s_tick_fn)(void);
+void np_psnr_on_tick(void (*fn)(void))
+{
+    s_tick_fn = fn;
+}
+
 void np_psnr_pump(void)
 {
     psnr_msg m;
+    if (s_tick_fn) s_tick_fn();
     if (!s_client) return;
 
     for (;;) {

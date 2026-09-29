@@ -44,6 +44,10 @@ uint32_t np_psnr_request(uint8_t type, const void* body, uint32_t len,
 /* Where server pushes go (room events). One handler: Matching2. */
 void np_psnr_on_push(void (*fn)(const psnr_msg* push));
 
+/* Called at the start of every np_psnr_pump(), for work that falls due over
+ * time rather than on a message (Matching2's deferred signaling). */
+void np_psnr_on_tick(void (*fn)(void));
+
 void np_psnr_pump(void);
 
 #ifdef __cplusplus
