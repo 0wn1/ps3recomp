@@ -221,8 +221,9 @@ typedef struct {
     int nifl;
     u16 attr_ids[16];
     int nattr;
-    /* SetRoomData* */
-    u32 new_flags;
+    /* SetRoomDataInternal: what changed, for the owner's own update event */
+    u32 prev_flags;
+    u8  flags_changed, bins_changed;
 } m2_op;
 
 static void answer(const m2_op* op, s32 err, rb_t* img)
@@ -598,6 +599,38 @@ static void room_gone(m2_ctx* c)
     c->room.in = 0;
 }
 
+/* SceNpMatching2RoomDataInternalUpdateInfo                                36 bytes
+ *   0 newRoomDataInternal | 4 newFlagAttr* | 8 prevFlagAttr* | 12/16 password masks
+ *   20 newRoomGroup | 24 num | 28 newRoomBinAttrInternal (ptr to ptrs) | 32 num
+ * Every member gets this, the one who made the change included: Simpsons
+ * Arcade's host writes its slot map with SetRoomDataInternal as a player
+ * joins, and assigns the newcomer a transport channel when its own update
+ * event comes back. psnr pushes to the others; the writer's is raised here. */
+static void internal_updated(m2_ctx* c, int flags_changed, u32 prev_flags, int bins_changed)
+{
+    m2_room* r = &c->room;
+    rb_t img = {0};
+    u32 o = rb_alloc(&img, 36, 8);
+    rb_ptr(&img, o, rb_room_internal(&img, r));
+    if (flags_changed) {
+        u32 f = rb_alloc(&img, 8, 4);
+        rb_32(&img, f, r->flags);
+        rb_32(&img, f + 4, prev_flags);
+        rb_ptr(&img, o + 4, f);
+        rb_ptr(&img, o + 8, f + 4);
+    }
+    if (bins_changed) {
+        u32 n, arr = rb_attrs(&img, &r->in_attrs, 1, &n);
+        if (n) {
+            u32 pp = rb_alloc(&img, n * 4, 4);
+            for (u32 i = 0; i < n; i++) rb_ptr(&img, pp + i * 4, arr + i * 12);
+            rb_ptr(&img, o + 28, pp);
+        }
+        rb_32(&img, o + 32, n);
+    }
+    room_event(c, ROOM_EV_UpdatedRoomDataInternal, &img);
+}
+
 static void on_push(const psnr_msg* m)
 {
     if (m->len < 8) return;
@@ -651,28 +684,7 @@ static void on_push(const psnr_msg* m)
         if (which == 0) { attrs_unpack(&r->ext, p + 3, l); return; }   /* external: no event */
         if (which == 1) attrs_unpack(&r->in_attrs, p + 3, l);
         if (which == 2 && l == 4) r->flags = psnr_get32(p + 3);
-        /* SceNpMatching2RoomDataInternalUpdateInfo                         36 bytes
-         *   0 newRoomDataInternal | 4 newFlagAttr* | 8 prevFlagAttr* | 12/16 password masks
-         *   20 newRoomGroup | 24 num | 28 newRoomBinAttrInternal (ptr to ptrs) | 32 num */
-        rb_t img = {0};
-        u32 o = rb_alloc(&img, 36, 8);
-        rb_ptr(&img, o, rb_room_internal(&img, r));
-        if (which == 2) {
-            u32 f = rb_alloc(&img, 8, 4);
-            rb_32(&img, f, r->flags);
-            rb_32(&img, f + 4, prev_flags);
-            rb_ptr(&img, o + 4, f);
-            rb_ptr(&img, o + 8, f + 4);
-        } else {
-            u32 n, arr = rb_attrs(&img, &r->in_attrs, 1, &n);
-            if (n) {
-                u32 pp = rb_alloc(&img, n * 4, 4);
-                for (u32 i = 0; i < n; i++) rb_ptr(&img, pp + i * 4, arr + i * 12);
-                rb_ptr(&img, o + 28, pp);
-            }
-            rb_32(&img, o + 32, n);
-        }
-        room_event(c, ROOM_EV_UpdatedRoomDataInternal, &img);
+        internal_updated(c, which == 2, prev_flags, which == 1);
         break;
     }
     case PSNR_ROOM_MSG: {
@@ -1164,6 +1176,8 @@ static void on_done(void* user, const psnr_msg* m)
         room_gone(c);
     }
     answer(op, err, img.len ? &img : NULL);
+    if (op->event == EV_SetRoomDataInternal && !err && c && c->room.in)
+        internal_updated(c, op->flags_changed, op->prev_flags, op->bins_changed);
     rb_free(&img);
     free(op);
 }
@@ -1227,6 +1241,7 @@ s32 sceNpMatching2SetRoomDataInternal(u16 ctxId, u32 req, u32 opt, u32 reqId)
     u8* body = (u8*)malloc(ATTR_MAX * (BIN_MAX + 8) + 16);
     u32 filter = vm_read32(req + 8), attr = vm_read32(req + 12);
     u32 bins = vm_read32(req + 16), nbins = vm_read32(req + 20);
+    u32 prev_flags = c->room.flags;
     if (filter) {
         c->room.flags = (c->room.flags & ~filter) | (attr & filter);
         u8* p = psnr_put64(body, c->room.id);
@@ -1239,7 +1254,15 @@ s32 sceNpMatching2SetRoomDataInternal(u16 ctxId, u32 req, u32 opt, u32 reqId)
     u8* p = psnr_put64(body, c->room.id);
     *p++ = 1;
     u32 l = attrs_pack(&c->room.in_attrs, p + 2); psnr_put16(p, (u16)l); p += 2 + l;
-    s32 r = send_simple(c, ctxId, EV_SetRoomDataInternal, opt, reqId, PSNR_SET_ROOM_DATA, body, (u32)(p - body));
+    m2_op* op = op_new(c, ctxId, EV_SetRoomDataInternal, opt, reqId);
+    op->prev_flags = prev_flags;
+    op->flags_changed = filter && c->room.flags != prev_flags;
+    op->bins_changed = nbins != 0;
+    s32 r = CELL_OK;
+    if (!np_psnr_request(PSNR_SET_ROOM_DATA, body, (u32)(p - body), on_done, op)) {
+        free(op);
+        r = (s32)SCE_NP_MATCHING2_ERROR_NOT_CONNECTED;
+    }
     free(body);
     return r;
 }
