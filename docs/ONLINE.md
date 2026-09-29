@@ -27,6 +27,11 @@ PS3_NET_ONLINE=1 PSNR_SERVER=127.0.0.1 PS3_NP_ONLINE_ID=homer PS3_NET_P2P_PORT=3
 PS3_NET_ONLINE=1 PSNR_SERVER=127.0.0.1 PS3_NP_ONLINE_ID=bart  PS3_NET_P2P_PORT=3659 ./build/simpsons ...
 ```
 
+Redirect stderr to a file and the runtime logs every wait (see
+`runtime/ps3_log.h`). Two instances doing that crawl to about 1 fps once the
+stage starts, and the title drops the peer as "not responding". Set
+`PS3_VERBOSE=0` for play; at that setting both hold 40-50 fps.
+
 ## What is implemented
 
 | Module | State |
