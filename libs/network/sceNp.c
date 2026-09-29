@@ -89,8 +89,12 @@ s32 sceNpGetNpId(s32 userId, SceNpId* npId)
     if (!npId)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
+    /* A guest address, like every sibling getter's: writing through it
+     * untranslated hit a host address and crashed Simpsons Arcade the first
+     * time it asked for its NP ID online. */
+    npId = GUEST_PTR(npId, SceNpId*);
     np_build_fake_id(npId);
-    printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, s_fake_username);
+    printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, np_psnr_online_id());
     return CELL_OK;
 }
 
@@ -265,6 +269,23 @@ s32 sceNpManagerGetNpId(SceNpId* npId)               { return sceNpGetNpId(0, np
 s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId) { return sceNpGetOnlineId(0, onlineId); }
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* name) { return sceNpGetOnlineName(0, name); }
 s32 sceNpManagerGetAccountAge(s32* age)              { return sceNpGetAccountAge(0, age); }
+
+/* Parental controls: an unrestricted adult account. Unimplemented, these
+ * returned OK without writing, and the title read whatever was in its stack. */
+s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (isRestricted) vm_write32((u32)(uintptr_t)isRestricted, 0);
+    if (age) vm_write32((u32)(uintptr_t)age, 25);
+    return CELL_OK;
+}
+
+s32 sceNpManagerGetChatRestrictionFlag(s32* isRestricted)
+{
+    if (!s_np_initialized) return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (isRestricted) vm_write32((u32)(uintptr_t)isRestricted, 0);
+    return CELL_OK;
+}
 
 /* Score setup is local even while the NP manager is offline. Games may
  * initialize it before starting the worker that decides whether to use PSN. */
