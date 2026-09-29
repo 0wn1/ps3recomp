@@ -24,7 +24,8 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t addr) { (void)addr; }
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
-uint16_t np_psnr_p2p_port(void) { return 36658; }
+static uint16_t s_p2p_port = 36658;
+uint16_t np_psnr_p2p_port(void) { return s_p2p_port; }
 
 static struct { uint32_t nid; void (*fn)(ppu_context*); } s_reg[64];
 static int s_nreg;
@@ -176,6 +177,28 @@ int main(void)
     assert(call("recvfrom", p2p, BUF, 64, 0, ADDR_B, LEN) == 3);
     assert(vm_read16(ADDR_B + 8) == 1000);
     assert(C1("socketclose", p2p) == 0);
+
+    /* P2P streams: an instance's listener and the socket it connects out
+     * with share its P2P port, so the peer accepts a connection whose source
+     * port is the P2P port signaling reported -- titles check it. */
+    int32_t l1 = C3("socket", SYS_NET_AF_INET, 10 /* SOCK_STREAM_P2P */, 0);
+    put_sockaddr(ADDR_A, LOOP, 4099);
+    assert(C3("bind", l1, ADDR_A, 16) == 0 && C1("listen", l1) == 0);
+    s_p2p_port = 36659;
+    int32_t l2 = C3("socket", SYS_NET_AF_INET, 10, 0);
+    int32_t out = C3("socket", SYS_NET_AF_INET, 10, 0);
+    assert(C3("bind", l2, ADDR_A, 16) == 0 && C1("listen", l2) == 0);
+    assert(C3("bind", out, ADDR_A, 16) == 0);
+    vm_write32(LEN, 16);
+    assert(C3("getsockname", out, ADDR_B, LEN) == 0 && vm_read16(ADDR_B + 2) == 36659);
+    vm_write16(ADDR_A + 8, 36658);               /* vport = the peer's P2P port */
+    assert(C3("connect", out, ADDR_A, 16) == 0);
+    vm_write32(LEN, 16);
+    int32_t in = C3("accept", l1, ADDR_B, LEN);
+    assert(in >= 0 && vm_read16(ADDR_B + 2) == 36659);
+    s_p2p_port = 36658;
+    assert(C1("socketclose", in) == 0 && C1("socketclose", out) == 0);
+    assert(C1("socketclose", l2) == 0 && C1("socketclose", l1) == 0);
 
     /* A bad fd is EBADF (9), and closing works. */
     assert((uint32_t)C1("socketclose", 99) == 0x80010209u && errno_cell() == SYS_NET_EBADF);

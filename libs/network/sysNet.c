@@ -332,12 +332,23 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
          * socket to a peer on 127.0.0.1 (WSAEADDRNOTAVAIL) -- Simpsons
          * Arcade's every packet failed that way. The port is what peers use. */
         a.sin_addr.s_addr = htonl(INADDR_ANY);
+        /* Every P2P stream socket shares that port, the listener and the ones
+         * that connect out, as on a console. A connection's source port is
+         * then the P2P port, and titles check it: Simpsons Arcade drops the
+         * host's game setup when it arrives from any port but the one
+         * signaling reported for the host. */
+        if (s_sockets[s].stream) {
+            int on = 1;
+            setsockopt(s_sockets[s].host_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+#ifdef SO_REUSEPORT
+            setsockopt(s_sockets[s].host_fd, SOL_SOCKET, SO_REUSEPORT, (const char*)&on, sizeof(on));
+#endif
+        }
     }
     if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR) {
-        /* A second P2P stream socket -- one that will connect out -- can't
-         * have the port the listener holds. On a console many P2P sockets
-         * share the UDP P2P port; here only the listener needs it, so any
-         * other takes an ephemeral one. */
+        /* Last resort for a P2P stream socket that still can't share the
+         * port: an ephemeral one. It connects, but titles that check the
+         * source port will ignore what it sends. */
         if (!(s_sockets[s].p2p && s_sockets[s].stream)) return host_fail();
         a.sin_port = 0;
         if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR)
