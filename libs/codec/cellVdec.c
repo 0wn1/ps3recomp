@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
+#include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -19,8 +20,8 @@
 typedef struct {
     int in_use;
     u32 codecType;
-    CellVdecCbMsg cbFunc;
-    void* cbArg;
+    u32 cbFunc;         /* guest EA of the callback's OPD */
+    u32 cbArg;          /* guest EA handed back to it     */
     int seqStarted;
     CellVdecPicItem lastPic;
     int hasPic;
@@ -30,6 +31,21 @@ typedef struct {
 } VdecSlot;
 
 static VdecSlot s_vdec[MAX_VDEC];
+
+/* Deliver a vdec message to the guest callback (handle, msgType, msgData,
+ * cbArg). It is a guest OPD, so it goes through g_ps3_guest_caller; this used
+ * to call it as a host function pointer, which crashes the first time a
+ * title's callback is reached.
+ * ponytail: synchronous on the caller's thread, like adec_notify; give it a
+ * decoder thread if a title's callback ever blocks on the DecodeAu caller. */
+static void vdec_notify(CellVdecHandle handle, u32 msg_type, s32 msg_data)
+{
+    if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return;
+    const VdecSlot* v = &s_vdec[handle];
+    if (!v->cbFunc || !g_ps3_guest_caller) return;
+    g_ps3_guest_caller(v->cbFunc, (u64)handle, (u64)msg_type,
+                       (u64)(s64)msg_data, (u64)v->cbArg, 0, 0, 0, 0);
+}
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -55,10 +71,16 @@ s32 cellVdecQueryAttr(const CellVdecType* type, void* attr)
     return CELL_OK;
 }
 
+/* cellVdecOpen(type, res, cb, handle) -- FOUR arguments, like cellAdecOpen.
+ * cb is a guest pointer to { u32 cbFunc; u32 cbArg; }. Declared with five,
+ * `handle` came from r7 instead of r6: the handle was written somewhere
+ * random and the title's own handle stayed 0 (Resistance: Fall of Man opened
+ * handle 1, then called StartSeq(0)); four Opens later every call was BUSY. */
 s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
-                  CellVdecCbMsg cbFunc, void* cbArg, CellVdecHandle* handle)
+                  const CellVdecCb* cb, CellVdecHandle* handle)
 {
     (void)res;
+    u32 cb_ea = (u32)(uintptr_t)cb;
 
     u32 codec_type = type ? vm_read32(GUEST_EA(type)) : 0;   /* codecType */
     printf("[cellVdec] Open(codecType=%u)\n", codec_type);
@@ -71,8 +93,8 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
             memset(&s_vdec[i], 0, sizeof(VdecSlot));
             s_vdec[i].in_use = 1;
             s_vdec[i].codecType = codec_type;
-            s_vdec[i].cbFunc = cbFunc;
-            s_vdec[i].cbArg = cbArg;
+            s_vdec[i].cbFunc = cb_ea ? vm_read32(cb_ea + 0) : 0;
+            s_vdec[i].cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
             vm_write32((u32)(uintptr_t)handle, (u32)i);
             printf("[cellVdec] Open -> handle=%u\n", i);
             return CELL_OK;
@@ -113,9 +135,7 @@ s32 cellVdecEndSeq(CellVdecHandle handle)
     s_vdec[handle].seqStarted = 0;
 
     /* Notify sequence done */
-    if (s_vdec[handle].cbFunc)
-        s_vdec[handle].cbFunc(handle, CELL_VDEC_MSG_TYPE_SEQDONE,
-                               CELL_OK, s_vdec[handle].cbArg);
+    vdec_notify(handle, CELL_VDEC_MSG_TYPE_SEQDONE, CELL_OK);
 
     return CELL_OK;
 }
@@ -147,8 +167,7 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
            (unsigned long long)au.pts);
 
     /* Step 1: Report AU consumed */
-    if (v->cbFunc)
-        v->cbFunc(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK, v->cbArg);
+    vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
 
     /* Step 2: Generate a dummy PICOUT callback.
      * Without FFmpeg, we can't actually decode video. But games expect the
@@ -170,8 +189,7 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     v->lastPic.height    = v->height ? v->height : 720;
     v->hasPic = 1;
 
-    if (v->cbFunc)
-        v->cbFunc(handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK, v->cbArg);
+    vdec_notify(handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
 
     return CELL_OK;
 }

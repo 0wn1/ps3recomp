@@ -92,8 +92,14 @@ typedef u32 (*CellVdecCbMsg)(CellVdecHandle handle, u32 msgType,
  * -----------------------------------------------------------------------*/
 
 s32 cellVdecQueryAttr(const CellVdecType* type, void* attr);
+/* Guest callback descriptor: cbFunc is a guest OPD address. */
+typedef struct CellVdecCb {
+    u32 cbFunc;
+    u32 cbArg;
+} CellVdecCb;
+
 s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
-                  CellVdecCbMsg cbFunc, void* cbArg, CellVdecHandle* handle);
+                  const CellVdecCb* cb, CellVdecHandle* handle);
 s32 cellVdecClose(CellVdecHandle handle);
 
 s32 cellVdecStartSeq(CellVdecHandle handle);
