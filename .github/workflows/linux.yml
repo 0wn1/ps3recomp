@@ -112,6 +112,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
           /tmp/test_sys_net
 
+      # Matching2 over psnr without a server: response relocation, attribute
+      # packing, and the room structs a title reads.
+      - name: Run the Matching2 test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
+          /tmp/test_np_matching2
+
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
