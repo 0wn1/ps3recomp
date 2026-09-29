@@ -113,11 +113,11 @@ int main(void)
     assert(vm_read32(ADDR_B + 4) == LOOP);
 
     /* Nothing queued: SO_NBIO and MSG_DONTWAIT both give -1 / EWOULDBLOCK (35). */
-    assert(call("recvfrom", a, BUF, 64, SYS_NET_MSG_DONTWAIT, 0, 0) == -1);
+    assert((uint32_t)call("recvfrom", a, BUF, 64, SYS_NET_MSG_DONTWAIT, 0, 0) == 0x80010223u);
     assert(errno_cell() == SYS_NET_EWOULDBLOCK);
     vm_write32(OPT, 1);
     assert(C5("setsockopt", a, SYS_NET_SOL_SOCKET, SYS_NET_SO_NBIO, OPT, 4) == 0);
-    assert(call("recvfrom", a, BUF, 64, 0, 0, 0) == -1);
+    assert((uint32_t)call("recvfrom", a, BUF, 64, 0, 0, 0) == 0x80010223u);
     assert(errno_cell() == SYS_NET_EWOULDBLOCK);
     vm_write32(LEN, 4);
     assert(C5("getsockopt", a, SYS_NET_SOL_SOCKET, SYS_NET_SO_NBIO, OPT, LEN) == 0);
@@ -178,7 +178,7 @@ int main(void)
     assert(C1("socketclose", p2p) == 0);
 
     /* A bad fd is EBADF (9), and closing works. */
-    assert(C1("socketclose", 99) == -1 && errno_cell() == SYS_NET_EBADF);
+    assert((uint32_t)C1("socketclose", 99) == 0x80010209u && errno_cell() == SYS_NET_EBADF);
     assert(C1("socketclose", a) == 0 && C1("socketclose", b) == 0);
     assert(C1("socketclose", c) == 0 && C1("socketclose", srv) == 0 && C1("socketclose", l) == 0);
 

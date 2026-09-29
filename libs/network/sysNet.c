@@ -103,11 +103,17 @@ static uint32_t scratch(uint32_t* ea, uint32_t size)
     return *ea;
 }
 
+/* A failing call returns SYS_NET_ERROR_BASE | errno (0x80010223 for
+ * EWOULDBLOCK) and also leaves errno in the cell. Titles compare the return
+ * value itself: Simpsons Arcade's connect wrapper waits on 0x80010224
+ * (EINPROGRESS) and 0x80010238 (EISCONN), and a plain -1 read as a failure it
+ * never retried. Anything that only tests for < 0 is unaffected. */
+#define SYS_NET_RET_BASE 0x80010200u
 static int32_t fail(int32_t err)
 {
     s_errno = err;
     if (s_errno_ea) vm_write32(s_errno_ea, (uint32_t)err);
-    return -1;
+    return (int32_t)(SYS_NET_RET_BASE | (uint32_t)err);
 }
 
 static int32_t host_fail(void)
