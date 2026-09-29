@@ -455,11 +455,15 @@ s32 cellPadInit(u32 max_connect)
     if (s_pad_initialized)
         return CELL_PAD_ERROR_ALREADY_OPENED;
 
-    if (max_connect == 0 || max_connect > CELL_PAD_MAX_PORT_NUM)
+    /* The bound is the 127-slot pad table, not the 7 ports: larger requests
+     * are accepted and clamped. Resistance: Fall of Man asks for 8; rejected,
+     * the library stayed closed, every GetInfo failed and the title never
+     * polled the pad -- stuck on "Press the START button". */
+    if (max_connect == 0 || max_connect > 127)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     s_pad_initialized = 1;
-    s_max_connect = max_connect;
+    s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
     memset(s_port_setting, 0, sizeof(s_port_setting));
     memset(s_host_state, 0, sizeof(s_host_state));
 
