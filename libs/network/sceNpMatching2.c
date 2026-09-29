@@ -232,6 +232,8 @@ static void answer(const m2_op* op, s32 err, rb_t* img)
         size = img->len;
         key = store_event(img);
     }
+    printf("[sceNpMatching2] -> request %u event 0x%04X err 0x%08X, %u bytes%s\n",
+           op->req, op->event, (u32)err, size, op->cb ? "" : " (no callback)");
     queue_cb(op->cb, op->ctx, op->req, op->event, key, (u64)(u32)err, size, op->arg, 0);
 }
 
@@ -247,6 +249,7 @@ static m2_op* op_new(m2_ctx* c, u16 ctx, u16 event, u32 opt, u32 req_id_ea)
     op->req = s_next_req++;
     UNLOCK();
     if (req_id_ea) vm_write32(req_id_ea, op->req);
+    printf("[sceNpMatching2] request %u: event 0x%04X\n", op->req, event);
     return op;
 }
 
@@ -491,12 +494,14 @@ static u32 rb_room_internal(rb_t* r, const m2_room* room)
 
 static void signal_member(m2_ctx* c, u16 member, u16 event)
 {
+    printf("[sceNpMatching2] -> signaling 0x%04X member %u\n", event, member);
     /* (ctxId, roomId, memberId, event, errorCode, arg) */
     queue_cb(c->sig_cb, ctx_id(c), c->room.id, member, event, 0, c->sig_arg, 0, 0);
 }
 
 static void room_event(m2_ctx* c, u16 event, rb_t* img)
 {
+    printf("[sceNpMatching2] -> room event 0x%04X\n", event);
     u32 size = img ? img->len : 0, key = img ? store_event(img) : 0;
     /* (ctxId, roomId, event, eventKey, errorCode, dataSize, arg) */
     queue_cb(c->room_cb, ctx_id(c), c->room.id, event, key, 0, size, c->room_arg, 0);
