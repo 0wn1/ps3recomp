@@ -744,6 +744,13 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
             vm_write32(wr + word, vm_read32(wr + word) | bit); count++;
         }
     }
+    if (net_trace()) {
+        static int last = -1;
+        if (count != last || count) {   /* changes and every ready answer, not every empty poll */
+            printf("[sys_net] socketselect(nfds %d, %d fds asked) -> %d ready\n", nfds, n, count);
+            last = count;
+        }
+    }
     return count;
 }
 
