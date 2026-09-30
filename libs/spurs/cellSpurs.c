@@ -2729,6 +2729,24 @@ s32 cellSpursJoinJobChain(u64 jc_ea)
 {
     static int _n = 0;
     if (_n++ < 8) printf("[cellSpurs] JoinJobChain(jc=0x%08X)\n", (u32)jc_ea);
+    /* Run/Kick walk the chain on a host thread, so Join has to wait for it.
+     * Returning at once told the title its jobs were done while they were
+     * still running. The Simpsons Arcade Game runs and joins a chain every
+     * frame, and those jobs DMA the fragment programs and vertices of draws
+     * already queued in the FIFO: the RSX drain then reached the draws first
+     * (black frames, glyph quads built from half-written vertices), and the
+     * next frame's Run was coalesced away while this walker was still busy,
+     * so that frame's data was never written at all. */
+    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+        if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
+        while (s_jobchains[i].running) {
+#ifdef _WIN32
+            Sleep(0);
+#else
+            usleep(0);
+#endif
+        }
+    }
     return CELL_OK;
 }
 
