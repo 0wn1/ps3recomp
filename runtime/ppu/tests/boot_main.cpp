@@ -1206,11 +1206,25 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     { extern void ps3_sampler_start(void); ps3_sampler_start(); } /* PS3_SAMPLE=<ms> */
 #endif
-    printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
+    /* PS3_MAIN_STACK_LV2=1: give the main thread its stack where lv2 does, in
+     * the 0xD0000000 stack region (the first allocation there, which is also
+     * what sys_ppu_thread_get_stack_information already reports for it).
+     * Guest code can tell: Tornado Outbreak's SPU memcpy (func_000D60E0) copies
+     * on the PPU when the destination shares the stack's top nibble, then waits
+     * for an SPU reply only the SPU path sends -- with the stack at 0x0FF00000,
+     * every low address "is on the stack" and the boot hangs. Opt-in until the
+     * regression gate has run with it on. */
+    uint32_t stack_top = STACK_TOP;
+    { const char* ms = getenv("PS3_MAIN_STACK_LV2");
+      if (ms && *ms && *ms != '0') {
+          uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, VM_PPU_STACK_SIZE);
+          if (base) stack_top = base + VM_PPU_STACK_SIZE;
+      } }
+    printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, stack_top);
 #ifdef _WIN32
     fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
 #endif
-    int rc = ppu_run(entry, STACK_TOP);
+    int rc = ppu_run(entry, stack_top);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
     /* A guest that called sys_process_exit never reaches this line: that path
      * ends in the host exit(). Getting here means the entry function returned

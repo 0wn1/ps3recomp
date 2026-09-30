@@ -813,8 +813,13 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
     for (unsigned i = 0; i < s_registry_count; i++)
         if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
     if (!fn) {
-        fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X\n",
-                (unsigned long long)fp, image_size, job_ea);
+        /* Capped: an unlifted job a title dispatches every frame (Tornado
+         * Outbreak's Wwise audio jobs) wrote 2 GB of these in three minutes,
+         * and the logging itself distorts guest timing. */
+        { static unsigned long long miss_n = 0;
+          if (++miss_n <= 32 || miss_n % 100000 == 0)
+            fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X (#%llu)\n",
+                    (unsigned long long)fp, image_size, job_ea, miss_n); }
         /* SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be
          * lifted and registered. SPURS job binaries are raw code+data blobs
          * the title loads from its own data files -- unlike sys_spu_image

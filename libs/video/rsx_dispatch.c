@@ -43,6 +43,8 @@
 #include "rsx_dispatch.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #define M_DMA_COLOR1            0x018C
 #define M_DMA_COLOR0            0x0194
@@ -250,12 +252,75 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
     memcpy(rsx->constants, words, count * sizeof(u32));
 }
 
+/* Every NV4097_SET_VERTEX_DATA* variant writes the same constant ("current")
+ * attribute register a disabled array feeds. Only the 4F form was decoded, so a
+ * colour set with SetVertexData4ub read as the (0,0,0,1) default: Tornado
+ * Outbreak's UI draws its vertex colour that way, alpha 0 failed the alpha test
+ * on every glyph, and 58 draws a frame reached an all-black screen. Fold each
+ * variant into the 4F slots rsx_dsp_vertex_default reads. Offsets and packing
+ * from the SDK (gcm_implementation_sub.h; x is the LOW byte/half). */
+static void vtx_const_set(rsx_dispatch* rsx, u32 attr, u32 c, float v)
+{
+    u32 w; memcpy(&w, &v, 4);
+    rsx->regs[(M_VTX_ATTR_4F + attr * 0x10 + c * 4) >> 2] = w;
+}
+
+static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
+{
+    float f;
+    u32 attr, word;
+    if (m >= 0x1E40 && m < 0x1E80) {                  /* DATA1F: (x,0,0,1) */
+        attr = (m - 0x1E40) >> 2; memcpy(&f, &arg, 4);
+        vtx_const_set(rsx, attr, 0, f); vtx_const_set(rsx, attr, 1, 0.0f);
+        vtx_const_set(rsx, attr, 2, 0.0f); vtx_const_set(rsx, attr, 3, 1.0f);
+    } else if (m >= 0x1880 && m < 0x1900) {           /* DATA2F: (x,y,0,1) */
+        attr = (m - 0x1880) >> 3; word = ((m - 0x1880) >> 2) & 1; memcpy(&f, &arg, 4);
+        vtx_const_set(rsx, attr, word, f);
+        if (word == 0) { vtx_const_set(rsx, attr, 2, 0.0f); vtx_const_set(rsx, attr, 3, 1.0f); }
+    } else if (m >= 0x1500 && m < 0x1600) {           /* DATA3F: (x,y,z,1) */
+        attr = (m - 0x1500) >> 4; word = ((m - 0x1500) >> 2) & 3; memcpy(&f, &arg, 4);
+        if (word < 3) vtx_const_set(rsx, attr, word, f);
+        if (word == 0) vtx_const_set(rsx, attr, 3, 1.0f);
+    } else if (m >= 0x1900 && m < 0x1940) {           /* DATA2S: (x,y,0,1), unnormalised */
+        attr = (m - 0x1900) >> 2;
+        vtx_const_set(rsx, attr, 0, (float)(int16_t)(arg & 0xFFFF));
+        vtx_const_set(rsx, attr, 1, (float)(int16_t)(arg >> 16));
+        vtx_const_set(rsx, attr, 2, 0.0f); vtx_const_set(rsx, attr, 3, 1.0f);
+    } else if (m >= 0x1940 && m < 0x1980) {           /* DATA4UB: normalised bytes */
+        attr = (m - 0x1940) >> 2;
+        for (u32 c = 0; c < 4; c++)
+            vtx_const_set(rsx, attr, c, (float)((arg >> (8 * c)) & 0xFF) / 255.0f);
+    } else if ((m >= 0x1980 && m < 0x1A00) ||         /* DATA4S: unnormalised */
+               (m >= 0x0A80 && m < 0x0B00)) {         /* DATA_SCALED4S: normalised */
+        const u32 base = m >= 0x1980 ? 0x1980u : 0x0A80u;
+        const float k = m >= 0x1980 ? 1.0f : 1.0f / 32767.0f;
+        attr = (m - base) >> 3; word = ((m - base) >> 2) & 1;
+        vtx_const_set(rsx, attr, word * 2 + 0, (float)(int16_t)(arg & 0xFFFF) * k);
+        vtx_const_set(rsx, attr, word * 2 + 1, (float)(int16_t)(arg >> 16) * k);
+    }
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;
     const u32 idx = method >> 2;
+    /* regs[] covers methods 0..0xFFFC (subchannel bits included). A larger
+     * value is not a method -- and indexing with it wrote past regs[] into
+     * vp[] and constants[]: Tornado Outbreak's c[461] held two copies of a
+     * "load constant 461" command header, i.e. FIFO words stored as shader
+     * constants. Drop it, and say what it was. */
+    if (idx >= RSX_DSP_NUM_REGS) {
+        static int n = 0;
+        if (n++ < 8)
+            fprintf(stderr, "[rsx-dispatch] method 0x%05X (arg 0x%08X) out of range -- dropped\n",
+                    method, arg);
+        return;
+    }
     rsx->seen[idx]++;
     rsx->regs[idx] = arg;
+    if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
+        (method >= 0x0A80 && method < 0x0B00))
+        vtx_const_fold(rsx, method, arg);
 
     /* Transform program upload window: word goes to instruction slot
      * VP_UPLOAD_FROM_ID; the load pointer advances after every completed
@@ -279,6 +344,14 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
         if (slot < RSX_DSP_NUM_CONSTANTS)
             rsx->constants[slot][word & 3] = arg;
+        /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
+         * slot range (first 400) -- what a shader's constants really were. */
+        { static int lo = -2, hi = 0, n = 0;
+          if (lo == -2) { const char* e = getenv("RSX_CONST_LOG"); lo = -1;
+                          if (e) sscanf(e, "%d,%d", &lo, &hi); }
+          if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < 400) { n++;
+              fprintf(stderr, "[const-load] c[%u].%c = 0x%08X (method 0x%04X id=%u)\n", slot,
+                      "xyzw"[word & 3], arg, method, rsx->regs[M_VP_UPLOAD_CONST_ID >> 2]); } }
         return;
     }
 

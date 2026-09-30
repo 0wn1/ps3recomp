@@ -828,6 +828,17 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 
     switch (channel) {
     case SPU_WrOutMbox:
+        /* A raw SPU's outbound mailbox is one entry deep and wrch stalls while
+         * it is full. Buffering instead let two replies queue up, and a PPU
+         * that tests bit 0 of the count -- Tornado Outbreak's boot handshake,
+         * func_000D5A10 -- read count 2 as empty and spun forever (an
+         * intermittent boot hang). Raw SPUs only: their reader is the PPU
+         * polling the MMIO window, whereas SPURS-thread mailboxes are drained
+         * by paths that do not wake a stalled writer. A raw SPU's local store
+         * is the guest window, not its own buffer. */
+        if (ctx->ls != ctx->ls_store)
+            while (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && ctx->status != SPU_STATUS_STOPPED)
+                Sleep(0);
         spu_channel_write(&ctx->ch_out_mbox, v);
         /* SPU_DBG_MBOX=1: depth after the write. The image-1 SPUs publish their
          * LS work buffer here (LS 0x11D4) and then poll it, and the guest sets
