@@ -4,7 +4,7 @@
  * Online NP needs three things set:
  *   PS3_NET_ONLINE=1         real sockets and a connected cellNetCtl
  *   PSNR_SERVER=host[:port]  the psnr server (port 36100 by default)
- *   PS3_NP_ONLINE_ID=name    optional; otherwise the fake NP username
+ *   PS3_NP_ONLINE_ID=name    optional; see np_psnr_setup for the default
  * and optionally PS3_NET_P2P_PORT (default 3658), the host port this
  * instance's P2P sockets bind. That port goes to peers through psnr; two
  * instances on one machine need different values.
@@ -30,6 +30,21 @@ int np_psnr_enabled(void);
 /* Connect (once) as this title. 0 if connected, -1 if not. */
 int np_psnr_connect(const char* comm_id);
 int np_psnr_connected(void);
+
+/* Settle the player's name and server at startup, before the title runs; the
+ * runtime's main passes --username and --psnr (either may be NULL).
+ *   --psnr host[:port]  sets PS3_NET_ONLINE=1 and PSNR_SERVER.
+ *   The name is --username, else PS3_NP_ONLINE_ID, else -- online only -- the
+ *   OS login name. Offline with neither, nothing changes ("PS3Player").
+ * Names follow PSN's online ID rules: 3-16 letters, digits, '-' or '_',
+ * starting with a letter. */
+void np_psnr_setup(const char* username, const char* server);
+
+/* The name the NP ID, psnr and the console identity (OpenPSID, MAC) derive
+ * from, or NULL offline with no name set -- then the old fixed values stand,
+ * so offline saves are untouched. Resolves from the environment if main never
+ * called np_psnr_setup. */
+const char* np_psnr_identity(void);
 
 /* The player's online ID, and the P2P port this instance binds and advertises. */
 const char* np_psnr_online_id(void);

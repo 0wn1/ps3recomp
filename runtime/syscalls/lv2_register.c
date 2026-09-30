@@ -438,12 +438,14 @@ static uint32_t vm_read_be32(uint32_t guest_addr)
  * Simpsons Arcade hashes it into the key each player announces when joining a
  * match, and with every console at zero the host took the joining player for
  * itself and never gave them a slot. PS3_OPEN_PSID=<32 hex digits> sets it;
- * otherwise PS3_NP_ONLINE_ID (the online-play name) derives one; otherwise it
- * stays zero, so offline saves keyed on it are untouched. */
+ * otherwise the player's name derives one (np_psnr_identity: --username,
+ * PS3_NP_ONLINE_ID, or the OS login when online); otherwise it stays zero, so
+ * offline saves keyed on it are untouched. */
+extern const char* np_psnr_identity(void);   /* libs/network/np_psnr.c */
 static void open_psid(uint32_t w[4])
 {
     const char* e = getenv("PS3_OPEN_PSID");
-    const char* id = getenv("PS3_NP_ONLINE_ID");
+    const char* id = np_psnr_identity();
     w[0] = w[1] = w[2] = w[3] = 0;
     if (e && strlen(e) >= 32) {
         for (int i = 0; i < 4; i++) {

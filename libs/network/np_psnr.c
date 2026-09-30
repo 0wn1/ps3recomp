@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -30,6 +31,68 @@ static int          s_tried;
 static struct { uint32_t req; np_psnr_reply_fn fn; void* user; } s_pending[PENDING_MAX];
 static void (*s_push_fn)(const psnr_msg*);
 
+static void set_env(const char* k, const char* v)
+{
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+
+/* PSN online IDs: 3-16 letters, digits, '-' and '_', starting with a letter.
+ * Copies the allowed characters of `in`; 1 if the result is a valid ID. */
+static int clean_online_id(const char* in, char out[17])
+{
+    int n = 0;
+    for (; in && *in && n < 16; in++)
+        if (isalnum((unsigned char)*in) || *in == '-' || *in == '_')
+            out[n++] = *in;
+    out[n] = 0;
+    return n >= 3 && isalpha((unsigned char)out[0]);
+}
+
+static char s_id[17];
+static int  s_id_state;     /* 0 unresolved, 1 a name applies, 2 none (offline) */
+
+void np_psnr_setup(const char* username, const char* server)
+{
+    /* Before anything reads them: the runtime's getenv cache keeps the first
+     * answer it sees. */
+    if (server && *server) {
+        set_env("PS3_NET_ONLINE", "1");
+        set_env("PSNR_SERVER", server);
+    }
+    /* The first valid one of: --username, PS3_NP_ONLINE_ID, and -- online
+     * only -- the OS login name. */
+    const char* named[2] = { username, getenv("PS3_NP_ONLINE_ID") };
+    int found = 0;
+    for (int i = 0; i < 2 && !found; i++) {
+        if (!named[i] || !*named[i]) continue;
+        found = clean_online_id(named[i], s_id);
+        if (!found)
+            printf("[psnr] \"%s\" is not a valid online ID (3-16 letters, digits, - or _, "
+                   "starting with a letter)\n", named[i]);
+    }
+    if (!found) {
+        if (!np_psnr_enabled()) { s_id_state = 2; return; }   /* offline: "PS3Player" */
+#ifdef _WIN32
+        const char* os = getenv("USERNAME");
+#else
+        const char* os = getenv("USER");
+#endif
+        if (!clean_online_id(os, s_id)) strcpy(s_id, "PS3Player");
+    }
+    s_id_state = 1;
+    printf("[psnr] player \"%s\"%s\n", s_id, np_psnr_enabled() ? "" : " (offline)");
+}
+
+const char* np_psnr_identity(void)
+{
+    if (!s_id_state) np_psnr_setup(NULL, NULL);
+    return s_id_state == 1 ? s_id : NULL;
+}
+
 int np_psnr_enabled(void)
 {
     return getenv("PS3_NET_ONLINE") && getenv("PSNR_SERVER");
@@ -37,8 +100,8 @@ int np_psnr_enabled(void)
 
 const char* np_psnr_online_id(void)
 {
-    const char* id = getenv("PS3_NP_ONLINE_ID");
-    return (id && *id) ? id : np_fake_username();
+    const char* id = np_psnr_identity();
+    return id ? id : np_fake_username();
 }
 
 uint16_t np_psnr_p2p_port(void)

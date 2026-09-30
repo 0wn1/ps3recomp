@@ -59,7 +59,7 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
     (void)poolPtr;
 
     printf("[sceNp] Init(poolSize=%u, username=\"%s\")\n",
-           poolSize, s_fake_username);
+           poolSize, np_psnr_online_id());
 
     if (s_np_initialized)
         return SCE_NP_ERROR_ALREADY_INITIALIZED;
@@ -110,10 +110,10 @@ s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     memset(onlineId, 0, sizeof(SceNpOnlineId));
-    strncpy(onlineId->data, s_fake_username, SCE_NP_ONLINEID_MAX_LENGTH);
+    strncpy(onlineId->data, np_psnr_online_id(), SCE_NP_ONLINEID_MAX_LENGTH);
     onlineId->term = '\0';
 
-    printf("[sceNp] GetOnlineId(user=%d) -> \"%s\"\n", userId, s_fake_username);
+    printf("[sceNp] GetOnlineId(user=%d) -> \"%s\"\n", userId, np_psnr_online_id());
     return CELL_OK;
 }
 
@@ -129,11 +129,11 @@ s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     memset(onlineName, 0, sizeof(SceNpOnlineName));
-    strncpy(onlineName->data, s_fake_username,
+    strncpy(onlineName->data, np_psnr_online_id(),
             SCE_NP_ONLINENAME_MAX_LENGTH - 1);
 
     printf("[sceNp] GetOnlineName(user=%d) -> \"%s\"\n",
-           userId, s_fake_username);
+           userId, np_psnr_online_id());
     return CELL_OK;
 }
 
@@ -150,12 +150,12 @@ s32 sceNpGetUserProfile(s32 userId, SceNpUserInfo* userInfo)
 
     memset(userInfo, 0, sizeof(SceNpUserInfo));
     np_build_fake_id(&userInfo->npId);
-    strncpy(userInfo->onlineName.data, s_fake_username,
+    strncpy(userInfo->onlineName.data, np_psnr_online_id(),
             SCE_NP_ONLINENAME_MAX_LENGTH - 1);
     /* Leave avatar URL empty */
 
     printf("[sceNp] GetUserProfile(user=%d) -> \"%s\"\n",
-           userId, s_fake_username);
+           userId, np_psnr_online_id());
     return CELL_OK;
 }
 

@@ -93,6 +93,13 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
           /tmp/test_np_matching2
 
+      # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
+      # and PSN's online ID rules.
+      - name: Run the player-name test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
+          /tmp/test_np_identity
+
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
       # Headless, so it needs no display: exit 0 means the whole graphics bridge
