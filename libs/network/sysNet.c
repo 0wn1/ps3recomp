@@ -447,6 +447,19 @@ int32_t sys_net_bnet_accept(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
 
     host_socket_t fd = HOST_INVALID_SOCKET;
+    if (s_sockets[s].p2p && s_sockets[s].stream && !s_sockets[s].nonblocking) {
+        /* A blocking accept on the P2P listener: a stream through the relay
+         * never reaches the host listener, so wait for either. Simpsons
+         * Arcade's joiner sits here on a thread for the host's game setup. */
+        while (!relayed_pending(s)) {
+            host_pollfd p;
+            p.fd = s_sockets[s].host_fd;
+            p.events = POLLIN;
+            p.revents = 0;
+            if (host_poll(&p, 1, 100) != 0) break;   /* a direct connection, or an error */
+            if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+        }
+    }
     if (relayed_pending(s)) {
         /* A peer's stream through the relay: to the title it is the peer
          * connecting from its P2P port. */

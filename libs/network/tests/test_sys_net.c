@@ -52,6 +52,18 @@ void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context
     s_nreg++;
 }
 
+/* Hands a relayed stream to sysNet's sink from another thread, the way the
+ * pump thread does while the title's thread sits in a blocking accept. */
+static struct { int64_t fd; uint8_t ip[4]; uint16_t port; } s_late;
+#ifdef _WIN32
+static DWORD WINAPI late_sink(LPVOID u) { (void)u; Sleep(200); s_sink(s_late.fd, s_late.ip, s_late.port); return 0; }
+static void start_late_sink(void) { CloseHandle(CreateThread(NULL, 0, late_sink, NULL, 0, NULL)); }
+#else
+#include <pthread.h>
+static void* late_sink(void* u) { (void)u; usleep(200 * 1000); s_sink(s_late.fd, s_late.ip, s_late.port); return NULL; }
+static void start_late_sink(void) { pthread_t t; pthread_create(&t, NULL, late_sink, NULL); pthread_detach(t); }
+#endif
+
 static unsigned int bump_alloc(unsigned int size, unsigned int align)
 {
     static unsigned int top = 0x80000;
@@ -259,6 +271,27 @@ int main(void)
         assert(vm_read16(ADDR_B + 2) == 40001 && vm_read16(ADDR_B + 8) == 40001);
         send(hc, "setup", 5, 0);
         assert(call("recv", rs, BUF, 64, 0, 0, 0) == 5 && !memcmp(vm_base + BUF, "setup", 5));
+        assert(C1("socketclose", rs) == 0);
+        host_closesocket(hc);
+
+        /* The same while the title's thread is already blocked in accept:
+         * it must wake for the relayed stream, not wait on the host
+         * listener forever. */
+        hl = socket(AF_INET, SOCK_STREAM, 0);
+        la.sin_port = 0;
+        assert(bind(hl, (struct sockaddr*)&la, sizeof(la)) == 0 && listen(hl, 1) == 0);
+        ll = sizeof(la);
+        getsockname(hl, (struct sockaddr*)&la, &ll);
+        hc = socket(AF_INET, SOCK_STREAM, 0);
+        assert(connect(hc, (struct sockaddr*)&la, sizeof(la)) == 0);
+        s_late.fd = (int64_t)accept(hl, NULL, NULL);
+        host_closesocket(hl);
+        memcpy(s_late.ip, peer, 4);
+        s_late.port = 40002;
+        start_late_sink();
+        vm_write32(LEN, 16);
+        rs = C3("accept", l1, ADDR_B, LEN);   /* blocks until the sink runs */
+        assert(rs >= 0 && vm_read16(ADDR_B + 8) == 40002);
         assert(C1("socketclose", rs) == 0);
         host_closesocket(hc);
     }
