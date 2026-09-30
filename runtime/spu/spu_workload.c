@@ -16,6 +16,7 @@
 #else
 #include <pthread.h>
 #include <errno.h>
+#include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #endif
 
 /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
