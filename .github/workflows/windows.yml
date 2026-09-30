@@ -128,6 +128,15 @@ jobs:
           .\test_np_identity.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # NAT traversal: probing psnr from the P2P socket, dropping psnr's
+      # packets before the title sees them, punching toward peers.
+      - name: Run the NAT traversal test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_np_nat.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
       # sync_stress has always been the Windows-native suite; now that its

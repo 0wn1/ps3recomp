@@ -49,7 +49,7 @@
 #include "../../runtime/ppu/ppu_context.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../include/ps3emu/nid.h"
-#include "np_psnr.h"   /* np_psnr_p2p_port */
+#include "np_psnr.h"   /* np_psnr_p2p_port, NAT traversal on the P2P socket */
 
 #include <stdio.h>
 #include <string.h>
@@ -306,9 +306,30 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
     return slot;
 }
 
+/* The title's P2P datagram socket: np_psnr sends its probes and punches from
+ * it (np_psnr.h), so they leave through the same router mapping as the
+ * title's own traffic. ponytail: the first one bound; titles have one. */
+static int s_p2p_dgram = -1;
+
+static int p2p_send(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port)
+{
+    struct sockaddr_in a;
+    if (s_p2p_dgram < 0) return -1;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    memcpy(&a.sin_addr, ip, 4);
+    a.sin_port = htons(port);
+    return (int)sendto(s_sockets[s_p2p_dgram].host_fd, (const char*)buf, (int)len, 0,
+                       (struct sockaddr*)&a, sizeof(a));
+}
+
 int32_t sys_net_bnet_close(int32_t s)
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+    if (s == s_p2p_dgram) {
+        s_p2p_dgram = -1;
+        np_psnr_set_p2p_sender(NULL);
+    }
     host_closesocket(s_sockets[s].host_fd);
     s_sockets[s].in_use = 0;
     return 0;
@@ -357,6 +378,10 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
     char ip[16];
     printf("[sys_net] bind(%d, %s:%u%s)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port),
            s_sockets[s].p2p ? ", p2p" : "");
+    if (s_sockets[s].p2p && !s_sockets[s].stream && s_p2p_dgram < 0) {
+        s_p2p_dgram = s;
+        np_psnr_set_p2p_sender(p2p_send);
+    }
     return 0;
 }
 
@@ -501,14 +526,21 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
                               sys_net_sockaddr* from, uint32_t* fromlen)
 {
     struct sockaddr_in a;
-    socklen_t alen = sizeof(a);
+    socklen_t alen;
+    int n;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
-    if (would_block(s, flags, POLLIN)) return fail(SYS_NET_EWOULDBLOCK);
 
-    memset(&a, 0, sizeof(a));
-    int n = recvfrom(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len,
+    /* psnr's own packets (probe replies, peers' punches) are consumed here;
+     * the title only ever sees its own traffic. */
+    do {
+        if (would_block(s, flags, POLLIN)) return fail(SYS_NET_EWOULDBLOCK);
+        memset(&a, 0, sizeof(a));
+        alen = sizeof(a);
+        n = recvfrom(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len,
                      host_recv_flags(flags), (struct sockaddr*)&a, &alen);
-    if (n == HOST_SOCKET_ERROR) return host_fail();
+        if (n == HOST_SOCKET_ERROR) return host_fail();
+    } while (s_sockets[s].p2p && n > 0 &&
+             np_psnr_p2p_filter(GUEST_PTR(EA(buf), const char*), (uint32_t)n));
     if (net_trace()) trace("recvfrom", s, n, &a);
     write_sockaddr(EA(from), EA(fromlen), &a);
     if (from && s_sockets[s].p2p) vm_write16(EA(from) + 8, s_sockets[s].vport);

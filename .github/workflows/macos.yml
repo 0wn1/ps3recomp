@@ -100,6 +100,13 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
           /tmp/test_np_identity
 
+      # NAT traversal: probing psnr from the P2P socket, dropping psnr's
+      # packets before the title sees them, punching toward peers.
+      - name: Run the NAT traversal test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
+          /tmp/test_np_nat
+
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.
       # Headless, so it needs no display: exit 0 means the whole graphics bridge

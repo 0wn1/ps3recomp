@@ -126,6 +126,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
           /tmp/test_np_identity
 
+      # NAT traversal: probing psnr from the P2P socket, dropping psnr's
+      # packets before the title sees them, punching toward peers.
+      - name: Run the NAT traversal test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
+          /tmp/test_np_nat
+
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler

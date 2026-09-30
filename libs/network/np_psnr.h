@@ -65,6 +65,24 @@ void np_psnr_on_tick(void (*fn)(void));
 
 void np_psnr_pump(void);
 
+/* NAT traversal (psnr docs/api.md, "UDP"). A player behind a router has a
+ * public P2P port the server can't see over TCP, so np_psnr probes psnr from
+ * the title's own P2P datagram socket -- psnr then hands peers on other
+ * networks that socket's public endpoint -- and punches toward each peer so
+ * this side's router lets the peer's traffic in. sysNet owns the socket:
+ *   - it registers how to send from it once the title binds it (NULL when it
+ *     closes); probes and punches go out from np_psnr_pump;
+ *   - it passes every datagram that arrives on it to np_psnr_p2p_filter,
+ *     which consumes psnr's own packets: the title never sees them. */
+typedef int (*np_psnr_p2p_send_fn)(const void* buf, uint32_t len,
+                                   const uint8_t ip[4], uint16_t port);
+void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn);
+int  np_psnr_p2p_filter(const void* buf, uint32_t len);   /* 1 = psnr's, dropped */
+
+/* A peer's P2P endpoint became known (Matching2 member entries): punch toward
+ * it a few times. Our own entry is skipped. */
+void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port);
+
 #ifdef __cplusplus
 }
 #endif

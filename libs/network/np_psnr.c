@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -27,6 +28,7 @@ extern const char* np_fake_username(void);
 #define PENDING_MAX 64
 
 static psnr_client* s_client;
+static uint32_t     s_user_id;   /* ours, from HELLO: our own member entry needs no punch */
 static int          s_tried;
 static struct { uint32_t req; np_psnr_reply_fn fn; void* user; } s_pending[PENDING_MAX];
 static void (*s_push_fn)(const psnr_msg*);
@@ -138,6 +140,7 @@ int np_psnr_connect(const char* comm_id)
 
     s_client = psnr_connect(host, port, comm_id, np_psnr_online_id(),
                             np_psnr_p2p_port(), &user_id, ip);
+    s_user_id = user_id;
     UNLOCK();
     if (s_client)
         printf("[psnr] connected to %s:%u as \"%s\" (%s), user %u, seen from %u.%u.%u.%u, p2p port %u\n",
@@ -181,10 +184,92 @@ void np_psnr_on_tick(void (*fn)(void))
     s_tick_fn = fn;
 }
 
+/* ---- NAT traversal: probes and punches from the title's P2P socket ---- */
+
+#define PUNCHES      5      /* per peer */
+#define PUNCH_MS     200
+#define PROBE_MS     500    /* until psnr answers */
+#define REPROBE_MS   20000  /* after: routers forget idle UDP mappings */
+
+static np_psnr_p2p_send_fn s_p2p_send;
+static int      s_probed;
+static uint64_t s_next_probe;
+static struct { uint8_t ip[4]; uint16_t port; int left; uint64_t next; } s_punch[8];
+
+static uint64_t nat_now_ms(void)
+{
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn)
+{
+    s_p2p_send = fn;
+    s_probed = 0;
+    s_next_probe = 0;
+}
+
+int np_psnr_p2p_filter(const void* buf, uint32_t len)
+{
+    uint8_t ip[4];
+    uint16_t port;
+    if (!psnr_is_control(buf, len)) return 0;
+    if (psnr_probe_reply(buf, len, ip, &port) && !s_probed) {
+        s_probed = 1;
+        s_next_probe = nat_now_ms() + REPROBE_MS;
+        printf("[psnr] P2P socket seen at %u.%u.%u.%u:%u\n", ip[0], ip[1], ip[2], ip[3], port);
+    }
+    return 1;
+}
+
+void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port)
+{
+    int slot = -1;
+    if (user == s_user_id || !port) return;
+    for (int i = 0; i < 8; i++) {
+        if (s_punch[i].port == port && !memcmp(s_punch[i].ip, ip, 4)) { slot = i; break; }
+        if (slot < 0 && !s_punch[i].left) slot = i;
+    }
+    if (slot < 0) return;   /* ponytail: 8 peers punching at once; a room has at most 4 */
+    memcpy(s_punch[slot].ip, ip, 4);
+    s_punch[slot].port = port;
+    s_punch[slot].left = PUNCHES;
+    s_punch[slot].next = 0;
+}
+
+/* From np_psnr_pump: probe psnr until it answers (and again now and then),
+ * and send the punches that are due. */
+static void nat_tick(void)
+{
+    uint8_t pkt[PSNR_UDP_PROBE_LEN], ip[4];
+    uint16_t port;
+    uint64_t now = nat_now_ms();
+    if (!s_client || !s_p2p_send) return;
+    if (now >= s_next_probe) {
+        psnr_probe_packet(s_client, pkt);
+        psnr_server_addr(s_client, ip, &port);
+        s_p2p_send(pkt, PSNR_UDP_PROBE_LEN, ip, port);
+        s_next_probe = now + (s_probed ? REPROBE_MS : PROBE_MS);
+    }
+    for (int i = 0; i < 8; i++) {
+        if (!s_punch[i].left || now < s_punch[i].next) continue;
+        psnr_punch_packet(s_client, pkt);
+        s_p2p_send(pkt, PSNR_UDP_PUNCH_LEN, s_punch[i].ip, s_punch[i].port);
+        s_punch[i].left--;
+        s_punch[i].next = now + PUNCH_MS;
+    }
+}
+
 void np_psnr_pump(void)
 {
     psnr_msg m;
     if (s_tick_fn) s_tick_fn();
+    nat_tick();
     if (!s_client) return;
 
     for (;;) {

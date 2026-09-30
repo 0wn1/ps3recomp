@@ -27,6 +27,13 @@ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; 
 static uint16_t s_p2p_port = 36658;
 uint16_t np_psnr_p2p_port(void) { return s_p2p_port; }
 
+/* np_psnr's side of NAT traversal (tested for real in test_np_nat.c): here,
+ * only that sysNet registers the P2P datagram socket and drops what the
+ * filter claims. */
+static np_psnr_p2p_send_fn s_sender;
+void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn) { s_sender = fn; }
+int  np_psnr_p2p_filter(const void* buf, uint32_t len) { return len >= 4 && !memcmp(buf, "PSNR", 4); }
+
 static struct { uint32_t nid; void (*fn)(ppu_context*); } s_reg[64];
 static int s_nreg;
 void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*))
@@ -176,7 +183,24 @@ int main(void)
     assert(C3("socketpoll", POLLFD, 1, 1000) == 1);
     assert(call("recvfrom", p2p, BUF, 64, 0, ADDR_B, LEN) == 3);
     assert(vm_read16(ADDR_B + 8) == 1000);
+
+    /* The bound P2P datagram socket is np_psnr's to send probes and punches
+     * from, and psnr's packets arriving on it never reach the title: a
+     * control packet followed by the title's own data reads as the data. */
+    {
+        const uint8_t lo[4] = { 127, 0, 0, 1 };
+        assert(s_sender);
+        assert(s_sender("PSNR\x02zzzz", 9, lo, 36658) == 9);
+        assert(s_sender("game", 4, lo, 36658) == 4);
+        vm_write32(POLLFD, (uint32_t)p2p);
+        vm_write16(POLLFD + 4, SYS_NET_POLLIN);
+        assert(C3("socketpoll", POLLFD, 1, 1000) == 1);
+        vm_write32(LEN, 16);
+        assert(call("recvfrom", p2p, BUF, 64, 0, ADDR_B, LEN) == 4);
+        assert(memcmp(vm_base + BUF, "game", 4) == 0);
+    }
     assert(C1("socketclose", p2p) == 0);
+    assert(!s_sender);   /* closing it unregisters */
 
     /* P2P streams: an instance's listener and the socket it connects out
      * with share its P2P port, so the peer accepts a connection whose source

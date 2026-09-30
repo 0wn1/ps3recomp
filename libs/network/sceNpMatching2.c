@@ -377,6 +377,7 @@ static const u8* parse_member(m2_member* m, const u8* p, const u8* end, int* own
     memcpy(m->online_id, p + 6, 16);
     memcpy(m->ip, p + 22, 4);
     m->port = psnr_get16(p + 26);
+    np_psnr_punch(m->user, m->ip, m->port);   /* open our router toward them */
     *owner = p[28];
     u16 dl = psnr_get16(p + 29);
     p += 31;
