@@ -80,6 +80,7 @@ typedef struct {
     int           p2p;      /* SOCK_DGRAM_P2P / SOCK_STREAM_P2P */
     int           stream;   /* SOCK_STREAM or SOCK_STREAM_P2P */
     uint16_t      vport;    /* the P2P vport it was bound to */
+    int           listening;
 } net_socket_slot;
 
 static net_socket_slot s_sockets[SYS_NET_MAX_SOCKETS];
@@ -174,6 +175,7 @@ static int alloc_slot(host_socket_t fd)
             s_sockets[i].p2p = 0;
             s_sockets[i].stream = 0;
             s_sockets[i].vport = 0;
+            s_sockets[i].listening = 0;
             return i;
         }
     return -1;
@@ -306,6 +308,49 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
     return slot;
 }
 
+/* Streams a peer opened to us through psnr's relay (np_psnr.h): each is a
+ * connected host socket that the title's P2P listener hands out from accept,
+ * and that poll/select report as a pending connection. The pump thread adds;
+ * the title's thread takes. */
+#define RELAYED_MAX 8
+static struct { host_socket_t fd; uint8_t ip[4]; uint16_t port; } s_relayed[RELAYED_MAX];
+static int s_nrelayed;
+#ifdef _WIN32
+static SRWLOCK s_relayed_lock = SRWLOCK_INIT;
+#  define RELAYED_LOCK()   AcquireSRWLockExclusive(&s_relayed_lock)
+#  define RELAYED_UNLOCK() ReleaseSRWLockExclusive(&s_relayed_lock)
+#else
+#  include <pthread.h>
+static pthread_mutex_t s_relayed_lock = PTHREAD_MUTEX_INITIALIZER;
+#  define RELAYED_LOCK()   pthread_mutex_lock(&s_relayed_lock)
+#  define RELAYED_UNLOCK() pthread_mutex_unlock(&s_relayed_lock)
+#endif
+
+static void relayed_stream(int64_t fd, const uint8_t ip[4], uint16_t port)
+{
+    RELAYED_LOCK();
+    if (s_nrelayed < RELAYED_MAX) {
+        s_relayed[s_nrelayed].fd = (host_socket_t)fd;
+        memcpy(s_relayed[s_nrelayed].ip, ip, 4);
+        s_relayed[s_nrelayed].port = port;
+        s_nrelayed++;
+        fd = -1;
+    }
+    RELAYED_UNLOCK();
+    if (fd >= 0) host_closesocket((host_socket_t)fd);   /* nobody will accept that many */
+}
+
+/* A P2P stream listener with a relayed connection waiting. */
+static int relayed_pending(int32_t s)
+{
+    int n;
+    if (!s_sockets[s].p2p || !s_sockets[s].stream || !s_sockets[s].listening) return 0;
+    RELAYED_LOCK();
+    n = s_nrelayed;
+    RELAYED_UNLOCK();
+    return n > 0;
+}
+
 /* The title's P2P datagram socket: np_psnr sends its probes and punches from
  * it (np_psnr.h), so they leave through the same router mapping as the
  * title's own traffic. ponytail: the first one bound; titles have one. */
@@ -389,6 +434,8 @@ int32_t sys_net_bnet_listen(int32_t s, int32_t backlog)
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (listen(s_sockets[s].host_fd, backlog) == HOST_SOCKET_ERROR) return host_fail();
+    s_sockets[s].listening = 1;
+    if (s_sockets[s].p2p) np_psnr_set_stream_sink(relayed_stream);
     printf("[sys_net] listen(%d)\n", s);
     return 0;
 }
@@ -399,8 +446,25 @@ int32_t sys_net_bnet_accept(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen
     socklen_t len = sizeof(a);
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
 
-    host_socket_t fd = accept(s_sockets[s].host_fd, (struct sockaddr*)&a, &len);
-    if (fd == HOST_INVALID_SOCKET) return host_fail();
+    host_socket_t fd = HOST_INVALID_SOCKET;
+    if (relayed_pending(s)) {
+        /* A peer's stream through the relay: to the title it is the peer
+         * connecting from its P2P port. */
+        RELAYED_LOCK();
+        if (s_nrelayed) {
+            fd = s_relayed[0].fd;
+            memset(&a, 0, sizeof(a));
+            a.sin_family = AF_INET;
+            memcpy(&a.sin_addr, s_relayed[0].ip, 4);
+            a.sin_port = htons(s_relayed[0].port);
+            memmove(s_relayed, s_relayed + 1, (size_t)(--s_nrelayed) * sizeof(s_relayed[0]));
+        }
+        RELAYED_UNLOCK();
+    }
+    if (fd == HOST_INVALID_SOCKET) {
+        fd = accept(s_sockets[s].host_fd, (struct sockaddr*)&a, &len);
+        if (fd == HOST_INVALID_SOCKET) return host_fail();
+    }
 
     int slot = alloc_slot(fd);
     if (slot < 0) {
@@ -437,6 +501,18 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
 
     char ip[16];
     printf("[sys_net] connect(%d, %s:%u)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port));
+    if (s_sockets[s].p2p && s_sockets[s].stream) {
+        /* A peer that can't take a direct connection (behind its router):
+         * the stream goes through psnr's relay, and its socket replaces
+         * this one. */
+        int64_t fd = np_psnr_stream_connect((const uint8_t*)&a.sin_addr, ntohs(a.sin_port));
+        if (fd == -1) return fail(SYS_NET_ECONNREFUSED);
+        if (fd >= 0) {
+            host_closesocket(s_sockets[s].host_fd);
+            s_sockets[s].host_fd = (host_socket_t)fd;
+            return 0;
+        }
+    }
     if (connect(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR) {
 #ifdef _WIN32
         if (WSAGetLastError() == WSAEWOULDBLOCK) return fail(SYS_NET_EINPROGRESS);
@@ -506,6 +582,9 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (!to) return sys_net_bnet_send(s, buf, len, flags);   /* connected socket */
     if (read_sockaddr(EA(to), &a)) return fail(SYS_NET_EINVAL);
+    if (s_sockets[s].p2p && np_psnr_p2p_route(GUEST_PTR(EA(buf), const char*), len,
+                                             (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
+        return (int32_t)len;   /* went through psnr's relay */
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
     int n = sendto(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, 0,
                    (struct sockaddr*)&a, sizeof(a));
@@ -539,8 +618,16 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
         n = recvfrom(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len,
                      host_recv_flags(flags), (struct sockaddr*)&a, &alen);
         if (n == HOST_SOCKET_ERROR) return host_fail();
-    } while (s_sockets[s].p2p && n > 0 &&
-             np_psnr_p2p_filter(GUEST_PTR(EA(buf), const char*), (uint32_t)n));
+        if (s_sockets[s].p2p && n > 0) {
+            uint32_t un = (uint32_t)n;
+            uint16_t port = ntohs(a.sin_port);
+            if (np_psnr_p2p_filter(GUEST_PTR(EA(buf), char*), &un, (uint8_t*)&a.sin_addr, &port))
+                continue;                     /* psnr's own packet */
+            n = (int)un;                      /* possibly a peer's, unwrapped */
+            a.sin_port = htons(port);
+        }
+        break;
+    } while (1);
     if (net_trace()) trace("recvfrom", s, n, &a);
     write_sockaddr(EA(from), EA(fromlen), &a);
     if (from && s_sockets[s].p2p) vm_write16(EA(from) + 8, s_sockets[s].vport);
@@ -710,7 +797,10 @@ static int run_poll(const int32_t* gfd, const short* gev, short* grev, int n, in
         hp[nh].revents = 0;
         map[nh++] = i;
     }
-    if (nval) timeout_ms = 0;
+    int relayed = 0;
+    for (int i = 0; i < n; i++)
+        if ((gev[i] & SYS_NET_POLLIN) && valid_socket(gfd[i]) && relayed_pending(gfd[i])) relayed++;
+    if (nval || relayed) timeout_ms = 0;
     if (nh == 0) { sleep_ms(timeout_ms); return nval; }
 
     int r = host_poll(hp, (unsigned)nh, timeout_ms);
@@ -724,6 +814,7 @@ static int run_poll(const int32_t* gfd, const short* gev, short* grev, int n, in
         if (h & POLLERR)  rv |= SYS_NET_POLLERR;
         if (h & POLLHUP)  rv |= SYS_NET_POLLHUP;
         if (h & POLLNVAL) rv |= SYS_NET_POLLNVAL;
+        if ((gev[map[k]] & SYS_NET_POLLIN) && relayed_pending(gfd[map[k]])) rv |= SYS_NET_POLLIN;
         grev[map[k]] = rv;
         if (rv) ready++;
     }

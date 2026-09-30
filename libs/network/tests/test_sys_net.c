@@ -31,8 +31,16 @@ uint16_t np_psnr_p2p_port(void) { return s_p2p_port; }
  * only that sysNet registers the P2P datagram socket and drops what the
  * filter claims. */
 static np_psnr_p2p_send_fn s_sender;
+static np_psnr_stream_sink_fn s_sink;
 void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn) { s_sender = fn; }
-int  np_psnr_p2p_filter(const void* buf, uint32_t len) { return len >= 4 && !memcmp(buf, "PSNR", 4); }
+void np_psnr_set_stream_sink(np_psnr_stream_sink_fn fn) { s_sink = fn; }
+int  np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t ip[4], uint16_t* port)
+{
+    (void)ip; (void)port;
+    return *len >= 4 && !memcmp(buf, "PSNR", 4);
+}
+int     np_psnr_p2p_route(const void* b, uint32_t l, const uint8_t ip[4], uint16_t p) { (void)b; (void)l; (void)ip; (void)p; return 0; }
+int64_t np_psnr_stream_connect(const uint8_t ip[4], uint16_t p) { (void)ip; (void)p; return -2; }
 
 static struct { uint32_t nid; void (*fn)(ppu_context*); } s_reg[64];
 static int s_nreg;
@@ -221,6 +229,39 @@ int main(void)
     int32_t in = C3("accept", l1, ADDR_B, LEN);
     assert(in >= 0 && vm_read16(ADDR_B + 2) == 36659 && vm_read16(ADDR_B + 8) == 36659);
     s_p2p_port = 36658;
+
+    /* A stream a peer opened through psnr's relay arrives as a connected host
+     * socket: the P2P listener turns readable, and accept hands it out as the
+     * peer connecting from its P2P port. */
+    {
+        struct sockaddr_in la;
+        socklen_t ll = sizeof(la);
+        host_socket_t hl = socket(AF_INET, SOCK_STREAM, 0), hc, hs;
+        memset(&la, 0, sizeof(la));
+        la.sin_family = AF_INET;
+        la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        assert(bind(hl, (struct sockaddr*)&la, sizeof(la)) == 0 && listen(hl, 1) == 0);
+        getsockname(hl, (struct sockaddr*)&la, &ll);
+        hc = socket(AF_INET, SOCK_STREAM, 0);
+        assert(connect(hc, (struct sockaddr*)&la, sizeof(la)) == 0);
+        hs = accept(hl, NULL, NULL);
+        host_closesocket(hl);
+
+        const uint8_t peer[4] = { 203, 0, 113, 7 };
+        assert(s_sink);   /* the P2P listener registered it */
+        s_sink((int64_t)hs, peer, 40001);
+        vm_write32(POLLFD, (uint32_t)l1);
+        vm_write16(POLLFD + 4, SYS_NET_POLLIN);
+        assert(C3("socketpoll", POLLFD, 1, 0) == 1 && (vm_read16(POLLFD + 6) & SYS_NET_POLLIN));
+        vm_write32(LEN, 16);
+        int32_t rs = C3("accept", l1, ADDR_B, LEN);
+        assert(rs >= 0 && vm_read32(ADDR_B + 4) == 0xCB007107u);
+        assert(vm_read16(ADDR_B + 2) == 40001 && vm_read16(ADDR_B + 8) == 40001);
+        send(hc, "setup", 5, 0);
+        assert(call("recv", rs, BUF, 64, 0, 0, 0) == 5 && !memcmp(vm_base + BUF, "setup", 5));
+        assert(C1("socketclose", rs) == 0);
+        host_closesocket(hc);
+    }
     assert(C1("socketclose", in) == 0 && C1("socketclose", out) == 0);
     assert(C1("socketclose", l2) == 0 && C1("socketclose", l1) == 0);
 

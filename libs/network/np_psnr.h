@@ -77,11 +77,31 @@ void np_psnr_pump(void);
 typedef int (*np_psnr_p2p_send_fn)(const void* buf, uint32_t len,
                                    const uint8_t ip[4], uint16_t port);
 void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn);
-int  np_psnr_p2p_filter(const void* buf, uint32_t len);   /* 1 = psnr's, dropped */
+
+/* A datagram that arrived on the P2P socket from from_ip:from_port. 1: it was
+ * psnr's own (a probe reply, a peer's punch) -- drop it. 0: it's the title's.
+ * A datagram a peer sent through the relay is unwrapped in place: len, and
+ * the sender, become the peer's payload and address. */
+int  np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* from_port);
 
 /* A peer's P2P endpoint became known (Matching2 member entries): punch toward
  * it a few times. Our own entry is skipped. */
 void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port);
+
+/* The relay (psnr docs/api.md, "Relay"), when psnr runs with -relay.
+ * - A peer that never answered our punches gets our datagrams through the
+ *   relay: np_psnr_p2p_route sends them there and returns 1; 0 means send
+ *   directly as usual.
+ * - psnr says (ROUTE) which peers take streams only through the relay:
+ *   np_psnr_stream_connect opens one to such a peer and returns its socket,
+ *   -2 when the peer takes direct connections, -1 when the relay failed.
+ * - A stream a peer opened to us arrives as a socket, with the peer's
+ *   address, through the sink sysNet registers; sysNet hands it to the
+ *   title's P2P listener. */
+int     np_psnr_p2p_route(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port);
+int64_t np_psnr_stream_connect(const uint8_t ip[4], uint16_t port);
+typedef void (*np_psnr_stream_sink_fn)(int64_t fd, const uint8_t ip[4], uint16_t port);
+void    np_psnr_set_stream_sink(np_psnr_stream_sink_fn fn);
 
 #ifdef __cplusplus
 }
