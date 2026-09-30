@@ -31,10 +31,6 @@
 extern "C" {
 #endif
 
-/* WWS code-buffer resolution probe counter (see spu_ls_write128 in spu_context.h). */
-int g_wws_code_probe = 0;
-int g_wws_read_probe = 0;
-
 /* The SPU decrementer ticks at the PS3 timebase, 79.8 MHz -- the same clock
  * sys_time_get_timebase_frequency reports to the PPU. Titles calibrate real
  * delays against it, so the rate has to be right, not merely non-zero. */
@@ -77,8 +73,6 @@ void (*g_spu_line_commit_hook)(uint32_t line) = 0;
  * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
 #define SPU_WATCH_MAX 4
 int g_spu_ls_watch_n = -1;
-int g_spu_ls_probe = -1;      /* spu_ls_read_probe gate (SPU_LS_LOWREAD) */
-int g_spu_smc_watch = -1;     /* spu_ls_write_probe_smc gate (SPU_SMC_WATCH) */
 static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
 unsigned* spu_ls_watch_list(int* out_n)
 {

@@ -17,13 +17,6 @@
 #include <stdio.h>
 #include <string.h>
 
-/* The helpers' diagnostic gates, defined in spu_channels.c, which this
- * standalone test does not link. Same defaults as the runtime. */
-int g_wws_code_probe = 0;
-int g_wws_read_probe = 0;
-int g_spu_ls_probe = -1;
-int g_spu_smc_watch = -1;
-
 static int g_pass = 0;
 static int g_fail = 0;
 static const char* g_current = "(none)";
