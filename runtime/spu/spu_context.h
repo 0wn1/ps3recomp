@@ -478,7 +478,20 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 /* Debug probes of spu_ls_read128, out of line: inlined they kept every LS
  * load a real call (~10% of GH3's FMOD mixer task). g_spu_ls_probe is -1
  * until the first call reads SPU_LS_LOWREAD, then 0/1. */
-extern int g_spu_ls_probe;
+
+/* The diagnostic gates the inline helpers below read. Defined here rather than
+ * in spu_channels.c, as one merged definition per program (selectany / weak),
+ * so every target that includes this header links whether or not it builds
+ * spu_channels.c -- the SPU unit tests and sync_stress do not. */
+#if defined(_MSC_VER)
+#  define SPU_GATE __declspec(selectany)
+#else
+#  define SPU_GATE __attribute__((weak))
+#endif
+SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      */
+SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
+SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
+SPU_GATE int g_wws_read_probe = 0;
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;

@@ -122,7 +122,7 @@ static void* ppu_host_thread_proc(void* param)
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
-            (unsigned long long)info->entry_addr), (unsigned long)GetCurrentThreadId();
+            (unsigned long long)info->entry_addr, (unsigned long)GetCurrentThreadId());
 
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
