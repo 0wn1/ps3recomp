@@ -474,6 +474,12 @@ int32_t sys_net_bnet_accept(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen
             memmove(s_relayed, s_relayed + 1, (size_t)(--s_nrelayed) * sizeof(s_relayed[0]));
         }
         RELAYED_UNLOCK();
+        /* A directly accepted socket inherits the listener's blocking mode,
+         * so this one must too. Simpsons Arcade's joiner reads its game
+         * setup and then once more, expecting EWOULDBLOCK; on a blocking
+         * socket that read hung until the stream closed, the joiner went
+         * quiet for 4 s, and the host kicked it. */
+        if (fd != HOST_INVALID_SOCKET) set_nonblocking(fd, s_sockets[s].nonblocking);
     }
     if (fd == HOST_INVALID_SOCKET) {
         fd = accept(s_sockets[s].host_fd, (struct sockaddr*)&a, &len);
@@ -524,6 +530,7 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
         if (fd >= 0) {
             host_closesocket(s_sockets[s].host_fd);
             s_sockets[s].host_fd = (host_socket_t)fd;
+            set_nonblocking(s_sockets[s].host_fd, s_sockets[s].nonblocking);   /* the mode the title set */
             return 0;
         }
     }

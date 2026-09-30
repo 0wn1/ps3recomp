@@ -294,6 +294,28 @@ int main(void)
         assert(rs >= 0 && vm_read16(ADDR_B + 8) == 40002);
         assert(C1("socketclose", rs) == 0);
         host_closesocket(hc);
+
+        /* On a nonblocking listener, the relayed stream is nonblocking too,
+         * as a directly accepted one is: a read with nothing waiting says
+         * EWOULDBLOCK instead of hanging. */
+        vm_write32(OPT, 1);
+        assert(C5("setsockopt", l1, SYS_NET_SOL_SOCKET, SYS_NET_SO_NBIO, OPT, 4) == 0);
+        hl = socket(AF_INET, SOCK_STREAM, 0);
+        la.sin_port = 0;
+        assert(bind(hl, (struct sockaddr*)&la, sizeof(la)) == 0 && listen(hl, 1) == 0);
+        ll = sizeof(la);
+        getsockname(hl, (struct sockaddr*)&la, &ll);
+        hc = socket(AF_INET, SOCK_STREAM, 0);
+        assert(connect(hc, (struct sockaddr*)&la, sizeof(la)) == 0);
+        hs = accept(hl, NULL, NULL);
+        host_closesocket(hl);
+        s_sink((int64_t)hs, peer, 40003);
+        vm_write32(LEN, 16);
+        rs = C3("accept", l1, ADDR_B, LEN);
+        assert(rs >= 0);
+        assert((uint32_t)call("recv", rs, BUF, 64, 0, 0, 0) == 0x80010223u);   /* EWOULDBLOCK */
+        assert(C1("socketclose", rs) == 0);
+        host_closesocket(hc);
     }
     assert(C1("socketclose", in) == 0 && C1("socketclose", out) == 0);
     assert(C1("socketclose", l2) == 0 && C1("socketclose", l1) == 0);
