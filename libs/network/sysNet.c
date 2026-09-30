@@ -37,6 +37,7 @@
     #include <errno.h>
     #include <poll.h>
     #include <time.h>
+    #include <sys/time.h>
     typedef int host_socket_t;
     typedef struct pollfd host_pollfd;
     #define HOST_INVALID_SOCKET (-1)
@@ -574,8 +575,22 @@ static void trace(const char* op, int32_t s, int n, const struct sockaddr_in* a)
 #endif
     char ip[16] = "-";
     if (a) ip_str(&a->sin_addr, ip);
-    printf("[sys_net] %s(%d) %s:%u -> %d (host error %d)\n", op, s, ip,
-           a ? ntohs(a->sin_port) : 0, n, err);
+    /* Wall-clock milliseconds, to line two machines' traces up. */
+    unsigned hh, mm, ss, ms;
+#ifdef _WIN32
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    hh = t.wHour; mm = t.wMinute; ss = t.wSecond; ms = t.wMilliseconds;
+#else
+    struct timeval tv;
+    struct tm tm;
+    gettimeofday(&tv, NULL);
+    localtime_r(&tv.tv_sec, &tm);
+    hh = (unsigned)tm.tm_hour; mm = (unsigned)tm.tm_min; ss = (unsigned)tm.tm_sec;
+    ms = (unsigned)(tv.tv_usec / 1000);
+#endif
+    printf("[sys_net %02u:%02u:%02u.%03u] %s(%d) %s:%u -> %d (host error %d)\n", hh, mm, ss, ms,
+           op, s, ip, a ? ntohs(a->sin_port) : 0, n, err);
 }
 
 int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flags)
