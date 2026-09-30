@@ -143,6 +143,9 @@ int np_psnr_connect(const char* comm_id)
         printf("[psnr] connected to %s:%u as \"%s\" (%s), user %u, seen from %u.%u.%u.%u, p2p port %u\n",
                host, port, np_psnr_online_id(), comm_id, user_id, ip[0], ip[1], ip[2], ip[3],
                np_psnr_p2p_port());
+    else if (psnr_connect_error() == PSNR_E_NAME_TAKEN)
+        printf("[psnr] %s:%u: another player there is already \"%s\" -- pick another "
+               "with --username. NP stays offline\n", host, port, np_psnr_online_id());
     else
         printf("[psnr] could not reach %s:%u -- NP stays offline\n", host, port);
     return s_client ? 0 : -1;
