@@ -110,6 +110,21 @@ static void adec_notify(CellAdecHandle handle, u32 msg_type, s32 msg_data)
  * API implementations
  * -----------------------------------------------------------------------*/
 
+/* cellAdecQueryAttr: how much work memory the decoder wants, before Open.
+ * CellAdecAttr (guest, big-endian): +0 u32 workMemSize, +4 u32 adecVerUpper,
+ * +8 u32 adecVerLower. Decoding is host-side and never touches the buffer;
+ * see cellVdecQueryAttr. */
+s32 cellAdecQueryAttr(const CellAdecType* type, void* attr)
+{
+    u32 ea = (u32)(uintptr_t)attr;
+    if (!type || !ea)
+        return (s32)CELL_ADEC_ERROR_ARG;
+    vm_write32(ea + 0x0, 0x40000);    /* workMemSize: 256 KB */
+    vm_write32(ea + 0x4, 0x00010000); /* adecVerUpper */
+    vm_write32(ea + 0x8, 0);          /* adecVerLower */
+    return CELL_OK;
+}
+
 /* cellAdecOpen(type, res, cb, handle) -- FOUR arguments.
  *
  * This took five, splitting the guest's CellAdecCb struct into cbFunc + cbArg,
