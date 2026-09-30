@@ -53,6 +53,10 @@
 #define ADEC_SCRATCH_STRIDE 0x4000u
 #define ADEC_ITEM_EA(h)     (ADEC_SCRATCH_BASE + (u32)(h) * ADEC_SCRATCH_STRIDE)
 #define ADEC_PCM_EA(h)      (ADEC_ITEM_EA(h) + 0x100u)
+/* The codec info block the PcmItem's bsiInfo points to, in the gap between
+ * the 0x30-byte item and the PCM buffer. */
+#define ADEC_BSI_EA(h)      (ADEC_ITEM_EA(h) + 0x40u)
+#define ADEC_BSI_BYTES      0x40u
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -236,7 +240,16 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
         vm_write32(it + PCMITEM_STATUS,     0);              /* CELL_OK */
         vm_write32(it + PCMITEM_START_ADDR, a->pcmEa);
         vm_write32(it + PCMITEM_SIZE,       ADEC_PCM_BYTES);
-        vm_write32(it + PCMITEM_BSI_INFO,   0);
+        /* bsiInfo must point at a codec info block, not be null. Resistance:
+         * Fall of Man sizes each AC3 block from bsiInfo+0x14; with a null
+         * pointer that read address 0x14 and came back 0, so its ring buffer
+         * never filled, it never started its audio port, and its movie player
+         * waited forever. ponytail: only that output-size word is filled; the
+         * rest of the block is zero until a title reads another field. */
+        const u32 bsi = ADEC_BSI_EA(handle);
+        for (u32 o = 0; o < ADEC_BSI_BYTES; o += 4) vm_write32(bsi + o, 0);
+        vm_write32(bsi + 0x14, ADEC_PCM_BYTES);
+        vm_write32(it + PCMITEM_BSI_INFO,   bsi);
         /* Echo the AU back, which is what a real decoder does -- the guest
          * matches returned PCM against the AU it submitted. */
         vm_write32(it + PCMITEM_AU_START,
