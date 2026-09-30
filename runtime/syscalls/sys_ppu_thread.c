@@ -122,7 +122,7 @@ static void* ppu_host_thread_proc(void* param)
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
-            (unsigned long long)info->entry_addr, (unsigned long)GetCurrentThreadId());
+            (unsigned long long)info->entry_addr), (unsigned long)GetCurrentThreadId();
 
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
@@ -451,6 +451,15 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
     if (_gate_this && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
+    /* The guest's top priorities (0 is highest, 3071 lowest) are its audio and
+     * I/O pollers. At normal host priority they wake late under a busy frame:
+     * The Simpsons Arcade Game's music thread (prio 0) polls the audio read
+     * index every 2.5 ms and misses a 5.3 ms block whenever it is delayed, and
+     * each miss is an audible gap. A mild boost, not TIME_CRITICAL: these
+     * threads sleep between polls.
+     * ponytail: two host levels only; map the full range if a title needs it. */
+    if (priority < 256)
+        SetThreadPriority(t->host_thread, THREAD_PRIORITY_ABOVE_NORMAL);
 #else
     /* Same reservation, for the same reason. This is the HOST stack the
      * recompiled C frames run on, not the guest stack (allocated above out of
