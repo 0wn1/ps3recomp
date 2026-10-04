@@ -24,6 +24,7 @@ This is the same philosophy behind:
 - [PS2Recomp](https://github.com/ran-j/PS2Recomp) (PS2 -> native)
 - [burnout3](https://github.com/sp00nznet/burnout3) (Original Xbox -> native)
 - [ReXGlue](https://github.com/rexglue/rexglue-sdk) (Xbox 360 -> native)
+- [AnyPS5](https://github.com/boykopovar/AnyPS5) (PS5 -> native)
 
 ...but for the PS3's glorious, terrifying **Cell Broadband Engine**.
 
