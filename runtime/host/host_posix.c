@@ -43,7 +43,7 @@
 /* Opt-in (-DPS3RECOMP_RSX_VULKAN=ON): same entry points and test hooks. */
 #  include "rsx_vulkan_backend.h"
 #  define HOST_BACKEND_NAME     "Vulkan"
-#  define HOST_BACKEND_GUEST_SHADERS 0
+#  define HOST_BACKEND_GUEST_SHADERS rsx_vulkan_backend_guest_programs()
 #  define host_backend_init     rsx_vulkan_backend_init
 #  define host_backend_shutdown rsx_vulkan_backend_shutdown
 #  define host_backend_pump     rsx_vulkan_backend_pump_messages

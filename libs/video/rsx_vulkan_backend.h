@@ -5,14 +5,21 @@
  * entry points and test hooks as the Metal and headless null backends, so
  * runtime/host/host_posix.c drives it unchanged.
  *
- * Stage V1 (this file): offscreen colour + depth targets, NV4097 CLEAR_SURFACE
- * (colour and depth), the fallback draw path (the headless null backend's
- * contract: flat colour, depth test, texture unit 0, point sampling), and
- * present with a CPU readback of the frame. Every fixed-function
- * ps3recomp_host scene passes on it; the scenes that need the guest's own
- * programs (--shader, --mip, --rtt, --depthtex, --mrt, --mrt-a) report that
- * and are skipped, as on the null backend. Stage V2 adds an optional window
- * (below). Guest programs are next.
+ * Two draw paths, one registered at a time (the FIFO walker feeds both):
+ *
+ *   - the shared register-file draw engine (rsx_draw_engine.h), the path the
+ *     Metal backend takes. The engine owns surfaces, render-to-texture, MRT,
+ *     depth textures, vertex compaction and pipeline keys; this backend builds
+ *     Vulkan pipelines from the guest's programs (HLSL -> SPIR-V through
+ *     glslang, rsx_shader_spirv.h) and executes. Every ps3recomp_host scene
+ *     passes on it. Default when guest programs are on.
+ *   - the rsx_state vtable: the headless null backend's fixed-function
+ *     contract (flat colour, depth test, texture unit 0, point sampling), so
+ *     the two agree pixel for pixel. Default otherwise; with guest programs it
+ *     also runs them, but has no surfaces (--rtt, --depthtex, --mrt, --mrt-a).
+ *
+ * Rendering is offscreen; a present reads the frame back (the host's pixel
+ * checks), optionally dumps it, and optionally shows it in a window.
  *
  * Vulkan is loaded at run time (dlopen of libvulkan.so.1), not linked, so:
  *   - building needs only the Vulkan headers, not a target-arch libvulkan
@@ -35,6 +42,13 @@
  *   PS3RECOMP_VK_FULLSCREEN=1 with a window: borderless full screen.
  *   PS3RECOMP_VK_HOLD=<sec>   with a window: keep the last frame on screen
  *                             this long before shutdown closes it.
+ *   PS3RECOMP_VK_GUEST_PROGRAMS=1
+ *                             run the guest's own vertex/fragment programs
+ *                             (needs the translator: glslang at build time),
+ *                             which also makes the draw engine the default.
+ *   PS3RECOMP_RSX_ENGINE=dispatch|vtable
+ *                             pick the path explicitly (the engine's own
+ *                             switch, shared with the Metal backend).
  */
 
 #ifndef PS3RECOMP_RSX_VULKAN_BACKEND_H
@@ -68,9 +82,16 @@ u32  rsx_vulkan_backend_debug_color(void);
  * has been presented yet. */
 u32  rsx_vulkan_backend_readback_center(void);
 
-/* Draws of the last presented frame that ran the guest's own programs:
- * 0 at V0, there is no shader path yet. */
+/* Draws of the last presented frame that ran the guest's own programs. */
 u32  rsx_vulkan_backend_guest_draws(void);
+
+/* 1 when draws run the guest's own programs: the HLSL -> SPIR-V translator
+ * was built (glslang found) and PS3RECOMP_VK_GUEST_PROGRAMS=1 opts in. Then
+ * the shared register-file draw engine (rsx_draw_engine.h) is the default
+ * path, as it is Metal's; PS3RECOMP_RSX_ENGINE=vtable selects the older
+ * rsx_state path instead. Opt-in while the path grows; needs no initialised
+ * backend. */
+int  rsx_vulkan_backend_guest_programs(void);
 
 #ifdef __cplusplus
 }
