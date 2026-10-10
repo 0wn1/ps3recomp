@@ -436,7 +436,16 @@ static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageF
     u32 type;
     const VkMemoryPropertyFlags vis = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     const VkMemoryPropertyFlags coh = vis | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    if (vk_find_memory_type(req.memoryTypeBits, coh, &type) == 0) b->coherent = 1;
+    /* A buffer the GPU only copies into is one the CPU reads back, and the
+     * first coherent type is usually write-combined and uncached (RADV's
+     * GTT): there the readback memcpy was 82% of the FIFO thread's time in
+     * Twisted Metal. Take a cached type for it when there is one; reads
+     * invalidate, so a non-coherent one is fine. */
+    const VkMemoryPropertyFlags cached = vis | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    const int readback = usage == VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (readback && vk_find_memory_type(req.memoryTypeBits, cached | coh, &type) == 0) b->coherent = 1;
+    else if (readback && vk_find_memory_type(req.memoryTypeBits, cached, &type) == 0) b->coherent = 0;
+    else if (vk_find_memory_type(req.memoryTypeBits, coh, &type) == 0) b->coherent = 1;
     else if (vk_find_memory_type(req.memoryTypeBits, vis, &type) == 0) b->coherent = 0;
     else { VK_LOG("no host-visible memory for a buffer\n"); return -1; }
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
