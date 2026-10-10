@@ -1562,13 +1562,19 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         u32 flags = 0;
         if (mask & RSX_CLEAR_DEPTH)   flags |= RSX_BE_CLEAR_DEPTH;
         if (mask & RSX_CLEAR_STENCIL) flags |= RSX_BE_CLEAR_STENCIL;
-        /* ZSTENCIL_CLEAR_VALUE is Z24S8: depth24 << 8 | stencil8, with the
-         * nv40 reset 0xFFFFFF00 seeded by rsx_dispatch_init, so a stream that
-         * never writes it still clears to 1.0 / 0. */
+        /* ZSTENCIL_CLEAR_VALUE is laid out as the zeta is: depth24 << 8 |
+         * stencil8 for Z24S8, a bare depth16 for Z16 (SURFACE_FORMAT depth
+         * field 1). Read as Z24S8, a Z16 surface's 0xFFFF -- its far plane --
+         * would clear it to 255/16777215, nearly the near plane, and every
+         * LESS or LEQUAL draw into it would then fail. The nv40 reset
+         * 0xFFFFFF00 seeded by rsx_dispatch_init clears to 1.0 / 0. */
         const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
+        const int z16 = sf.depth_format == 1u;
+        const float depth = !zs ? 1.0f
+                          : z16 ? (float)(zs & 0xFFFFu) / 65535.0f
+                                : (float)(zs >> 8) / 16777215.0f;
         g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
-                                  zs ? (float)(zs >> 8) / 16777215.0f : 1.0f,
-                                  (u8)(zs & 0xFFu));
+                                  depth, z16 ? 0 : (u8)(zs & 0xFFu));
         g.zdepths[zslot].cleared = 1;
         if (mask & RSX_CLEAR_DEPTH) {
             /* A clear invalidates the older published depth image; the next
