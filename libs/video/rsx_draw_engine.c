@@ -90,6 +90,8 @@ typedef struct {
     u32 pitch;              /* guest bytes per row, from SET_SURFACE_PITCH */
     rsx_be_format fmt;
     u32 handle;
+    u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
+    int guest_dirty;        /* rendered since guest memory last got a copy   */
 } eng_surface;
 
 typedef struct {
@@ -100,6 +102,10 @@ typedef struct {
     int cleared;
     int had_write;
     int snapshot_valid;
+    u64 depth_serial;      /* g.write_serial of the last depth write or clear */
+    int guest_dirty;       /* written since guest memory last got a copy     */
+    u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
+    u32 used_w, used_h;    /* the clip that write went through              */
 } eng_zdepth;
 
 typedef struct {
@@ -110,7 +116,12 @@ typedef struct {
     u64 last_use_serial;
 } eng_texture;
 
-typedef struct { u64 key; u32 handle; u8 fixed; } eng_pipeline;
+typedef struct {
+    u64 key;
+    u32 handle;
+    u8 fixed;
+    u16 tex_used;           /* units the pixel program samples */
+} eng_pipeline;
 
 typedef struct { u32 first, count; } eng_batch;
 
@@ -143,6 +154,7 @@ static struct {
     u32 last_guest_draws;
     u32 last_present_surface;
     u32 last_flip_buffer;
+    u64 write_serial;       /* orders colour and depth writes to one address */
 
     /* staging: decoded texture levels, the constant blocks, the index list */
     u8* tex_staging;
@@ -557,6 +569,8 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
     s->handle = handle;
+    s->color_serial = 0;
+    s->guest_dirty = 0;
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0; if (logs++ < 16)
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
@@ -782,6 +796,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->cleared = 0;
     z->had_write = 0;
     z->snapshot_valid = 0;
+    z->depth_serial = 0;
+    z->guest_dirty = 0;
     if (slot == g.n_zdepths) g.n_zdepths++;
     return slot;
 }
@@ -972,6 +988,134 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     return e.handle;
 }
 
+/* ---- surfaces read through guest memory --------------------------------- */
+
+/* A texture may name a surface's bytes in a format the surface was not
+ * rendered in: a deferred renderer reads its D24S8 depth buffer as A8R8G8B8
+ * to rebuild positions, samples its Z16 shadow map as DEPTH16, and reads back
+ * as X32_FLOAT a float it packed into an RGBA8 target. On RSX that is only
+ * memory. Here the surface is stored into guest memory in its own layout --
+ * the bytes RSX would have left there -- and the texture is then decoded from
+ * guest memory like any other, so every format the decoder knows reads them
+ * the way RSX would. A surface is stored at most once per write to it. */
+
+/* Re-hash, on their next use rather than next frame, the cached textures that
+ * start inside [offset, offset + bytes): their bytes changed within this one. */
+static void eng_textures_touch(u32 location, u32 offset, u32 bytes)
+{
+    for (u32 i = 0; i < g.n_textures; i++) {
+        eng_texture* e = &g.textures[i];
+        if (e->location == location && e->offset >= offset && e->offset - offset < bytes)
+            e->last_hash_frame = g.frames - 1u;
+    }
+}
+
+/* Formats that read an RGBA8 surface's 32-bit pixels as something else: the
+ * host image cannot be sampled as them, the guest bytes can. */
+static int eng_format_reinterprets_rgba8(u32 base_fmt)
+{
+    switch (base_fmt) {
+    case RSX_TEX_FMT_DEPTH24_D8:
+    case 0x91u:     /* DEPTH24_D8_FLOAT */
+    case 0x92u:     /* DEPTH16          */
+    case 0x93u:     /* DEPTH16_FLOAT    */
+    case 0x95u:     /* Y16_X16          */
+    case 0x9Cu:     /* X32_FLOAT        */
+    case 0x9Fu:     /* Y16_X16_FLOAT    */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Store a colour surface into guest memory, A,R,G,B per pixel at its own
+ * pitch. Returns 0 when it cannot, and the caller samples as before. */
+static int eng_surface_to_guest(u32 slot)
+{
+    eng_surface* s = &g.surfaces[slot];
+    if (!s->guest_dirty) return 1;
+    if (s->fmt != RSX_BE_FMT_R8G8B8A8 || s->pitch < s->w * 4u || !g.be->readback)
+        return 0;
+    rsx_draw_engine_guest_read(s->location, s->offset, s->pitch, s->w, s->h);
+    s->guest_dirty = 0;
+    eng_textures_touch(s->location, s->offset, s->pitch * s->h);
+    return 1;
+}
+
+static float* s_depth_rows;
+static u32 s_depth_cap;
+
+/* Store a depth target into guest memory as its zeta format lays it out:
+ * Z16 as one big-endian 16-bit value, Z24S8 as a big-endian word with the
+ * depth in the top 24 bits. The stencil byte is written as 0: the host depth
+ * target keeps no stencil to copy. Returns 0 when it cannot. */
+static int eng_zdepth_to_guest(u32 slot)
+{
+    eng_zdepth* z = &g.zdepths[slot];
+    if (!z->guest_dirty) return 1;
+    if (!g.be->depth_readback || !z->handle) return 0;
+    const u32 bpp = (z->zfmt == 1u) ? 2u : 4u;      /* SURFACE_FORMAT Z16 = 1 */
+    const u32 w = z->used_w < z->w ? z->used_w : z->w;
+    const u32 h = z->used_h < z->h ? z->used_h : z->h;
+    if (!w || !h || z->pitch < w * bpp) return 0;
+    if (s_depth_cap < w * h) {
+        float* n = (float*)realloc(s_depth_rows, (size_t)w * h * sizeof(float));
+        if (!n) return 0;
+        s_depth_rows = n;
+        s_depth_cap = w * h;
+    }
+    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+    if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
+                             w * (u32)sizeof(float)) != 0)
+        return 0;
+    for (u32 r = 0; r < h; r++) {
+        u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
+        if (!dst) return 0;
+        const float* src = s_depth_rows + (size_t)r * w;
+        for (u32 c = 0; c < w; c++) {
+            float d = src[c];
+            if (!(d > 0.0f)) d = 0.0f;
+            if (d > 1.0f) d = 1.0f;
+            if (bpp == 2u) {
+                const u32 v = (u32)(d * 65535.0f + 0.5f);
+                dst[0] = (u8)(v >> 8); dst[1] = (u8)v;
+            } else {
+                const u32 v = (u32)(d * 16777215.0f + 0.5f);
+                dst[0] = (u8)(v >> 16); dst[1] = (u8)(v >> 8); dst[2] = (u8)v; dst[3] = 0;
+            }
+            dst += bpp;
+        }
+    }
+    z->guest_dirty = 0;
+    eng_textures_touch(z->location, z->offset, z->pitch * h);
+    if (eng_coherence_log())
+        fprintf(stderr, "[rsx engine] depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
+                z->offset, bpp == 2u ? "Z16" : "Z24S8", z->pitch, w, h);
+    return 1;
+}
+
+/* A depth write or clear through the current zeta, recorded with what the
+ * guest-memory copy needs to lay it out. */
+static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
+{
+    eng_zdepth* z = &g.zdepths[slot];
+    z->depth_serial = ++g.write_serial;
+    z->guest_dirty = 1;
+    z->zfmt = sf->depth_format;
+    z->pitch = sf->zeta_pitch;
+    z->used_w = sf->clip_w ? sf->clip_w : g.width;
+    z->used_h = sf->clip_h ? sf->clip_h : g.height;
+}
+
+static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
+{
+    const u64 serial = ++g.write_serial;
+    for (u32 i = 0; i < n_targets; i++) {
+        g.surfaces[targets[i]].color_serial = serial;
+        g.surfaces[targets[i]].guest_dirty = 1;
+    }
+}
+
 /* SET_TEXTURE_FILTER's min field is [18:16] (1 NEAREST, 2 LINEAR, then 3..6,
  * the four combinations of a nearest/linear minification with a
  * nearest/linear mip filter) and mag [26:24]; SET_TEXTURE_CONTROL0 carries
@@ -1134,14 +1278,32 @@ static const char* const kEngFixedPS =
 "};\n"
 "float4 main(PSInput input) : SV_TARGET { return input.col0; }\n";
 
+/* The texture units a translated pixel program samples. Every sampling call
+ * the decompiler emits names its unit's sampler, rsx_samp[N], whatever the
+ * texture's own spelling (rsx_tex[N] or, with a cube unit, rsx_texN); the
+ * declaration's rsx_samp[16] is out of range and so not counted. */
+static u32 eng_sampled_units(const char* ps)
+{
+    u32 mask = 0;
+    for (const char* q = ps; (q = strstr(q, "rsx_samp[")) != NULL; q += 9) {
+        const unsigned long u = strtoul(q + 9, NULL, 10);
+        if (u < RSX_BE_MAX_TEXTURES) mask |= 1u << u;
+    }
+    return mask;
+}
+
 /* The pipeline for this draw, built once per distinct key. A negative result
  * is cached too (handle 0), so a program pair that will not translate is not
- * retried on every draw of every frame. */
+ * retried on every draw of every frame. `out_tex_used` gets the units the
+ * pixel program samples: all of them for the built-in pair, which keeps
+ * every enabled unit bound as before. */
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
-                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
+                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
+                            u32* out_tex_used)
 {
     *out_fixed = 1;
+    *out_tex_used = 0;
     const u8* vp_uc = NULL;
     const u8* fp_uc = NULL;
     u32 vp_instrs = 0, fp_size = 0;
@@ -1185,6 +1347,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     for (u32 i = 0; i < g.n_pipelines; i++)
         if (g.pipelines[i].key == key) {
             *out_fixed = g.pipelines[i].fixed;
+            *out_tex_used = g.pipelines[i].tex_used;
             return g.pipelines[i].handle;
         }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
@@ -1219,6 +1382,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
+    g.pipelines[g.n_pipelines].tex_used =
+        (u16)(fixed ? 0xFFFFu : eng_sampled_units(s_ps_hlsl));
+    *out_tex_used = g.pipelines[g.n_pipelines].tex_used;
     g.n_pipelines++;
     *out_fixed = fixed;
     return handle;
@@ -1407,7 +1573,7 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
  * tracked zeta in DEPTH24_D8 samples its snapshot, and everything else is a
  * guest upload (rsx_live_draw.c:5986-6062). */
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
-                              u32 current_zslot,
+                              u32 current_zslot, u32 tex_used,
                               u32 textures[RSX_BE_MAX_TEXTURES],
                               rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
 {
@@ -1415,23 +1581,61 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
-        if (!t.enabled) continue;
+        /* A unit left enabled by an earlier draw but not sampled by this
+         * program is skipped: resolving it would cost a cache check, and an
+         * aliased surface a store to guest memory, for nothing. */
+        if (!t.enabled || !((tex_used >> u) & 1u)) continue;
         mask |= 1u << u;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
 
-        int sampled = -1;
+        int sampled = -1, own = 0, surface_at = -1;
         for (u32 i = 0; i < g.n_surfaces; i++) {
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
                 continue;
+            surface_at = (int)i;
             /* Not one this draw writes: reading a target a pass is writing
              * is undefined on every API, and an MRT set writes more than
              * one of them. */
-            int own = 0;
             for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
             if (own) break;
             sampled = (int)i;
             break;
+        }
+        const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
+        /* The depth at this address, when it was written after any colour
+         * there: a depth-only pass names its zeta as a colour target too. */
+        int zsrc = -1;
+        for (u32 i = 0; i < g.n_zdepths; i++) {
+            const eng_zdepth* z = &g.zdepths[i];
+            if (z->location != t.location || z->offset != t.offset || !z->depth_serial)
+                continue;
+            if (surface_at < 0 || z->depth_serial > g.surfaces[surface_at].color_serial)
+                zsrc = (int)i;
+            break;
+        }
+        if (zsrc >= 0) {
+            /* DEPTH24_D8 keeps the backend's own snapshot when it has one;
+             * anything else goes through guest memory. */
+            if (base_fmt == RSX_TEX_FMT_DEPTH24_D8 && current_zslot != (u32)zsrc) {
+                const u32 snap = eng_zdepth_snapshot((u32)zsrc);
+                if (snap) { textures[u] = snap; continue; }
+            }
+            if (eng_zdepth_to_guest((u32)zsrc)) {
+                textures[u] = eng_texture_slot(t.location, t.offset, t.format,
+                                               t.width, t.height, t.mipmaps, t.pitch,
+                                               (int)t.cubemap, t.remap & 0xFFFFu);
+                continue;
+            }
+        }
+        if (sampled >= 0 && zsrc < 0 &&
+            g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
+            eng_format_reinterprets_rgba8(base_fmt) &&
+            eng_surface_to_guest((u32)sampled)) {
+            textures[u] = eng_texture_slot(t.location, t.offset, t.format,
+                                           t.width, t.height, t.mipmaps, t.pitch,
+                                           (int)t.cubemap, t.remap & 0xFFFFu);
+            continue;
         }
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
@@ -1441,7 +1645,6 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             textures[u] = view ? view : g.surfaces[sampled].handle;
             continue;
         }
-        const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
         if (base_fmt == RSX_TEX_FMT_DEPTH24_D8) {
             for (u32 i = 0; i < g.n_zdepths; i++)
                 if (g.zdepths[i].location == t.location &&
@@ -1532,6 +1735,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      sf.clip_w, sf.clip_h);
 
+    /* A guest program pair that will not translate has no fallback: the draw
+     * is dropped, as the reference engine drops it. Substituting the built-in
+     * program would draw the geometry in the wrong colours, which is harder to
+     * see than a missing object and hides the translation failure. */
+    int pipeline_is_fixed = 1;
+    u32 tex_used = 0;
+    const u32 pipeline = eng_pipeline_get(&layout, &rs,
+                                          eng_surface_format(sf.color_format),
+                                          n_targets, &pipeline_is_fixed, &tex_used);
+    if (!pipeline) return;
+
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */
     u32 textures[RSX_BE_MAX_TEXTURES];
@@ -1542,20 +1756,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(samplers, 0, sizeof samplers);
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
-    const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot,
+    const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
-
-    /* A guest program pair that will not translate has no fallback: the draw
-     * is dropped, as the reference engine drops it. Substituting the built-in
-     * program would draw the geometry in the wrong colours, which is harder to
-     * see than a missing object and hides the translation failure. */
-    int pipeline_is_fixed = 1;
-    const u32 pipeline = eng_pipeline_get(&layout, &rs,
-                                          eng_surface_format(sf.color_format),
-                                          n_targets, &pipeline_is_fixed);
-    if (!pipeline) return;
 
     if (indexed) {
         if (!dc_reserve_indices(n_draw)) return;
@@ -1654,8 +1858,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * evidence that the decompile-translate-compile path worked. */
     if (!pipeline_is_fixed) g.guest_draws++;
 
-    if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write)
+    if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
+    if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
         g.zdepths[zslot].had_write = 1;
+        eng_zdepth_wrote(zslot, &sf);
+    }
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
@@ -1680,6 +1887,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
          * keep whatever the last frame left in them. */
         for (u32 i = 0; i < n_targets; i++)
             g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
+        eng_surfaces_wrote(targets, n_targets);
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
         rsx_dsp_surface sf;
@@ -1703,6 +1911,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
              * texture consumer resolves the newly written pass exactly once. */
             g.zdepths[zslot].had_write = 0;
             g.zdepths[zslot].snapshot_valid = 0;
+            eng_zdepth_wrote(zslot, &sf);
         }
     }
 }

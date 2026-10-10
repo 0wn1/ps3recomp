@@ -210,6 +210,14 @@ typedef struct rsx_draw_backend {
     void (*present)(void* user, u32 surface);
     void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                      void* out, u32 out_pitch);
+
+    /* Optional: read a rectangle of a depth target back as floats in [0, 1],
+     * `out_pitch` bytes per row. Returns 0 on success. The engine uses it to
+     * store a depth buffer into guest memory when a texture reads those bytes
+     * in a format of its own (a D24S8 buffer as A8R8G8B8, a Z16 shadow map as
+     * DEPTH16); left NULL, such a texture reads guest memory as it is. */
+    int  (*depth_readback)(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+                           float* out, u32 out_pitch);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
