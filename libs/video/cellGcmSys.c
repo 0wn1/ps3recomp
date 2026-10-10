@@ -2764,12 +2764,22 @@ u32 cellGcmResolveIO(u32 offset)
  * local allocations (gcm/cube: ioSize 16MB, FP ucode at local 0xB90000 --
  * table hit returned the empty command-buffer EA instead of VRAM). Callers
  * that KNOW the location (texture format bits, SET_SHADER_PROGRAM bits) must
- * use this. `local` != 0 -> local memory. */
+ * use this. `local` != 0 -> local memory.
+ *
+ * A MAIN offset asks the IO table first. cellGcmResolveOffset would send it
+ * to VRAM whenever the guest once derived a local offset in the same 1 MB
+ * page number, and a title with both a large IO map and a full VRAM has
+ * many such pages: Twisted Metal's menu fragment programs at IO 0x08B96040
+ * and 0x0F75E800 and a G-buffer texture at IO 0x02A1F380 were read out of
+ * VRAM -- texture bytes that decode as a NOP program, so the menu's UI drew
+ * transparent black. An offset the IO table does not map keeps the old
+ * guess. */
 u32 cellGcmResolveLocated(int local, u32 offset)
 {
     if (local)
         return s_config.localAddress + offset;
-    return cellGcmResolveOffset(offset);
+    const u32 ea = cellGcmResolveIO(offset);
+    return ea ? ea : cellGcmResolveOffset(offset);
 }
 
 /* ---------------------------------------------------------------------------

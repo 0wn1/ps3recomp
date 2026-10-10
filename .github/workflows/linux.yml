@@ -220,6 +220,10 @@ jobs:
           # plausible and still fails here. Exercises rsx_texture_layout and
           # rsx_texture_decode end to end with no GPU involved.
           ./build/ps3recomp_host --tex
+          # The same texture after the guest also derived a VRAM offset in its
+          # 1 MB page number: the texture says main memory, so it must still
+          # resolve through the IO map rather than into VRAM.
+          ./build/ps3recomp_host --tex-io
           # A polygon and a quad strip, neither of which any host API draws:
           # both have to be expanded into triangles first. The pentagon is
           # green and the strip red over it, and the centre pixel belongs to
