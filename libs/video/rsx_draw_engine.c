@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -1373,6 +1374,34 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
+    /* RSX_ENGINE_SHADER_DUMP=<existing dir>: each new pipeline's two programs
+     * as <dir>/pipe<handle>.vs.hlsl and .ps.hlsl, the handle being the one
+     * RSX_ENGINE_PASS_DUMP's index names, and a guest fragment program's own
+     * ucode as .fp.bin with its address in .fp.txt. A failed pipeline is
+     * pipe0. */
+    {
+        const char* dir = getenv("RSX_ENGINE_SHADER_DUMP");
+        if (dir && *dir) {
+            char path[1024];
+            FILE* f;
+            snprintf(path, sizeof path, "%s/pipe%u.vs.hlsl", dir, handle);
+            if ((f = fopen(path, "w"))) { fputs(s_vs_hlsl, f); fclose(f); }
+            snprintf(path, sizeof path, "%s/pipe%u.ps.hlsl", dir, handle);
+            if ((f = fopen(path, "w"))) { fputs(s_ps_hlsl, f); fclose(f); }
+            if (!fixed && fp_uc && fp_size) {
+                u32 fp_loc = 0;
+                const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
+                snprintf(path, sizeof path, "%s/pipe%u.fp.bin", dir, handle);
+                if ((f = fopen(path, "wb"))) { fwrite(fp_uc, 1, fp_size, f); fclose(f); }
+                snprintf(path, sizeof path, "%s/pipe%u.fp.txt", dir, handle);
+                if ((f = fopen(path, "w"))) {
+                    fprintf(f, "location %u offset 0x%08X size %u ctrl 0x%08X\n",
+                            fp_loc, fp_off, fp_size, fp_ctrl);
+                    fclose(f);
+                }
+            }
+        }
+    }
     { static u32 logs = 0; if (logs++ < 32)
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
                         " %u constants -> %s\n",
@@ -1681,6 +1710,324 @@ static u32 sink_bind_vertex_textures(
     return bound;
 }
 
+/* ---- per-pass capture (diagnostic) --------------------------------------- */
+
+/* RSX_ENGINE_PASS_DUMP=<existing dir>: capture the draws pass by pass, from
+ * the first draw RSX_ENGINE_PASS_DUMP_AFTER seconds after the engine's first
+ * one or, without that, from the frame after the first presented frame of at
+ * least RSX_ENGINE_PASS_DUMP_MINDRAWS guest draws (default 1).
+ *
+ * A pass is a run of draws and clears into one target set and zeta. When the
+ * set changes, each colour target of the pass that ended is read back to
+ * <dir>/passNNN_tK.ppm, its zeta to <dir>/passNNN_z.pgm (stretched from its
+ * smallest to its largest value), and <dir>/passes.txt gets one line: the
+ * targets, the zeta and its depth range, the draw and clear counts, each
+ * clear's scissor, and the first draw's state and textures. Each texture
+ * names the colour surface (S) and the depth target (Z) at its address with
+ * the serial of their last write -- the newer one is what was sampled -- or G
+ * for guest memory. Each presented surface goes to <dir>/presentNNN.ppm,
+ * named after the pass count, and the capture runs on across presents until
+ * RSX_ENGINE_PASS_DUMP_MAX passes (default 64). RSX_ENGINE_PASS_DUMP_DRAWS=1
+ * also writes one line per draw to <dir>/draws.txt: its pipeline, colour
+ * mask, blend, depth state and the textures it samples.
+ *
+ * The question it answers is which pass of a multi-pass frame first comes out
+ * wrong. */
+static struct {
+    int state;              /* 0 unread, 1 waiting, 2 capturing, 3 done/off */
+    const char* dir;
+    u32 min_draws;
+    u32 after_s;
+    u32 max_passes;
+    time_t start;
+    FILE* index;
+    FILE* draws_log;        /* RSX_ENGINE_PASS_DUMP_DRAWS: one line a draw */
+    u32 pass;
+    int open;
+    u32 n_targets, targets[RSX_BE_MAX_COLOR_TARGETS], zslot;
+    u32 draws, clears;
+    char first[2048];
+} s_pd;
+
+static int pd_open_index(void)
+{
+    char path[1024];
+    snprintf(path, sizeof path, "%s/passes.txt", s_pd.dir);
+    s_pd.index = fopen(path, "w");
+    if (!s_pd.index) { s_pd.state = 3; return 0; }
+    if (getenv("RSX_ENGINE_PASS_DUMP_DRAWS")) {
+        snprintf(path, sizeof path, "%s/draws.txt", s_pd.dir);
+        s_pd.draws_log = fopen(path, "w");
+    }
+    s_pd.state = 2;
+    s_pd.open = 0;
+    return 1;
+}
+
+static int pd_capturing(void)
+{
+    if (s_pd.state == 0) {
+        s_pd.dir = getenv("RSX_ENGINE_PASS_DUMP");
+        const char* m = getenv("RSX_ENGINE_PASS_DUMP_MINDRAWS");
+        s_pd.min_draws = m ? (u32)strtoul(m, NULL, 0) : 1u;
+        const char* a = getenv("RSX_ENGINE_PASS_DUMP_AFTER");
+        s_pd.after_s = a ? (u32)strtoul(a, NULL, 0) : 0u;
+        const char* x = getenv("RSX_ENGINE_PASS_DUMP_MAX");
+        s_pd.max_passes = x ? (u32)strtoul(x, NULL, 0) : 64u;
+        s_pd.start = time(NULL);
+        s_pd.state = (s_pd.dir && *s_pd.dir) ? 1 : 3;
+    }
+    if (s_pd.state == 1 && s_pd.after_s &&
+        difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
+        fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
+    return s_pd.state == 2;
+}
+
+static float pd_half(u16 h)
+{
+    const u32 e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+    float v;
+    if (e == 0)       v = (float)m / 16777216.0f;              /* m * 2^-24 */
+    else if (e == 31) v = m ? 0.0f : 65504.0f;
+    else {
+        v = (1.0f + (float)m / 1024.0f);
+        for (u32 i = e; i > 15; i--) v *= 2.0f;
+        for (u32 i = e; i < 15; i++) v *= 0.5f;
+    }
+    return (h & 0x8000u) ? -v : v;
+}
+
+static u8 pd_unit(float v)
+{
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (u8)(v * 255.0f + 0.5f);
+}
+
+/* One colour surface to a binary PPM, alpha dropped, floats clamped to [0,1]. */
+static void pd_write_surface(u32 slot, const char* path)
+{
+    const eng_surface* s = &g.surfaces[slot];
+    u32 bpp;
+    switch (s->fmt) {
+    case RSX_BE_FMT_R8G8B8A8:      bpp = 4;  break;
+    case RSX_BE_FMT_R16G16B16A16F: bpp = 8;  break;
+    case RSX_BE_FMT_R32G32B32A32F: bpp = 16; break;
+    case RSX_BE_FMT_R32F:          bpp = 4;  break;
+    default: return;
+    }
+    if (!s->handle || !s->w || !s->h || !g.be->readback) return;
+    u8* raw = (u8*)malloc((size_t)s->w * s->h * bpp);
+    u8* rgb = (u8*)malloc((size_t)s->w * s->h * 3u);
+    FILE* f = (raw && rgb) ? fopen(path, "wb") : NULL;
+    if (f) {
+        memset(raw, 0, (size_t)s->w * s->h * bpp);
+        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, raw, s->w * bpp);
+        for (size_t i = 0; i < (size_t)s->w * s->h; i++) {
+            const u8* p = raw + i * bpp;
+            u8* o = rgb + i * 3u;
+            if (s->fmt == RSX_BE_FMT_R8G8B8A8) {
+                o[0] = p[0]; o[1] = p[1]; o[2] = p[2];
+            } else if (s->fmt == RSX_BE_FMT_R16G16B16A16F) {
+                for (u32 c = 0; c < 3; c++) {
+                    u16 h; memcpy(&h, p + c * 2u, 2);
+                    o[c] = pd_unit(pd_half(h));
+                }
+            } else if (s->fmt == RSX_BE_FMT_R32G32B32A32F) {
+                for (u32 c = 0; c < 3; c++) {
+                    float v; memcpy(&v, p + c * 4u, 4);
+                    o[c] = pd_unit(v);
+                }
+            } else {
+                float v; memcpy(&v, p, 4);
+                o[0] = o[1] = o[2] = pd_unit(v);
+            }
+        }
+        fprintf(f, "P6\n%u %u\n255\n", s->w, s->h);
+        fwrite(rgb, 1, (size_t)s->w * s->h * 3u, f);
+        fclose(f);
+    }
+    free(raw);
+    free(rgb);
+}
+
+/* A depth target to a greyscale PPM, stretched from its smallest to its
+ * largest value so a shallow range still shows; the range goes to the index. */
+static void pd_write_depth(u32 zslot, const char* path, float* lo_out, float* hi_out)
+{
+    const eng_zdepth* z = &g.zdepths[zslot];
+    *lo_out = *hi_out = -1.0f;
+    if (!g.be->depth_readback || !z->handle) return;
+    const u32 w = z->used_w && z->used_w < z->w ? z->used_w : z->w;
+    const u32 h = z->used_h && z->used_h < z->h ? z->used_h : z->h;
+    float* d = (float*)malloc((size_t)w * h * sizeof(float));
+    u8* px = (u8*)malloc((size_t)w * h);
+    FILE* f = (d && px) ? fopen(path, "wb") : NULL;
+    if (f) {
+        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+        if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, d, w * 4u) == 0) {
+            float lo = 1.0f, hi = 0.0f;
+            for (size_t i = 0; i < (size_t)w * h; i++) {
+                if (d[i] < lo) lo = d[i];
+                if (d[i] > hi) hi = d[i];
+            }
+            const float span = hi > lo ? hi - lo : 1.0f;
+            for (size_t i = 0; i < (size_t)w * h; i++)
+                px[i] = (u8)((d[i] - lo) / span * 255.0f);
+            fprintf(f, "P5\n%u %u\n255\n", w, h);
+            fwrite(px, 1, (size_t)w * h, f);
+            *lo_out = lo; *hi_out = hi;
+        }
+        fclose(f);
+    }
+    free(d);
+    free(px);
+}
+
+static void pd_close_pass(void)
+{
+    if (!s_pd.open) return;
+    char path[1024];
+    fprintf(s_pd.index, "pass %03u: draws %u clears %u |", s_pd.pass, s_pd.draws,
+            s_pd.clears);
+    for (u32 k = 0; k < s_pd.n_targets; k++) {
+        const eng_surface* s = &g.surfaces[s_pd.targets[k]];
+        fprintf(s_pd.index, " %c 0x%08X fmt %d %ux%u p%u", 'A' + (int)k, s->offset,
+                (int)s->fmt, s->w, s->h, s->pitch);
+        snprintf(path, sizeof path, "%s/pass%03u_t%u.ppm", s_pd.dir, s_pd.pass, k);
+        pd_write_surface(s_pd.targets[k], path);
+    }
+    if (s_pd.zslot != ENG_INVALID) {
+        float lo, hi;
+        snprintf(path, sizeof path, "%s/pass%03u_z.pgm", s_pd.dir, s_pd.pass);
+        pd_write_depth(s_pd.zslot, path, &lo, &hi);
+        const eng_zdepth* z = &g.zdepths[s_pd.zslot];
+        fprintf(s_pd.index, " | zeta 0x%08X p%u depth %.9g..%.9g (%ux%u, written %ux%u)",
+                z->offset, z->pitch, lo, hi, z->w, z->h, z->used_w, z->used_h);
+    }
+    fprintf(s_pd.index, " |%s\n", s_pd.first);
+    fflush(s_pd.index);
+    s_pd.pass++;
+    s_pd.open = 0;
+    if (s_pd.pass >= s_pd.max_passes) {
+        fprintf(s_pd.index, "stopped after %u passes\n", s_pd.pass);
+        fclose(s_pd.index);
+        s_pd.index = NULL;
+        if (s_pd.draws_log) { fclose(s_pd.draws_log); s_pd.draws_log = NULL; }
+        s_pd.state = 3;
+        fprintf(stderr, "[rsx engine] pass dump: %u passes written to %s\n",
+                s_pd.pass, s_pd.dir);
+    }
+}
+
+/* A draw (or, with rs NULL, a clear) into this target set: close the pass
+ * when the set changed, and describe the first draw of a new one. */
+static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+                    const rsx_be_render_state* rs, u32 pipeline, u32 tex_mask)
+{
+    if (!pd_capturing()) return;
+    int same = s_pd.open && s_pd.n_targets == n_targets && s_pd.zslot == zslot;
+    for (u32 k = 0; same && k < n_targets; k++) same = s_pd.targets[k] == targets[k];
+    if (!same) {
+        pd_close_pass();
+        s_pd.open = 1;
+        s_pd.n_targets = n_targets;
+        memcpy(s_pd.targets, targets, n_targets * sizeof(u32));
+        s_pd.zslot = zslot;
+        s_pd.draws = s_pd.clears = 0;
+        s_pd.first[0] = 0;
+    }
+    if (!rs) {
+        s_pd.clears++;
+        const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+        const u32 v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+        const size_t n = strlen(s_pd.first);
+        snprintf(s_pd.first + n, sizeof s_pd.first - n,
+                 " [clear after %u draws, scissor %u,%u %ux%u]",
+                 s_pd.draws, h & 0xFFFFu, v & 0xFFFFu, h >> 16, v >> 16);
+        return;
+    }
+    if (s_pd.draws_log) {
+        fprintf(s_pd.draws_log, "pass %03u draw %u: pipe %u cmask %08X blend %u %X/%X"
+                " dt %u dw %u at %u |", s_pd.pass, s_pd.draws, pipeline, rs->color_mask,
+                rs->blend_enable, rs->sf_rgb, rs->df_rgb, rs->depth_test, rs->depth_write,
+                rs->alpha_test_enable);
+        for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+            if (!(tex_mask & (1u << u))) continue;
+            rsx_dsp_texture t;
+            rsx_dsp_get_texture(&g.rsx, u, &t);
+            fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u", u, t.location, t.offset,
+                    t.format & 0xFFu, t.width, t.height);
+        }
+        fprintf(s_pd.draws_log, "\n");
+    }
+    if (s_pd.draws++) return;
+
+    rsx_dsp_surface sf;
+    rsx_dsp_viewport vp;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    rsx_dsp_get_viewport(&g.rsx, &vp);
+    size_t at = strlen(s_pd.first);
+    at += (size_t)snprintf(s_pd.first + at, sizeof s_pd.first - at,
+        " rt_sel %u cfmt %u zfmt %u clip %ux%u | pipe %u dt %u dw %u df %u cmask %08X"
+        " blend %u %X/%X stencil %u vpz %g+%g |",
+        sf.color_target, sf.color_format, sf.depth_format, sf.clip_w, sf.clip_h,
+        pipeline, rs->depth_test, rs->depth_write, rs->depth_func, rs->color_mask,
+        rs->blend_enable, rs->sf_rgb, rs->df_rgb, rs->stencil_enable,
+        vp.scale[2], vp.translate[2]);
+    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES && at < sizeof s_pd.first; u++) {
+        if (!(tex_mask & (1u << u))) continue;
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        /* S<n> a colour surface, Z<n> a depth target, each with the serial
+         * of its last write: the newer one is what the binding sampled. */
+        char src[48] = "G";
+        size_t sl = 0;
+        for (u32 i = 0; i < g.n_surfaces; i++)
+            if (g.surfaces[i].handle && g.surfaces[i].location == t.location &&
+                g.surfaces[i].offset == t.offset) {
+                sl = (size_t)snprintf(src, sizeof src, "S%u@%llu", i,
+                                      (unsigned long long)g.surfaces[i].color_serial);
+                break;
+            }
+        for (u32 i = 0; i < g.n_zdepths; i++)
+            if (g.zdepths[i].location == t.location && g.zdepths[i].offset == t.offset) {
+                snprintf(src + sl, sizeof src - sl, "%sZ%u@%llu", sl ? "," : "", i,
+                         (unsigned long long)g.zdepths[i].depth_serial);
+                break;
+            }
+        at += (size_t)snprintf(s_pd.first + at, sizeof s_pd.first - at,
+            " t%u %u:0x%08X f%02X %ux%u p%u%s r%04X zf%u %s", u, t.location, t.offset,
+            t.format & 0xFFu, t.width, t.height, t.pitch, t.cubemap ? " cube" : "",
+            t.remap & 0xFFFFu, t.wrap >> 28, src);
+    }
+}
+
+/* Called on every present: arm on the first frame heavy enough when no delay
+ * was asked for, and while capturing, close the pass in progress and write
+ * the presented surface. */
+static void pd_present(u32 presented)
+{
+    if (s_pd.state == 0) pd_capturing();
+    if (s_pd.state == 1 && !s_pd.after_s && g.guest_draws >= s_pd.min_draws) {
+        if (pd_open_index())
+            fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
+                    g.frames + 1, g.guest_draws);
+        return;
+    }
+    if (s_pd.state == 2) {
+        char path[1024];
+        pd_close_pass();
+        if (s_pd.state != 2) return;               /* that pass was the last */
+        snprintf(path, sizeof path, "%s/present%03u.ppm", s_pd.dir, s_pd.pass);
+        pd_write_surface(presented, path);
+        fprintf(s_pd.index, "present%03u: surface %u 0x%08X, %u guest draws\n",
+                s_pd.pass, presented, g.surfaces[presented].offset, g.guest_draws);
+        fflush(s_pd.index);
+    }
+}
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -1803,6 +2150,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
       alpha[1] = alpha[2] = alpha[3] = 0.0f; }
 
+    pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
+
     /* The depth attachment is cleared the first time it is bound, so a title
      * that never clears its shadow zeta still tests against something. */
     const u32 depth_handle = (zslot != ENG_INVALID) ? g.zdepths[zslot].handle : 0;
@@ -1872,6 +2221,13 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
     if (!n_targets) return;
+    if (pd_capturing()) {
+        rsx_dsp_surface zs;
+        rsx_dsp_get_surface(&g.rsx, &zs);
+        pd_note(targets, n_targets,
+                eng_zdepth_get(zs.zeta_location, zs.zeta_offset, zs.clip_w, zs.clip_h),
+                NULL, 0, 0);
+    }
 
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G |
                 RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
@@ -1946,6 +2302,7 @@ static void eng_present(u32 buffer_id)
                     i, g.surfaces[i].location, g.surfaces[i].offset,
                     g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
     }
+    pd_present(target);
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
     g.frames++;
