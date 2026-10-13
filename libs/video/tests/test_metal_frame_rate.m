@@ -1,10 +1,22 @@
 #include "../rsx_metal_backend.m"
 #include <assert.h>
 
+/* Shutdown reaches these only for a fully initialized production engine. */
+void rsx_set_backend(rsx_backend* backend) { (void)backend; }
+void rsx_draw_engine_shutdown(void) {}
+void rsx_draw_engine_set_backend(const rsx_draw_backend* backend) { (void)backend; }
+static void* shutdown_worker(void* unused) {
+ (void)unused;rsx_metal_backend_shutdown();return NULL;
+}
+
 int main(int argc, char **argv) {
  @autoreleasepool {
   assert(argc == 2);
-  if (!strcmp(argv[1], "window") || !strcmp(argv[1], "drawable") || !strcmp(argv[1], "disabled")) {
+  if (!strcmp(argv[1], "headless_shutdown")) {
+   s_headless=1;pthread_t worker;
+   assert(pthread_create(&worker,NULL,shutdown_worker,NULL)==0);
+   assert(pthread_join(worker,NULL)==0);
+  } else if (!strcmp(argv[1], "window") || !strcmp(argv[1], "drawable") || !strcmp(argv[1], "disabled")) {
    setenv("PS3RECOMP_METAL_FPS", "1", 1);
    if (!strcmp(argv[1], "disabled")) unsetenv("PS3RECOMP_METAL_FPS");
    s_dev = MTLCreateSystemDefaultDevice(); assert(s_dev);

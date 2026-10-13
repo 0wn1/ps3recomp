@@ -3373,8 +3373,12 @@ void rsx_metal_backend_shutdown(void)
             s_inflight = nil;
         }
 #if !TARGET_OS_IPHONE
-        if ([NSThread isMainThread]) fps_stop();
-        else dispatch_sync(dispatch_get_main_queue(), ^{ fps_stop(); });
+        /* Disabled/headless runs never create a tracker and must not gain a
+         * dependency on a pumping AppKit main queue during worker teardown. */
+        if (fps_session()) {
+            if ([NSThread isMainThread]) fps_stop();
+            else dispatch_sync(dispatch_get_main_queue(), ^{ fps_stop(); });
+        }
         if (s_window) { [s_window close]; s_window = nil; }
 #endif
         free(s_verts); s_verts = NULL;

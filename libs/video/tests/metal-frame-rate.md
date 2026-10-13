@@ -24,6 +24,7 @@ statistics allocation is introduced. Drawable callbacks retain their own
 session so shutdown/reinitialization cannot contaminate a new run.
 
 Run `python3 tools/test_metal_frame_rate.py` on macOS with a display. It checks
-deterministic rates/stalls/duplicate timestamps/bounded p95, a native title
+deterministic rates/stalls/duplicate timestamps/bounded p95, worker-thread
+headless shutdown without main-queue pumping, a native title
 timer without a rendering thread, actual drawable callbacks versus GPU-only
 completion, reset, and disabled mode.
