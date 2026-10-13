@@ -152,8 +152,10 @@ missing, or `PS3RECOMP_FFMPEG=0` is set, the decoders keep the callback-only
 behaviour every build had before. `PS3RECOMP_FFMPEG_AVCODEC` and
 `PS3RECOMP_FFMPEG_AVUTIL` name the library files to load instead.
 
-FFmpeg stays a separate LGPL library supplied by the user; nothing from it is
-compiled into the runtime.
+FFmpeg stays a separate library supplied by the user; nothing from it is
+compiled into the runtime. If you redistribute FFmpeg DLLs with a port, use an
+LGPL-only build: distro and MSYS2 packages are usually built with GPL parts
+enabled (`--enable-gpl`), which changes what you may ship.
 
 ### Running the Tests
 
