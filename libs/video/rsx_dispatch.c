@@ -262,7 +262,11 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 static void vtx_const_set(rsx_dispatch* rsx, u32 attr, u32 c, float v)
 {
     u32 w; memcpy(&w, &v, 4);
-    rsx->regs[(M_VTX_ATTR_4F + attr * 0x10 + c * 4) >> 2] = w;
+    const u32 idx = (M_VTX_ATTR_4F + attr * 0x10 + c * 4) >> 2;
+    rsx->regs[idx] = w;
+    /* Folded packed constants also have an explicit canonical value, even
+     * when every component is zero. Immediate snapshots need that presence. */
+    rsx->seen[idx]++;
 }
 
 static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)

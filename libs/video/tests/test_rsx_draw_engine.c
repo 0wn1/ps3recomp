@@ -1246,6 +1246,43 @@ static void test_immediate_compositor(void)
     engine_down();
 }
 
+static void test_immediate_packed_zero_and_inline(void)
+{
+    const u32 packed[] = {0x194Cu, 0x1998u, 0x0A98u};
+    for (u32 k = 0; k < 3; k++) {
+        engine_up();
+        m(packed[k], 0);
+        if (k) m(packed[k] + 4, 0);
+        m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+        immediate_vertex(0,0,0,0); immediate_vertex(1,0,0,0);
+        immediate_vertex(0,1,0,0);
+        m(M_BEGIN_END, 0);
+        CHECK(stub.n_draw == 1 && stub.captured_vertices[0][15] == 0,
+              "packed all-zero method 0x%X preserves explicit alpha", packed[k]);
+        engine_down();
+    }
+    engine_up();
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    m(M_INLINE_ARRAY, 0); /* shorter than declared stride */
+    immediate_vertex(0,0,0,0); immediate_vertex(1,0,0,0);
+    immediate_vertex(0,1,0,0);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 0, "short inline stream mixed with immediate rejects group");
+    m(M_VTXFMT, 0); /* no enabled inline attribute */
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    m(M_INLINE_ARRAY, 0);
+    immediate_vertex(0,0,0,0); immediate_vertex(1,0,0,0);
+    immediate_vertex(0,1,0,0);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 0, "undeclared inline stream mixed with immediate rejects group");
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    immediate_vertex(0,0,0,0); immediate_vertex(1,0,0,0);
+    immediate_vertex(0,1,0,0);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 1, "BEGIN clears rejected inline source state");
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1275,6 +1312,7 @@ int main(void)
     test_depth_read_as_color();
     test_color_read_as_float();
     test_immediate_compositor();
+    test_immediate_packed_zero_and_inline();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

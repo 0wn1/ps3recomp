@@ -1627,7 +1627,7 @@ static void sink_immediate_vertex(void* user, const rsx_dispatch* r)
         float* value = dc.immediate[dc.n_immediate][attr];
         rsx_dsp_vertex_default(r, attr, value);
         /* The legacy default getter treats all-zero words as unwritten.
-         * Direct DATA4F writes may explicitly set W/alpha to zero. */
+         * Direct and folded constants may explicitly set W/alpha to zero. */
         const u32 base = (0x1C00u + attr * 16u) >> 2;
         if (r->seen[base] || r->seen[base + 1] ||
             r->seen[base + 2] || r->seen[base + 3])
@@ -1653,10 +1653,12 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
                               const u8* data, u32 bytes)
 {
     (void)user;
-    const u32 stride = rsx_vertex_inline_layout(r, NULL);
-    if (!stride || bytes < stride) return;
+    /* Record source presence even when its declaration or length is invalid,
+     * so mixed immediate/inline groups cannot draw a partial prefix. */
     dc.inl = data;
     dc.inl_bytes = bytes;
+    const u32 stride = rsx_vertex_inline_layout(r, NULL);
+    if (!stride || bytes < stride) return;
     dc.n_packets++;
     if (dc.n_arr >= ENG_MAX_BATCHES) return;
     dc.arr[dc.n_arr].first = 0;
