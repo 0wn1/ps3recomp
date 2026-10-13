@@ -4279,7 +4279,7 @@ static ID3D12PipelineState* get_pso(
         LD_PSO_BAIL("shader hash collapsed to zero");
         return NULL;
     }
-    const u32 fp_ctrl_key = fp_ctrl & 0x40u;
+    const u32 fp_ctrl_key = fp_ctrl & 0x4Eu;   /* 32-bit exports, depth export */
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
@@ -4296,6 +4296,30 @@ static ID3D12PipelineState* get_pso(
         unnorm_mask |= 1u << uu;
         unnorm_dim[uu][0] = ut.width;
         unnorm_dim[uu][1] = ut.height;
+        /* A depth texture bound to a zeta's snapshot reads that host
+         * resource, which is as large as the largest pass that used the zeta
+         * (bounded by the zeta), not as large as the texture. Texel
+         * coordinates address the resource, so divide by its size: a texture
+         * smaller than the zeta then reads its top-left corner, as it does in
+         * VRAM, instead of a stretched copy of the whole depth buffer. */
+        if ((ut.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) ==
+                TEX_FMT_DEPTH24_D8) {
+            for (u32 zi = 0; zi < g.n_zdepths; zi++) {
+                const zdepth_t* z = &g.zdepths[zi];
+                if (z->location != ut.location || z->offset != ut.offset)
+                    continue;
+                /* Only when the bind will take the snapshot (it has, or
+                 * will copy, a depth-writing pass); a zeta that was only
+                 * cleared is read from guest memory at texture size. */
+                if (z->snapshot && (z->had_write || z->snapshot_valid) &&
+                    z->snapshot_w >= ut.width &&
+                    z->snapshot_h >= ut.height) {
+                    unnorm_dim[uu][0] = z->snapshot_w;
+                    unnorm_dim[uu][1] = z->snapshot_h;
+                }
+                break;
+            }
+        }
     }
     key = fnv1a(&unnorm_mask, sizeof(unnorm_mask), key);
     if (unnorm_mask) key = fnv1a(unnorm_dim, sizeof(unnorm_dim), key);
@@ -5881,7 +5905,7 @@ static u64 live_legacy_pso_key(void)
 
     u64 key = fnv1a(vp_uc, vp_instrs * 16, 1469598103934665603ull);
     key = fnv1a(fp_uc, fp_size, key);
-    const u32 fp_ctrl_key = rsx_dsp_shader_control(&g.rsx) & 0x40u;
+    const u32 fp_ctrl_key = rsx_dsp_shader_control(&g.rsx) & 0x4Eu;
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     render_state_t rs;
     decode_render_state(&rs);
