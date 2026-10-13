@@ -2056,6 +2056,8 @@ static void release_surfaces(void)
 static int s_eng_active;
 /* Certificate for synchronous submissions used by depth readback. */
 static int s_eng_checked_completed;
+/* Owner-thread encoding failures remain sticky until backend reinitialization. */
+static int s_eng_encoding_failed;
 
 static id<MTLTexture> s_eng_obj[ENG_MAX_OBJECTS];
 static u32 s_eng_obj_count;
@@ -2263,6 +2265,7 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
 static int eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
+    s_eng_encoding_failed = 0;
     if (!s_dev) return -1;
     NSError* err = nil;
     s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
@@ -2301,6 +2304,8 @@ static void eng_shutdown(void* user)
     s_eng_depth_pso = nil;
     s_eng_point_sampler = nil;
     s_eng_active = 0;
+    s_eng_encoding_failed = 0;
+    s_eng_checked_completed = 0;
 }
 
 static void eng_submit_and_wait(void* user, u32 reason)
@@ -2772,9 +2777,9 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
 static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                             id<MTLBuffer> stage)
 {
-    if (!r->pipeline || r->pipeline > s_eng_pipe_count) return;
+    if (!r->pipeline || r->pipeline > s_eng_pipe_count) { s_eng_encoding_failed = 1; return; }
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
-    if (!p->pso) return;
+    if (!p->pso) { s_eng_encoding_failed = 1; return; }
     [enc setRenderPipelineState:p->pso];
     [enc setDepthStencilState:p->ds];
     [enc setCullMode:p->cull];
@@ -2836,13 +2841,13 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->depth);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
-            if (!src || !dst || !s_eng_depth_pso) continue;
+            if (!src || !dst || !s_eng_depth_pso) { s_eng_encoding_failed = 1; continue; }
             MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture     = dst;
             rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
-            if (!e) continue;
+            if (!e) { s_eng_encoding_failed = 1; continue; }
             [e setRenderPipelineState:s_eng_depth_pso];
             [e setFragmentTexture:src atIndex:0];
             [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
@@ -2923,7 +2928,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             tex[attach++] = t;
         }
         id<MTLTexture> zbuf = eng_obj(depth);
-        if (!attach && !zbuf) { if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
+        if (!attach && !zbuf) { s_eng_encoding_failed = 1; if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
         /* A pipeline always declares the depth attachment, so a draw pass
          * always has to have one; the display's shared buffer is the fallback
          * for a guest that never declared a zeta. */
@@ -2969,6 +2974,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          * named, so a pass that could not bind them all takes its clears and
          * skips those draws rather than encoding a mismatch. */
         if (!enc || attach != nrt) {
+            s_eng_encoding_failed = 1;
             if (enc) [enc endEncoding];
             while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                    eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
@@ -3056,6 +3062,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                                       options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         if (!cb || (s_eng_stage_used && !stage)) {
+            s_eng_encoding_failed = 1;
             if (windowed_present) dispatch_semaphore_signal(s_inflight);
             return;
         }
@@ -3073,7 +3080,8 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             [cb commit];
             [cb waitUntilCompleted];
             s_eng_checked_completed = [cb status] == MTLCommandBufferStatusCompleted &&
-                                      ![cb error] && !s_eng_dropped;
+                                      ![cb error] && !s_eng_dropped && !s_eng_encoding_failed;
+            if (!s_eng_checked_completed) s_eng_encoding_failed = 1;
         }
 
         if (s_eng_dropped) {
