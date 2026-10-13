@@ -89,6 +89,7 @@ typedef struct {
     u32 stencil_ref;
     u32 last_created_texture, last_created_color;
     u32 last_released;
+    float last_clear_depth;
 } StubState;
 
 static StubState stub;
@@ -230,7 +231,7 @@ static void stub_clear_color(void* u, u32 s, const float rgba[4])
 }
 
 static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
-{ (void)u; (void)d; (void)f; (void)z; (void)s; stub.n_clear_ds++; }
+{ (void)u; (void)d; (void)f; (void)s; stub.n_clear_ds++; stub.last_clear_depth = z; }
 
 static u32 presented_surface;
 static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.n_present++; }
@@ -308,6 +309,8 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_ZETA_OFFSET         0x0214
 #define M_COLOR_B_OFFSET      0x0218
 #define M_COLOR_TARGET        0x0220
+#define M_CONTEXT_DMA_ZETA    0x0198
+#define M_ZSTENCIL_CLEAR      0x1D8C
 #define M_COLOR_C_OFFSET      0x0288
 #define M_COLOR_D_OFFSET      0x028C
 #define M_SCISSOR_H           0x08C0
@@ -1028,6 +1031,34 @@ static void test_inline_array(void)
     engine_down();
 }
 
+/* ---- 9. the depth clear value --------------------------------------------- */
+
+#define ZETA_OFFSET  0x00100000u        /* local memory */
+
+static void test_depth_clear_value(void)
+{
+    printf("-- depth clear value\n");
+    engine_up();
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+
+    /* Z16 (depth field 1): the clear value is a bare depth16, and 0xFFFF its
+     * far plane. Read as Z24S8 it would clear to 255/16777215. */
+    m(M_SURFACE_FORMAT, 8u | (1u << 5));
+    m(M_ZSTENCIL_CLEAR, 0xFFFFu);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    CHECK(stub.n_clear_ds == 1 && stub.last_clear_depth == 1.0f,
+          "a Z16 zeta cleared with 0xFFFF clears to 1.0 (%g)", stub.last_clear_depth);
+
+    /* Z24S8 (depth field 2): depth24 << 8 | stencil8. */
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZSTENCIL_CLEAR, 0xFFFFFF00u);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    CHECK(stub.last_clear_depth == 1.0f,
+          "a Z24S8 zeta cleared with 0xFFFFFF00 clears to 1.0 (%g)", stub.last_clear_depth);
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1053,6 +1084,7 @@ int main(void)
     test_queued_flip_buffer();
     test_transfer_coherence();
     test_inline_array();
+    test_depth_clear_value();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
