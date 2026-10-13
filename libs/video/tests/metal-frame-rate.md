@@ -26,5 +26,19 @@ session so shutdown/reinitialization cannot contaminate a new run.
 Run `python3 tools/test_metal_frame_rate.py` on macOS with a display. It checks
 deterministic rates/stalls/duplicate timestamps/bounded p95, worker-thread
 headless shutdown without main-queue pumping, a native title
-timer without a rendering thread, actual drawable callbacks versus GPU-only
-completion, reset, and disabled mode.
+timer without a rendering thread, and disabled mode. A deterministic drawable
+substitute invokes the production registration/callback with positive, zero,
+duplicate, stale, and non-finite timestamps, and checks late callbacks after
+session replacement.
+
+The real drawable scenario requires six GPU clears to complete without error,
+reads back their expected pixel, and compares production display counters and
+the last timestamp to an independent observer on the same Metal drawables.
+An active display with an identified I/O Kit monitor vendor/model must produce
+a positive presentation. This identity check does not prove physical scanout.
+Other displays must satisfy the same GPU and timestamp-parity assertions; zero
+observed timestamps require exactly zero display frames and explicitly report
+that actual presentation was unobserved. The hosted macOS runner's
+paravirtualized GPU was observed to deliver either no callbacks or callbacks
+with all-zero timestamps despite an active display and visible fixture window.
+Neither GPU completion nor that window visibility is counted as a display frame.
