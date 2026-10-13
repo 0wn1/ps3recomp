@@ -800,7 +800,6 @@ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     printf("[cellSpurs] DestroyTaskset()\n");
-    taskset->initialized = 0;
     return CELL_OK;
 }
 
@@ -811,7 +810,6 @@ s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     printf("[cellSpurs] ShutdownTaskset()\n");
-    taskset->shutdownRequested = 1;
     return CELL_OK;
 }
 
@@ -927,7 +925,6 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
              * signals with has to be the same number. */
             if (taskId) vm_write32((u32)(uintptr_t)taskId, i);
             (void)taskId_h;
-            taskset->taskCount++;
 
             /* Register the task in the REAL BE taskset: writes task_info[slot]
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
