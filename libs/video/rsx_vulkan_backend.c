@@ -2404,6 +2404,47 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     vk_destroy_buffer(&st);
     return rc ? 0 : snap;
 }
+/* The depth aspect of a D32_SFLOAT target copies out as 32-bit floats, which
+ * is what the engine asks for; other depth formats report failure. */
+static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+                                 float* out, u32 out_pitch)
+{
+    (void)user;
+    vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
+    if (!z || !out || !w || !h || x + w > z->w || y + h > z->h ||
+        out_pitch < w * 4u || s_vk.depth_format != VK_FORMAT_D32_SFLOAT)
+        return -1;
+    vk_buffer st = {0};
+    if (vk_create_host_buffer(&st, (VkDeviceSize)w * h * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+        vk_destroy_buffer(&st); return -1;
+    }
+    int rc = vk_begin();
+    if (!rc) {
+        vk_barrier_image(z->im.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        VkBufferImageCopy region = {
+            .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+            .imageOffset = { (int32_t)x, (int32_t)y, 0 }, .imageExtent = { w, h, 1 },
+        };
+        pvkCmdCopyImageToBuffer(s_vk.cmd, z->im.img, VK_IMAGE_LAYOUT_GENERAL, st.buf, 1, &region);
+        VkBufferMemoryBarrier hb = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = st.buf, .offset = 0, .size = VK_WHOLE_SIZE,
+        };
+        pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                              0, 0, NULL, 1, &hb, 0, NULL);
+        rc = vk_submit_and_wait();
+        if (!rc) {
+            vk_invalidate(&st);
+            for (u32 row = 0; row < h; row++)
+                memcpy((u8*)out + (size_t)row * out_pitch,
+                       (const u8*)st.ptr + (size_t)row * w * 4u, (size_t)w * 4u);
+        }
+    }
+    vk_destroy_buffer(&st);
+    return rc ? -1 : 0;
+}
 /* ---- E2: pipelines and draws ---------------------------------------------
  * A pipeline handle carries the two translated modules and the render state
  * the engine keyed it on. Topology is not part of that key (Metal sets it on
@@ -3123,6 +3164,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
     .present              = vk_eng_present,
     .readback             = vk_eng_readback,
+    .depth_readback       = vk_eng_depth_readback,
     .color_target_write   = vk_eng_color_target_write,
 };
 

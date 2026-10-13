@@ -90,6 +90,7 @@ typedef struct {
     u32 last_created_texture, last_created_color;
     u32 last_released;
     float last_clear_depth;
+    int n_depth_readback;
 } StubState;
 
 static StubState stub;
@@ -249,6 +250,18 @@ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
             memcpy((u8*)out + (size_t)r * pitch + c * 4u, g_stub_pixel, 4);
 }
 
+/* Every depth target reads back as 0.5, which Z24S8 stores as 0x800000. */
+static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
+                               float* out, u32 pitch)
+{
+    (void)u; (void)d; (void)x; (void)y;
+    stub.n_depth_readback++;
+    for (u32 r = 0; r < h; r++)
+        for (u32 c = 0; c < w; c++)
+            *(float*)((u8*)out + (size_t)r * pitch + c * 4u) = 0.5f;
+    return 0;
+}
+
 /* The last rectangle pushed into a colour target, and its first pixel. */
 static struct { int n; u32 surface, x, y, w, h; u8 first[4]; } g_written;
 
@@ -293,6 +306,7 @@ static const rsx_draw_backend g_stub_backend = {
     .clear_depth_stencil = stub_clear_ds,
     .present = stub_present,
     .readback = stub_readback,
+    .depth_readback = stub_depth_readback,
 };
 
 /* ---- driving the engine -------------------------------------------------- */
@@ -311,6 +325,10 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_COLOR_TARGET        0x0220
 #define M_CONTEXT_DMA_ZETA    0x0198
 #define M_ZSTENCIL_CLEAR      0x1D8C
+#define M_ZETA_PITCH          0x022C
+#define M_COLOR_MASK          0x0324
+#define M_DEPTH_WRITE         0x0A70
+#define M_DEPTH_TEST          0x0A74
 #define M_COLOR_C_OFFSET      0x0288
 #define M_COLOR_D_OFFSET      0x028C
 #define M_SCISSOR_H           0x08C0
@@ -1059,6 +1077,77 @@ static void test_depth_clear_value(void)
     engine_down();
 }
 
+/* ---- 10. a zeta or a target read in a texture format of its own --------- */
+
+static void test_depth_read_as_color(void)
+{
+    printf("-- zeta read as A8R8G8B8\n");
+    engine_up();
+    /* A depth-only pass, with colour A named at the zeta's own address and
+     * nothing written to it: how a title points an unused colour target. */
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, ZETA_OFFSET);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    draw_triangle();
+    CHECK(stub.n_draw == 1, "the depth-only pass drew");
+
+    /* The next pass reads that address as A8R8G8B8, the zeta still bound:
+     * the bytes are the zeta's, stored to guest memory from the depth
+     * target, not the untouched colour target's. */
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    const int uploads = stub.n_texture_create;
+    draw_triangle();
+    const u8* z = vm_base + GUEST_LOCAL_EA + ZETA_OFFSET;
+    CHECK(stub.n_depth_readback == 1, "the depth target was read back (%d)",
+          stub.n_depth_readback);
+    CHECK(z[0] == 0x80 && z[1] == 0x00 && z[2] == 0x00 && z[3] == 0x00,
+          "guest memory holds depth 0.5 laid out as Z24S8 (%02X %02X %02X %02X)",
+          z[0], z[1], z[2], z[3]);
+    CHECK(stub.n_texture_create == uploads + 1 &&
+          stub.bound_tex[0] == stub.last_created_texture,
+          "the unit samples a texture decoded from those bytes");
+
+    /* No depth write since: nothing is read back again. */
+    draw_triangle();
+    CHECK(stub.n_depth_readback == 1,
+          "an unchanged depth target is not read back again (%d)", stub.n_depth_readback);
+    engine_down();
+}
+
+static void test_color_read_as_float(void)
+{
+    printf("-- colour target read as X32_FLOAT\n");
+    engine_up();
+    m(M_COLOR_A_PITCH, 256u * 4u);
+    m(M_CLEAR_BUFFERS, 0xF0u);                   /* a colour write at 0x40000 */
+    const u32 surface = stub.last_created_color;
+
+    /* Read back as X32_FLOAT, the target's 32-bit pixels are floats a pass
+     * packed into it: they come from guest memory, where the target's pixels
+     * are stored as A,R,G,B first. */
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, 0x40000u);
+    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((0x9Cu | 0x20u) << 8) | (1u << 16));
+    const int uploads = stub.n_texture_create;
+    draw_triangle();
+    const u8* p = vm_base + GUEST_LOCAL_EA + 0x40000u;
+    CHECK(p[0] == 0x44 && p[1] == 0x11 && p[2] == 0x22 && p[3] == 0x33,
+          "the target was stored to guest memory as A,R,G,B (%02X %02X %02X %02X)",
+          p[0], p[1], p[2], p[3]);
+    CHECK(stub.n_texture_create == uploads + 1 && stub.bound_tex[0] != surface,
+          "the unit decodes those bytes instead of sampling the RGBA8 image");
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1085,6 +1174,8 @@ int main(void)
     test_transfer_coherence();
     test_inline_array();
     test_depth_clear_value();
+    test_depth_read_as_color();
+    test_color_read_as_float();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
