@@ -1825,6 +1825,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (subch == 7 && m == 0x0B00u) {
                     extern void rsx_raise_user_cmd(u32 arg);
                     rsx_raise_user_cmd(vm_read32(dea));
+                    /* A title that registered its handler with the HLE
+                     * cellGcmSetUserHandler has no lv2 interrupt thread
+                     * reading that event; its handler runs from the pump.
+                     * The `continue` skips the 0xEB00 case below, so queue
+                     * it for the pump here. */
+                    if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
                     continue;
                 }
                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
