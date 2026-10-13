@@ -94,6 +94,10 @@ else()
     # an existing module changes, and reconfigure when a new module is added.
     file(GLOB_RECURSE HLE_NID_SOURCES CONFIGURE_DEPENDS
         "${PS3RECOMP_DIR}/libs/*.c")
+    # A removed input cannot make the output older than a remaining dependency.
+    # Track the list itself so deletions also remove stale handler references.
+    set(HLE_NID_SOURCE_LIST "${CMAKE_CURRENT_BINARY_DIR}/hle_nid_sources.txt")
+    file(GENERATE OUTPUT "${HLE_NID_SOURCE_LIST}" CONTENT "${HLE_NID_SOURCES}\n")
     add_custom_command(
         OUTPUT "${HLE_NID_TABLE}"
         COMMAND "${Python3_EXECUTABLE}"
@@ -101,7 +105,7 @@ else()
                 --out "${HLE_NID_TABLE}" --all
         DEPENDS "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
                 "${PS3RECOMP_DIR}/tools/nid_database.py"
-                ${HLE_NID_SOURCES}
+                ${HLE_NID_SOURCES} "${HLE_NID_SOURCE_LIST}"
         COMMENT "Generating the HLE NID -> handler table")
     message(STATUS "HLE NID table:   generated (every module)")
 endif()

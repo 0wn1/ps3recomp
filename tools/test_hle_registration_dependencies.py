@@ -53,9 +53,13 @@ with tempfile.TemporaryDirectory(prefix='hle-registration-deps-') as tmp:
     added=sdk/'libs/system/cellNewFixture.c'
     update(added,'int cellNewFixtureHandler(void) { return 0; }\n')
     assert 'cellNewFixtureHandler' in build_table(),'New module did not regenerate registration'
+    # Make/file systems can compare timestamps at one-second resolution.
+    while int(time.time()) <= int(output.stat().st_mtime): time.sleep(.02)
+    added.unlink()
+    assert 'cellNewFixtureHandler' not in build_table(),'Deleted module retained stale registration'
     database=sdk/'tools/nid_database.py'
     update(database,database.read_text()+'\n_original_compute_nid = compute_nid\n'
         'def compute_nid(name):\n    return _original_compute_nid(name) ^ 1\n')
     expected=compute_nid('cellFixtureFirst')^1
     assert f'0x{expected:08X}u, "cellFixtureFirst"' in build_table(),'NID database edit did not regenerate registration'
-    print('PASS: real template incremental registration handles existing/new modules and NID database edits')
+    print('PASS: real template incremental registration handles existing/new/deleted modules and NID database edits')
