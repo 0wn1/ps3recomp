@@ -202,10 +202,10 @@ GCC, Clang and clang-cl — so in practice this is a hard gate: any new error
 fails the build.
 
 Compiling is not the same as running. The scaffold is not linked or executed by
-anything in this repository (that needs a lifted game), and `boot_main.cpp`
-still starts its vblank ticker, hang watchdog and profiler inside
-`#ifdef _WIN32` with no `#else`, so a POSIX host has no frame clock. Those are
-the remaining gaps between "builds" and "runs a title".
+anything in this repository (that needs a lifted game). `boot_main.cpp` now
+starts its vblank ticker on POSIX too, through the pthread `CreateThread` shim
+in `win32_compat.h`; the hang watchdog is still Windows-only. What remains
+between "builds" and "runs a title" is booting one.
 
 It compiles the four scaffold translation units. `boot_main.cpp` is excluded:
 it also pulls in the per-game SPU recomp header and the generated function
@@ -237,7 +237,7 @@ which is opt-in on Linux (`-DPS3RECOMP_RSX_VULKAN=ON`) while it grows:
 | Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. |
 | macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
 | Linux | null / headless software | `libs/video/` null path | The default. The guest command stream is executed and validated, but nothing is presented to a window. |
-| Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Early: clears, the fixed-function fallback draw path (the null backend's contract), depth, texture unit 0 and an optional window. No guest programs yet. See below. |
+| Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Opt-in. With guest programs on (`PS3RECOMP_VK_GUEST_PROGRAMS=1`) it runs the title's shaders on the shared register-file draw engine, as Metal does; without them, the null backend's fixed-function contract. See below. |
 
 So on Windows a plain `cmake --build` already gives you the working renderer --
 there is nothing to switch on. If you are bringing up a port and want frames on
@@ -403,11 +403,12 @@ Clang, Debug and Release on every push). That workflow builds the runtime
 library, runs all eight lifter suites plus the SPU helper tests, and drives
 `ps3recomp_host` end to end against the headless software backend.
 
-> **No hardware render backend.** Metal is Apple-only and D3D12 is
-> Windows-only. Linux falls back to the null backend's headless software path
-> (`libs/video/rsx_null_backend.c`), which rasterises into host memory — a
-> correctness probe, not a renderer. Running a recompiled title additionally
-> needs the PPU boot scaffold ported off Win32 — the same gap macOS has.
+> **Renderer:** the opt-in Vulkan backend (see [below](#the-vulkan-backend-linux-opt-in)).
+> The default is the null backend's headless software path
+> (`libs/video/rsx_null_backend.c`), which rasterises into host memory: a
+> correctness probe for CI, not a renderer. Running a recompiled title from
+> this tree additionally needs the PPU boot scaffold to boot one on POSIX, the
+> same gap macOS has.
 
 **Compiler Flags (GCC/Clang):**
 - `-Wall -Wextra` — Enable warnings
@@ -435,11 +436,12 @@ cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
 ```
 
-**It cannot run a recompiled game yet.** The PPU boot scaffold —
-`runtime/ppu/ppu_loader.cpp`, `runtime/ppu/tests/boot_main.cpp` and the HLE
-dispatch — is still Win32-only (thread creation, `VirtualAlloc`, SEH, stack
-walking) and is compiled per-game rather than into the library, so it is not
-covered by the macOS build. Porting that scaffold is the remaining work.
+**No title has run from this tree on macOS yet.** The PPU boot scaffold
+(`runtime/ppu/ppu_loader.cpp`, `runtime/ppu/tests/boot_main.cpp` and the HLE
+dispatch) compiles on POSIX with zero errors under a CI ratchet, but it is
+compiled per game rather than into the library, and booting a title with it on
+macOS is the remaining work. Downstream, inFamous runs on macOS/arm64 with
+patches that are on their way upstream (#213).
 
 Thanks to [@slushiimusic](https://github.com/slushiimusic), who reported the
 original docs-vs-reality gap in

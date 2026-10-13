@@ -425,6 +425,9 @@ Gave the project its first CI and its second platform, in **v0.9.0**.
   register-file draw engine. Every `ps3recomp_host` scene passes on it under
   the Khronos validation layer — on lavapipe in CI, and on a Nintendo Switch's
   Tegra X1.
+- **Vulkan stencil** (#231): the depth format now carries stencil
+  (`D32_SFLOAT_S8_UINT` first), so the engine's stencil state takes effect.
+  Verified with a two-pass stencil scene on lavapipe and on the Switch.
 
 ### André Brum — [@andrebrumdev](https://github.com/andrebrumdev)
 Lifter and RSX correctness found bringing up *God of War II HD* and *Ben 10
@@ -443,6 +446,49 @@ Omniverse* — every fix arrives with a test that fails on master.
   War's skinning palette: 46% of samples had a non-rigid bone, now 0.1%.
 - **`-msse4.1` probed instead of assumed** (#206) — Apple clang 21 and aarch64
   GCC reject it outright.
+
+### Kurtisone — [@Kurtisone](https://github.com/Kurtisone)
+Draw-engine, Vulkan and SPURS fixes found bringing up *Twisted Metal* on
+Linux/Vulkan. Each one comes with a measurement or a test, and most of v0.14.0
+came from this work.
+- **Surfaces read through guest memory in another format** (#236): a depth
+  buffer read as colour, a Z16 shadow map, a float packed into RGBA8. Write
+  serials let the engine pick the newer of the two surfaces at one address.
+  Plus `RSX_ENGINE_PASS_DUMP` to find which pass of a frame first goes wrong
+  (#237).
+- NV3089 surface coherence (#224), display buffers and flips handed to the
+  engine (#223), texel-addressed coordinates (#221), B8 (#220), Z16 far-plane
+  clears (#235).
+- Vulkan: RGBA16F targets (#222), cube maps (#229), images sized by the device
+  limit (#227), cached readbacks (#245), and dumping every nth frame (#219).
+- **An SPU-signalled SPURS task wakes at once** (#242). It used to wait out a
+  1 s timeout, which made one frame of post-FX take 4.1 s.
+- SPURS taskset fields kept out of guest memory (#240), barrier and
+  `GetTasksetInfo` (#241), IO-table-first offsets (#238), a POSIX
+  `ps3_ms_now` (#244), real POSIX lwmutex/lwcond (#225), safe stack scans
+  (#217), SPU disassembler `orbi`/`xorhi`/`xorbi` (#239), `--chunk-lines`
+  (#216), `PS3_NULL_READ_STACK` (#226) and `g_ppu_main_ctx` (#228).
+
+### undecuple — [@undecuple](https://github.com/undecuple)
+- **Real video decode in cellVdec** (#215): H.264 and MPEG-2 through FFmpeg,
+  loaded at run time and never linked. Pictures come out in display order, with
+  pic items, PICOUT and EndSeq flush, in YUV420/UYVY/ARGB/RGBA. The loader is
+  reusable for cellAdec and cellDmux.
+- A detailed set of about 60 general fixes from a *Killzone 3* port (#214),
+  each with a focused test against v0.13.0.
+
+### robbe1912 — [@robbe1912](https://github.com/robbe1912)
+- **D3D12 fragment-program source capacity** (#230): a 256-instruction program
+  produced 57 KB of HLSL against a 32 KB buffer and was dropped as a decompile
+  failure. Comes with a synthetic regression fixture.
+
+### tekulvw — [@tekulvw](https://github.com/tekulvw)
+- **SPU interpreter `ILH`** (#234): it had shared `IL`'s case and repeated a
+  32-bit immediate instead of a halfword. The test runs the real interpreter.
+
+### deucebucket — [@deucebucket](https://github.com/deucebucket)
+- Reported that `fw_spu/` was tracking decrypted firmware PRXs and lifted C,
+  against our own firmware policy (#210). It came out in #212.
 
 ### bojogon7 — [@bojogon7](https://github.com/bojogon7)
 - Added [AnyPS5](https://github.com/boykopovar/AnyPS5) to the README's list of
