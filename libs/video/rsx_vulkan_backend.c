@@ -192,6 +192,7 @@ typedef struct vk_state {
      * additionally blits the frame into the window's swapchain. */
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
+    u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
     SDL_Window*      window;
     const char*      inst_exts[16];
@@ -363,6 +364,9 @@ static int vk_pick_device(void)
     pvkGetPhysicalDeviceMemoryProperties(s_vk.phys, &s_vk.memprops);
     VkPhysicalDeviceProperties p;
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+    /* Vulkan guarantees 4096; the engine's targets and textures may use what
+     * the device really has (a title's 4608-wide target on RADV). */
+    s_vk.max_dim = p.limits.maxImageDimension2D >= 4096u ? p.limits.maxImageDimension2D : 4096u;
     VK_LOG("using device %d: %s\n", best, p.deviceName);
     return 0;
 }
@@ -1935,6 +1939,10 @@ static int vk_eng_rt_index(VkFormat f)
     }
 }
 
+/* The largest image side the engine creates: the device's own limit once a
+ * device is picked, the 4096 Vulkan guarantees before. */
+static u32 vk_max_dim(void) { return s_vk.max_dim ? s_vk.max_dim : 4096u; }
+
 static u32 vk_eng_alloc(void)
 {
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
@@ -2071,7 +2079,7 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
     u32 bpp;
     const VkFormat vf = vk_eng_format(fmt, &bpp);
     /* Only formats the E2 passes are built for (vk_eng_rt_index). */
-    if (vk_eng_rt_index(vf) < 0 || !w || !h || w > 4096u || h > 4096u) {
+    if (vk_eng_rt_index(vf) < 0 || !w || !h || w > vk_max_dim() || h > vk_max_dim()) {
         VK_LOG("engine: colour target format %d %ux%u not supported yet\n", (int)fmt, w, h);
         return 0;
     }
@@ -2101,7 +2109,7 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
 static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
 {
     (void)user;
-    if (!w || !h || w > 4096u || h > 4096u) return 0;
+    if (!w || !h || w > vk_max_dim() || h > vk_max_dim()) return 0;
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
@@ -2247,7 +2255,8 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     u32 bpp;
     const VkFormat vf = vk_eng_format(fmt, &bpp);
     const int bc = (fmt == RSX_BE_FMT_BC1 || fmt == RSX_BE_FMT_BC2 || fmt == RSX_BE_FMT_BC3);
-    if (vf == VK_FORMAT_UNDEFINED || !w || !h || w > 4096u || h > 4096u || (bc && !s_vk.bc_ok))
+    if (vf == VK_FORMAT_UNDEFINED || !w || !h || w > vk_max_dim() || h > vk_max_dim() ||
+        (bc && !s_vk.bc_ok))
         return 0;
     if (faces == 6) {
         static int warned_cube;
