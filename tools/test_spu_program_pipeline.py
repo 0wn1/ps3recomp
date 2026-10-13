@@ -269,7 +269,9 @@ class Pipeline(unittest.TestCase):
                      f'int id{i} = 0; spu_lifted_entry_fn f{i} = spu_workload_find_img(fp{i}, &id{i});',
                      f'assert(f{i} && id{i} == {program["image_id"]});',
                      f'assert(spu_lookup(0x100, id{i}) == f{i});',
-                     f'spu_context c{i} = {{0}}; f{i}(&c{i});',
+                     # Each context contains a 256 KB local store. Keep the
+                     # four fixtures off Windows' default 1 MB main stack.
+                     f'static spu_context c{i}; f{i}(&c{i});',
                      f'assert(c{i}.gpr[3]._u32[0] == {immediate});']
         body += ['assert(f0 != f1 && id0 != id1);', 'assert(spu_workload_count() == 8);']
         (self.root / 'proof.c').write_text(
