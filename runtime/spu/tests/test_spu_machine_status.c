@@ -73,3 +73,5 @@ void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) 
     (void)c; (void)a; (void)b; (void)d; abort();
 }
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
+/* LV2 worker publication is outside the machine-status paths exercised here. */
+void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
