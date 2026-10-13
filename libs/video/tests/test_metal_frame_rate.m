@@ -30,6 +30,10 @@ int main(int argc, char **argv) {
 #endif
    } else if (!strcmp(argv[1], "drawable")) {
 #ifdef PS3RECOMP_METAL_FRAME_RATE
+    /* Inspect the callback counters directly in this scenario. Sampling would
+     * reset them on the one-second timer while a slower compositor catches up;
+     * the separate window scenario verifies that timer. */
+    dispatch_source_cancel(s_fps_timer);s_fps_timer=nil;
     s_queue=[s_dev newCommandQueue];assert(s_queue);
     [NSApp finishLaunching];
     [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
@@ -51,7 +55,19 @@ int main(int argc, char **argv) {
     [cb presentDrawable:drawable];[cb commit];[cb waitUntilCompleted];
     [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
     }
+    /* Completion of command buffers precedes compositor presentation. Wait
+     * for its condition with a deadline rather than assuming 50ms is enough. */
+    const double deadline=CACurrentMediaTime()+5.0;
+    for (;;) {
+     pthread_mutex_lock(&s_fps_session->lock);
+     const unsigned long long shown=s_fps_session->stats.displayed;
+     pthread_mutex_unlock(&s_fps_session->lock);
+     if (shown || CACurrentMediaTime()>=deadline) break;
+     [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    }
     pthread_mutex_lock(&s_fps_session->lock);
+    fprintf(stderr,"[FPS fixture] drawable displayed=%llu guest=%llu\n",
+        s_fps_session->stats.displayed,s_fps_session->stats.guest);
     assert(s_fps_session->stats.displayed>0 && s_fps_session->stats.displayed<=6);
     assert(s_fps_session->stats.guest==6);
     pthread_mutex_unlock(&s_fps_session->lock);
