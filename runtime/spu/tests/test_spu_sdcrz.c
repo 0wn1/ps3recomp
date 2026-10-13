@@ -9,7 +9,7 @@ uint8_t* vm_base = guest;
 uint32_t ppu_vm_size;
 #include "../spu_channels.c"
 #include "../spu_interp.h"
-static spu_context writer, peer;
+static spu_context writer, peer, first_peer;
 static uint8_t expected_ls[SPU_LS_SIZE];
 static void be32(uint8_t* p, uint32_t v) {p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v;}
 static void prepare(uint32_t ea, uint32_t n) {
@@ -28,13 +28,6 @@ static void cleared(uint32_t ea,uint32_t n) {
     spu_wrch(&writer,MFC_WrTagUpdate,spu_splat_u32(2));
     assert(spu_rdch(&writer,MFC_RdTagStat)._u32[0]==(1u<<11));
 }
-static unsigned wake_count;
-static void notified(void* opaque) {
-    uint32_t ea=*(const uint32_t*)opaque;
-    for(unsigned i=0;i<128;i++)assert(guest[ea+i]==0);
-    assert(!(mfc_for(&writer)->tag_completed&(1u<<11)));
-    wake_count++;
-}
 static void reserve(uint32_t ea) {
     peer.mfc_eal=ea;peer.mfc_eah=0;peer.mfc_lsa=0x2000;
     assert(spu_mfc_atomic(&peer,MFC_GETLLAR_CMD));assert(peer.resv_valid);
@@ -44,6 +37,7 @@ int main(void) {
     const uint32_t ea=0x20000;
     spu_context_init(&writer,0);writer.image_id=-1;
     spu_context_init(&peer,0);peer.image_id=-1;
+    spu_context_init(&first_peer,0);first_peer.image_id=-1;
     prepare(ea,2048);
     spu_wrch(&writer,MFC_EAL,spu_splat_u32(ea));
     spu_wrch(&writer,MFC_Size,spu_splat_u32(2048));
@@ -64,19 +58,17 @@ int main(void) {
     be32(writer.ls+0x1010,0);memcpy(expected_ls,writer.ls,SPU_LS_SIZE);
     spu_interp_run(&writer,0x1000);
     cleared(ea,16384);
-    /* Writes to already-zero bytes must invalidate peer and PPU epoch tokens. */
+    /* Zero-to-zero writes must notify peers on every touched line. Master
+     * tracks SPU reservations; it does not expose PPU reservation epochs. */
     prepare(ea,2048);memset(guest+ea,0,2048);reserve(ea+1920);
-    spu_lockline_lock();uint64_t epoch=spu_coh_line_epoch(ea+128);spu_lockline_unlock();
-    uint32_t first=ea,last=ea+1920;spu_coh_watch w1,w2;
-    spu_lockline_lock();
-    spu_coh_watch_add(&w1,first,notified,&first);
-    spu_coh_watch_add(&w2,last,notified,&last);
-    spu_lockline_unlock();
+    first_peer.mfc_eal=ea;first_peer.mfc_eah=0;first_peer.mfc_lsa=0x2000;
+    assert(spu_mfc_atomic(&first_peer,MFC_GETLLAR_CMD));
+    assert(first_peer.resv_valid);first_peer.event_status=0;
+    unsigned long notifications=g_spu_lr_raise;
     assert(mfc_submit(mfc_for(&writer),&writer,0x89)==0);
-    assert(wake_count==2);
-    spu_lockline_lock();spu_coh_watch_remove(&w1);spu_coh_watch_remove(&w2);spu_lockline_unlock();
+    assert(g_spu_lr_raise==notifications+2);
+    assert(!first_peer.resv_valid && (first_peer.event_status&SPU_EVENT_LR));
     assert(!peer.resv_valid && (peer.event_status&SPU_EVENT_LR));
-    spu_lockline_lock();assert(spu_coh_line_epoch(ea+128)!=epoch);spu_lockline_unlock();
     be32(peer.ls+0x2000,0xABCDEF01);assert(spu_mfc_atomic(&peer,MFC_PUTLLC_CMD));
     assert(peer.atomic_stat==1 && guest[ea+1920]==0);
     reserve(ea+2048);assert(mfc_submit(mfc_for(&writer),&writer,0x89)==0);
@@ -107,8 +99,9 @@ int main(void) {
     writer.list_stall_mask=(1u<<12);
     assert(mfc_submit(mfc_for(&writer),&writer,0x89)==0);cleared(ea,2048);
     writer.list_stall_mask=0;
-    spu_coh_unregister(&peer);spu_mfc_release(&peer);spu_mfc_release(&writer);
-    puts("PASS: SDCRZ real channels/encoded interpreter, full zero range, no LS operand, peer and PPU reservation invalidation, unaffected neighbor");
+    spu_coh_unregister(&first_peer);spu_coh_unregister(&peer);
+    spu_mfc_release(&first_peer);spu_mfc_release(&peer);spu_mfc_release(&writer);
+    puts("PASS: SDCRZ real channels/encoded interpreter, full zero range, no LS operand, peer reservation invalidation and zero-to-zero notifications, unaffected neighbor");
     return 0;
 }
 
