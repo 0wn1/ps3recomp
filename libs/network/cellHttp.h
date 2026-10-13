@@ -62,13 +62,17 @@ extern "C" {
 typedef u32 CellHttpClientId;
 typedef u32 CellHttpTransId;
 
+/* Guest layout (4-byte EAs): scheme +0, hostname +4, username +8,
+ * password +12, path +16, port +20, reserved +24. cellHttp.c reads it by
+ * guest offset; this host declaration only names the fields in order. */
 typedef struct CellHttpUri {
     const char* scheme;
     const char* hostname;
-    const char* path;
     const char* username;
     const char* password;
+    const char* path;
     u32         port;
+    u8          reserved[4];
 } CellHttpUri;
 
 /* Max number of concurrent clients and transactions */
