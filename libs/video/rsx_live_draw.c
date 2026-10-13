@@ -3222,6 +3222,56 @@ static D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle(u32 slot)
     return h;
 }
 
+/* The R32F snapshot is sized from the clip of the first pass that bound the
+ * zeta. A title that first binds its full-screen zeta with a smaller clip
+ * (a 512x512 pass into a 1280x720 depth buffer) kept a 512x512 snapshot, and
+ * every later full-size read of that depth saw 0 outside the top-left
+ * corner. Grow the snapshot to the largest clip bound since, within the
+ * depth resource. */
+static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
+{
+    zdepth_t* z = &g.zdepths[i];
+    if (!z->snapshot) return;
+    u32 nw = rt_w < z->w ? rt_w : z->w, nh = rt_h < z->h ? rt_h : z->h;
+    if (nw < z->snapshot_w) nw = z->snapshot_w;
+    if (nh < z->snapshot_h) nh = z->snapshot_h;
+    if (nw == z->snapshot_w && nh == z->snapshot_h) return;
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {0};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = nw;
+    rd.Height = nh;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R32_FLOAT;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* snap = NULL;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
+            g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL,
+            &IID_ID3D12Resource, (void**)&snap))) {
+        fprintf(stderr, "[zetatrack] snapshot grow failed %u:0x%X %ux%u\n",
+                z->location, z->offset, nw, nh);
+        return;
+    }
+    fprintf(stderr, "[zetatrack] snapshot %u:0x%X grown %ux%u -> %ux%u\n",
+            z->location, z->offset, z->snapshot_w, z->snapshot_h, nw, nh);
+    /* The open command list may still read the old one. */
+    retire_texture(z->snapshot);
+    z->snapshot = snap;
+    z->snapshot_w = nw;
+    z->snapshot_h = nh;
+    z->snapshot_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    srv_write_zdepth(SRV_ZDEPTH_BASE + i, z->snapshot);
+    uav_write_zdepth(UAV_ZDEPTH_BASE + i, z->snapshot);
+    /* The depth resource still holds what the old snapshot held (a clear
+     * would have invalidated both): resolve it again at the next read. */
+    if (z->snapshot_valid) z->had_write = 1;
+    z->snapshot_valid = 0;
+}
+
 /* Returns DSV slot 1+i. Slot 0 is the legacy shared depth fallback. */
 static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
 {
@@ -3237,7 +3287,10 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     for (u32 i = 0; i < g.n_zdepths; i++) {
         zdepth_t* z = &g.zdepths[i];
         if (z->location == location && z->offset == offset) {
-            if (z->w >= want_w && z->h >= want_h) return 1 + i;
+            if (z->w >= want_w && z->h >= want_h) {
+                zdepth_grow_snapshot(i, rt_w, rt_h);
+                return 1 + i;
+            }
             slot = i;
             break;
         }
@@ -6856,6 +6909,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     u32 texture_mask = 0;
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) slots[u] = SRV_WHITE;
     for (u32 u = 0; u < SMP_TABLE_SIZE; u++) smp_slots[u] = SMP_DEFAULT;
+    /* A draw that samples its own zeta while not writing depth (deferred
+     * lighting reading the scene depth it also depth-tests against, soft
+     * particles) reads the snapshot: the zeta does not change during such a
+     * draw, so that is what RSX returns. Before, it fell back to guest VRAM,
+     * which the host-side depth never reaches (depth 0). A draw that writes
+     * the zeta it reads keeps that fallback. */
+    const int self_zeta_read = current_zslot &&
+        !((rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) &&
+          (rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1u));
     /* LD_UNITS=1: every enabled texture unit of every draw that samples PS1
      * VRAM, once per distinct combination.
      *
@@ -6927,7 +6989,21 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
          * descriptor actually declares; failing that, the most recently drawn
          * one, which is the only other defensible answer. */
         int sampled = -1;
-        { u32 best_gen = 0;
+        /* An address can be both a colour target and a zeta (a shadow map
+         * pass that binds the same memory as both, colour writes masked).
+         * A depth-format read of an address with a written host zeta is a
+         * depth read: try the zeta first. Before, the colour surface at the
+         * same address was taken (zeros). */
+        int zeta_pref = 0;
+        if ((t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) == TEX_FMT_DEPTH24_D8)
+            for (u32 i = 0; i < g.n_zdepths; i++)
+                if (g.zdepths[i].location == t.location &&
+                    g.zdepths[i].offset == t.offset &&
+                    (g.zdepths[i].had_write || g.zdepths[i].snapshot_valid)) {
+                    zeta_pref = 1;
+                    break;
+                }
+        if (!zeta_pref) { u32 best_gen = 0;
           for (u32 i = 0; i < g.n_surfaces; i++) {
               const surface_t* sf_i = &g.surfaces[i];
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
@@ -7026,7 +7102,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                 fprintf(stderr, "\n");
             }
         }
-        if (sampled < 0 && g.surfaces[target].location == t.location &&
+        if (sampled < 0 && !zeta_pref && g.surfaces[target].location == t.location &&
             g.surfaces[target].offset == t.offset) {
             /* Reads its own render target: sample a copy of it. */
             slots[u] = surface_feedback_srv(target);
@@ -7067,7 +7143,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                 for (u32 i = 0; i < g.n_zdepths; i++)
                     if (g.zdepths[i].location == t.location &&
                         g.zdepths[i].offset == t.offset &&
-                        current_zslot != 1 + i) {
+                        (current_zslot != 1 + i || self_zeta_read)) {
                         if (zdepth_snapshot(1 + i))
                             sampled_depth = (int)i;
                         else {
