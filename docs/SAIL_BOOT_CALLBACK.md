@@ -8,22 +8,17 @@ notifications continue to receive zero for `arg1`, and the existing sequence
 remains transition state, call completion, settled state. Other player calls
 continue to use zero completion parameters.
 
-The motivating retail MAG v1.0 image has SHA256
-`0089f0d6d17e48533ce7ff8d943dddd03487b925e7b04a1a055bfb907568694c`.
-Original instructions independently rechecked on 2026-10-11 establish:
-
-- `003C7AF4` forms a stack future at `r1+0xB8`; `003C7B14` supplies it in r4
-  before Boot at `003C7B18` (import stub `0152A3F4`).
-- Callback `003CDB20` receives the packed event in r4, result in r5 and call
-  parameter in r6. Its major-2/minor-1 path at `003CDC68` moves low32(r6) to
-  r3, sign-extends r5 to r4, and calls FutureSet at `003CDC70`
-  (stub `0152A3D4`). Zeroing the parameter loses the actual completion target.
+The motivating guest caller passes a future as its boot token. The guest's
+completion callback uses that same token to select the future receiving the
+result. Delivering zero instead loses the caller's completion target. This
+parameter relationship requires preserving the supplied token; it does not
+require recognizing a title, a guest address, or a particular image.
 
 [RPCS3's cellSail implementation](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellSail.cpp)
 corroborates the typed Boot parameter and callback/event shape. Its current
 Boot implementation also sends zero for this parameter; it is incomplete and
-is **not** evidence of the corrected echo behavior. The original retail
-caller and callback establish the required parameter relationship here.
+is **not** evidence of the corrected echo behavior. The observed guest caller
+and callback establish the required parameter relationship here.
 
 The runtime still delivers its existing synchronous completion. This change
 neither completes a future directly nor implements decoding, playback, new
