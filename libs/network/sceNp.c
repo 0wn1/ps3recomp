@@ -68,6 +68,9 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
     return CELL_OK;
 }
 
+/* Whether sceNpInit has run; sceNpBasic follows it (see sceNpBasic.c). */
+int np_is_initialized(void) { return s_np_initialized; }
+
 s32 sceNpTerm(void)
 {
     printf("[sceNp] Term()\n");
