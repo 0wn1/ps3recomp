@@ -1280,6 +1280,18 @@ static void test_immediate_packed_zero_and_inline(void)
     immediate_vertex(0,1,0,0);
     m(M_BEGIN_END, 0);
     CHECK(stub.n_draw == 1, "BEGIN clears rejected inline source state");
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    immediate_vertex(0,0,0,0); immediate_vertex(1,0,0,0);
+    immediate_vertex(0,1,0,0);
+    for (u32 i = 0; i <= RSX_DSP_INLINE_MAX_BYTES / 4u; i++)
+        m(M_INLINE_ARRAY, 0);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 1, "overflowed inline stream mixed with immediate rejects group");
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    immediate_vertex(0,0,0,0); immediate_vertex(1,0,0,0);
+    immediate_vertex(0,1,0,0);
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 2, "BEGIN recovers after mixed inline overflow");
     engine_down();
 }
 

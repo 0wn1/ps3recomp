@@ -208,6 +208,7 @@ static struct {
      * FIFO rather than from a vertex array. */
     const u8* inl;
     u32 inl_bytes;
+    u32 inline_dropped_at_begin;
 } dc;
 
 /* ---- guest memory -------------------------------------------------------- */
@@ -1601,8 +1602,9 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 
 static void sink_begin(void* user, const rsx_dispatch* r, u32 prim)
 {
-    (void)user; (void)r; (void)prim;
+    (void)user; (void)prim;
     dc_reset();
+    dc.inline_dropped_at_begin = r->inline_dropped;
 }
 
 /* A malformed/unbounded group must not render a truncated primitive. */
@@ -2115,7 +2117,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
     /* Mixed geometry sources have no defined concatenation here. Reject the
      * whole group instead of drawing partial/misordered geometry. */
-    if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes)) return;
+    if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||
+                          r->inline_dropped != dc.inline_dropped_at_begin)) return;
 
     const u32 prim = g.rsx.current_primitive;
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
