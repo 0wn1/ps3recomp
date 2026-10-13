@@ -3480,13 +3480,45 @@ class PPULifter:
         lines += self._table_lines()
         return "\n".join(lines)
 
+    @staticmethod
+    def write_if_changed(path: str, text: str) -> bool:
+        """Write `text` to `path` only when the content differs, so an
+        unchanged file keeps its mtime and the build leaves its object alone.
+        Returns True when the file was written."""
+        try:
+            with open(path, "r") as f:
+                if f.read() == text:
+                    return False
+        except OSError:
+            pass
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        return True
+
     def write_source_files(self, out_dir: str, base: str = "ppu_recomp",
-                           ext: str = ".cpp", max_lines: int = 600_000) -> list[str]:
+                           ext: str = ".cpp", max_lines: int = 600_000,
+                           chunks: int = 0) -> list[str]:
         """Write the C source split across chunk files. MSVC refuses sources
         past 16,777,215 lines (C4049/C1088), which a large game exceeds in a
         single file; splitting also lets the build compile chunks in parallel
         and rebuild incrementally. Chunks are cut only at function
-        boundaries. Returns the list of written paths."""
+        boundaries. Returns the paths that make up the output (written, or
+        left as they were because their content did not change).
+
+        chunks == 0 (default): cut every `max_lines` lines (--chunk-lines),
+        the function table in the last chunk. The cut points follow the
+        emitted line count, so a relift after a change that makes any
+        function's C longer or shorter moves every later cut and rewrites
+        those chunks.
+
+        chunks > 0 (--chunks N): N files cut by guest code bytes, chunk k
+        holding the functions of the address range that carries the k-th
+        N-th of the lifted bytes, plus `<base>_table<ext>` for the function
+        table. The ranges depend only on the function list, so a relift that
+        changes one function's body rewrites one file and leaves the others
+        byte-identical (and, through write_if_changed, untouched)."""
         emit_funcs = self._emit_functions()
         func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
@@ -3495,21 +3527,51 @@ class PPULifter:
         preamble = self._preamble_lines()
         written: list[str] = []
         chunk_idx = 0
+        changed = 0
 
-        def flush(body_lines: list[str], trailer: list[str] | None = None) -> None:
-            nonlocal chunk_idx
-            path = os.path.join(out_dir, f"{base}_{chunk_idx:03d}{ext}")
-            with open(path, "w") as f:
-                f.write("\n".join(preamble + body_lines + (trailer or [])))
+        def flush(body_lines: list[str], trailer: list[str] | None = None,
+                  name: str | None = None) -> None:
+            nonlocal chunk_idx, changed
+            path = os.path.join(out_dir, name or f"{base}_{chunk_idx:03d}{ext}")
+            new = self.write_if_changed(
+                path, "\n".join(preamble + body_lines + (trailer or [])))
+            changed += new
             written.append(path)
-            print(f"  wrote {os.path.basename(path)} "
+            print(f"  {'wrote' if new else 'unchanged'} {os.path.basename(path)} "
                   f"({len(preamble) + len(body_lines) + len(trailer or [])} lines)",
                   flush=True)
             chunk_idx += 1
 
+        n = len(emit_funcs)
+        if chunks > 0:
+            # Byte-keyed, not line-keyed: the lifter's C for a function can
+            # grow or shrink with a lifter change, its guest size cannot.
+            by_addr = sorted(emit_funcs, key=lambda f: f.start_addr)
+            size = lambda f: max(f.end_addr - f.start_addr, 4)
+            total = sum(size(f) for f in by_addr) or 1
+            groups: list[list] = [[] for _ in range(chunks)]
+            acc = 0
+            for func in by_addr:
+                groups[min(chunks - 1, acc * chunks // total)].append(func)
+                acc += size(func)
+            done = 0
+            for k, group in enumerate(groups):
+                cur: list[str] = []
+                for func in group:
+                    if done % 10000 == 0:
+                        print(f"  ... emitting {done}/{n} functions", flush=True)
+                    cur += self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
+                    done += 1
+                if len(preamble) + len(cur) > max_lines:
+                    print(f"  WARNING: chunk {k} has {len(preamble) + len(cur)} lines "
+                          f"(> {max_lines}); raise --chunks for MSVC", flush=True)
+                flush(cur, name=f"{base}_{k:03d}{ext}")
+            flush([], self._table_lines(), name=f"{base}_table{ext}")
+            print(f"  {changed} of {len(written)} source files changed", flush=True)
+            return written
+
         cur: list[str] = []
         cur_len = len(preamble)
-        n = len(emit_funcs)
         for i, func in enumerate(emit_funcs):
             if i % 10000 == 0:
                 print(f"  ... emitting {i}/{n} functions", flush=True)
@@ -3523,6 +3585,7 @@ class PPULifter:
 
         # Final chunk carries the function table.
         flush(cur, self._table_lines())
+        print(f"  {changed} of {len(written)} source files changed", flush=True)
         return written
 
 
@@ -4107,7 +4170,14 @@ def main() -> None:
                         help="Maximum lines per source chunk (default: 600000). "
                              "A smaller value means more, smaller translation "
                              "units: GCC needs about 2 GB at -O1 for 240k lines, "
-                             "so a host short on memory wants ~150000.")
+                             "so a host short on memory wants ~150000. With "
+                             "--chunks, only the threshold for a warning.")
+    parser.add_argument("--chunks", type=int, default=0,
+                        help="Split the source into this many files cut by guest "
+                             "code bytes, plus <source>_table for the function "
+                             "table. The cut depends only on the function list, "
+                             "so a relift that changes one function rewrites one "
+                             "file. 0 (default): cut every --chunk-lines lines.")
     parser.add_argument("--code-end", type=lambda x: int(x, 0), default=None,
                         help="Highest valid executable address (exclusive). "
                              "Branch/call/jump-table targets at or above this are "
@@ -4627,36 +4697,39 @@ def main() -> None:
     os.makedirs(args.output, exist_ok=True)
 
     header_path = os.path.join(args.output, args.header_name)
-    with open(header_path, "w") as f:
-        f.write(lifter.emit_header())
+    hdr_new = lifter.write_if_changed(header_path, lifter.emit_header())
 
-    # Remove stale output (the old single-file source and any previous chunk
-    # set) so a build doesn't pick up both.
     import glob as _glob
     base = args.source_name[:-2] if args.source_name.endswith(".c") else args.source_name
-    for stale in ([os.path.join(args.output, args.source_name)] +
-                  _glob.glob(os.path.join(args.output, f"{base}_*.c")) +
-                  _glob.glob(os.path.join(args.output, f"{base}_*.cpp"))):
-        if os.path.exists(stale):
-            os.remove(stale)
-
     if args.single_file:
         # One ppu_recomp.c (the old layout). Slower to compile for huge images,
         # but some workflows post-process a single file (e.g. flOw's vmx_splice).
         src_path = os.path.join(args.output, args.source_name)
         print(f"Writing single-file C source -> {os.path.basename(src_path)} ...", flush=True)
-        with open(src_path, "w") as f:
-            f.write(lifter.emit_source())
+        lifter.write_if_changed(src_path, lifter.emit_source())
         paths = [src_path]
-        print(f"Wrote {header_path}")
+        print(f"{'Wrote' if hdr_new else 'Unchanged'} {header_path}")
         print(f"Wrote {os.path.basename(src_path)}")
     else:
         print("Writing C source (split into chunks)...", flush=True)
         paths = lifter.write_source_files(args.output, base=base,
-                                          max_lines=args.chunk_lines)
-        print(f"Wrote {header_path}")
+                                          max_lines=args.chunk_lines,
+                                          chunks=args.chunks)
+        print(f"{'Wrote' if hdr_new else 'Unchanged'} {header_path}")
         print(f"Wrote {len(paths)} source chunks: "
               f"{os.path.basename(paths[0])} .. {os.path.basename(paths[-1])}")
+
+    # Remove stale output (the old single-file source, chunks of an earlier
+    # run with other cut points) so a build doesn't pick up both. After
+    # writing, not before, so the files this run left unchanged keep their
+    # mtime.
+    keep = {os.path.abspath(p) for p in paths}
+    for stale in ([os.path.join(args.output, args.source_name)] +
+                  _glob.glob(os.path.join(args.output, f"{base}_*.c")) +
+                  _glob.glob(os.path.join(args.output, f"{base}_*.cpp"))):
+        if os.path.exists(stale) and os.path.abspath(stale) not in keep:
+            os.remove(stale)
+            print(f"  removed stale {os.path.basename(stale)}")
     print(f"  {len(lifter.functions)} functions lifted")
     print(f"  {len(lifter.call_targets)} unique call targets")
 
