@@ -222,7 +222,7 @@ class Pipeline(unittest.TestCase):
                 control = (
                     '#include "spu_workload.h"\n#include <assert.h>\n'
                     'extern void spu_register_all(void);\n'
-                    '_Thread_local void (*g_spu_trampoline_fn)(spu_context*);\n'
+                    'SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);\n'
                     'void spu_indirect_branch(spu_context* ctx) { (void)ctx; assert(0); }\n'
                     'unsigned char image[] = {' + byte_list + '};\n'
                     'int main(void) { unsigned char ls[SPU_LS_SIZE] = {0}; uint32_t entry;\n'
@@ -237,11 +237,12 @@ class Pipeline(unittest.TestCase):
                     'assert(ctx.gpr[3]._u32[0] == 7); return 0; }\n')
                 (self.root / 'overlap_control.c').write_text(control)
                 binary = self.root / ('overlap_control.exe' if sys.platform == 'win32' else 'overlap_control')
-                subprocess.run([cc, '-std=c11', '-I' + str(runtime),
+                compiled = subprocess.run([cc, '-std=c11', '-I' + str(runtime),
                                 str(self.root / 'overlap_control.c'), str(self.root / 'workload.c'),
                                 str(self.root / 'registry.c'), str(output / 'registry.c'),
                                 str(output / 'sample' / 'spu_recomp.c'), '-o', str(binary)],
-                               check=True, capture_output=True, text=True)
+                               capture_output=True, text=True)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr + compiled.stdout)
                 subprocess.run([str(binary)], check=True)
 
     def test_compiled_runtime_registration_and_cmake(self):
@@ -275,7 +276,7 @@ class Pipeline(unittest.TestCase):
             '#include "spu_workload.h"\n#include <assert.h>\n'
             'extern void spu_register_all(void);\n'
             'extern spu_lifted_entry_fn spu_lookup(uint32_t, int);\n'
-            '_Thread_local void (*g_spu_trampoline_fn)(spu_context*);\n'
+            'SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);\n'
             'void spu_indirect_branch(spu_context* ctx) { (void)ctx; assert(0); }\n'
             'int main(void) { spu_register_all();\n' + '\n'.join(body) + '\nreturn 0; }\n')
         # Minimal consumer uses the same CMake generation helper as the template.
@@ -287,7 +288,12 @@ class Pipeline(unittest.TestCase):
         cmake_source += f'target_include_directories(proof PRIVATE "{runtime.as_posix()}")\n'
         (self.root / 'CMakeLists.txt').write_text(cmake_source)
         build = self.root / 'build'
-        configured = subprocess.run([cmake, '-S', str(self.root), '-B', str(build), '-DCMAKE_C_COMPILER=' + cc,
+        # Visual Studio generators select their own toolset instead of this
+        # compiler, and put the executable in a configuration subdirectory.
+        # Ninja honors the selected Clang and the same executable path as POSIX.
+        generator = ['-G', 'Ninja'] if sys.platform == 'win32' else []
+        configured = subprocess.run([cmake, '-S', str(self.root), '-B', str(build), *generator,
+                                     '-DCMAKE_C_COMPILER=' + cc,
                                      '-DPython3_EXECUTABLE=' + sys.executable], capture_output=True, text=True)
         self.assertEqual(configured.returncode, 0, configured.stderr + configured.stdout)
         built = subprocess.run([cmake, '--build', str(build)], capture_output=True, text=True)
