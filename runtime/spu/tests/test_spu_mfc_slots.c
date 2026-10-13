@@ -1,8 +1,8 @@
 /*
  * Every live SPU context gets an MFC engine of its own, and gives it back.
  *
- * There are eight slots in the per-context MFC table and a thread group starts
- * all of its threads at once, so the claim is a race between as many host
+ * There are SPU_MAX_CONTEXTS slots in the per-context MFC table and a thread
+ * group starts all of its threads at once, so the claim is a race between as many host
  * threads as the group has, each arriving on its first DMA. Two of them taking
  * the same slot is silent: both SPUs then share one engine's command queue and
  * tag-completion mask, so one SPU's tag wait is satisfied by the other SPU's
@@ -12,8 +12,11 @@
  *
  * The other half is the table running dry. Slots used to be claimed and never
  * released, so a title with more SPU contexts over its life than there are
- * slots ran everything past the eighth on one shared fallback engine, carrying
- * whatever queue and tag state the previous owners left in it.
+ * slots ran everything past the last slot on one shared fallback engine,
+ * carrying whatever queue and tag state the previous owners left in it. And a
+ * title can hold more contexts at once than the machine has SPUs (SPU thread
+ * groups plus a policy-module context per workload and SPU that keeps its
+ * engine), so the table must be larger than a group.
  *
  * So the assertions are: eight contexts claiming at the same instant get eight
  * different engines; each engine keeps the state its own context wrote while
@@ -21,7 +24,10 @@
  * eight contexts, freshly initialized; and over thirty-two rounds -- two
  * hundred and fifty-six contexts, none of them at an address a previous one
  * used -- exactly the same eight engines are handed out, which is what says
- * the slots came back rather than the overflow engine being shared.
+ * the slots came back rather than the overflow engine being shared. Then:
+ * eleven contexts held at once each have an engine of their own; the table
+ * holds SPU_MAX_CONTEXTS of them; and the context past that is reported as an
+ * error, not silently given the shared engine.
  *
  * spu_channels.c is compiled in rather than linked, because the slot table and
  * mfc_for() are file-static: the same reason test_spu_lifted_start.c compiles
@@ -71,8 +77,9 @@ static void check(int ok, const char* what)
 /* ---------------------------------------------------------------------------
  * Eight contexts claiming at once, thirty-two times over
  * -----------------------------------------------------------------------*/
-#define NCTX    SPU_MAX_CONTEXTS   /* exactly fills the table */
-#define ROUNDS  32                 /* 256 contexts, well past the eight slots */
+#define NCTX    8                  /* a thread group's worth, claiming together */
+#define ROUNDS  32                 /* 256 contexts, well past the table's slots */
+#define HELD    11                 /* contexts one title holds at once */
 
 /* Every context in the run is live at once and none is freed, so no two ever
  * share an address. A round that reused an address would find a leaked slot by
@@ -215,23 +222,51 @@ int main(void)
     CHECK(idle != NULL);
     spu_mfc_release(idle);
 
-    /* The table is empty again: fill it, then check what the ninth context
-     * gets. Sharing the overflow engine is the documented behaviour above
-     * SPU_MAX_CONTEXTS -- a real group has at most six -- and it must not cost
-     * a slot, so releasing one of the eight hands that same slot to the next
+    /* Eleven contexts held at once -- more than a group, more than the
+     * machine's SPUs -- each get an engine of their own and keep what they
+     * wrote into it. */
+    spu_context* many[HELD];
+    mfc_engine*  manye[HELD];
+    for (int i = 0; i < HELD; i++) {
+        many[i] = (spu_context*)calloc(1, sizeof(spu_context));
+        CHECK(many[i] != NULL);
+        manye[i] = mfc_for(many[i]);
+        manye[i]->tag_completed = 0x5A000000u | (uint32_t)i;
+    }
+    {
+        int distinct = 1, kept = 1;
+        for (int i = 0; i < HELD; i++) {
+            for (int j = i + 1; j < HELD; j++)
+                if (manye[i] == manye[j]) distinct = 0;
+            if (manye[i]->tag_completed != (0x5A000000u | (uint32_t)i)) kept = 0;
+        }
+        printf("  %d contexts held at once: %s engines, %s state\n", HELD,
+               distinct ? "distinct" : "SHARED", kept ? "own" : "OVERWRITTEN");
+        CHECK(distinct);
+        CHECK(kept);
+    }
+    CHECK(s_mfc_overflow_lookups == 0);
+    for (int i = 0; i < HELD; i++) spu_mfc_release(many[i]);
+
+    /* The table is empty again: fill it, then check what the next context
+     * gets. Above SPU_MAX_CONTEXTS it shares the overflow engine and that is
+     * reported as an error (counted here); it must not cost a slot, so
+     * releasing one of the held contexts hands that same slot to the next
      * context that asks. */
-    spu_context* held[NCTX];
-    mfc_engine*  helde[NCTX];
-    for (int i = 0; i < NCTX; i++) {
+    spu_context* held[SPU_MAX_CONTEXTS];
+    mfc_engine*  helde[SPU_MAX_CONTEXTS];
+    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
         held[i] = (spu_context*)calloc(1, sizeof(spu_context));
         CHECK(held[i] != NULL);
         helde[i] = mfc_for(held[i]);
     }
+    CHECK(s_mfc_overflow_lookups == 0);          /* the whole table, no overflow */
     spu_context* ninth = (spu_context*)calloc(1, sizeof(spu_context));
     CHECK(ninth != NULL);
     mfc_engine* ninthe = mfc_for(ninth);
     CHECK(ninthe != NULL);
-    CHECK(!engine_seen(helde, NCTX, ninthe));   /* the overflow one */
+    CHECK(!engine_seen(helde, SPU_MAX_CONTEXTS, ninthe));   /* the overflow one */
+    CHECK(s_mfc_overflow_lookups == 1);          /* ...reported */
 
     spu_mfc_release(held[3]);
     spu_context* reuser = (spu_context*)calloc(1, sizeof(spu_context));

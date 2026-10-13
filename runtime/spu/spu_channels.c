@@ -295,7 +295,13 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
  *     stored both took the same slot and then shared one engine's queue and tag
  *     state -- one SPU's tag wait satisfied by the other SPU's transfer.
  * ===========================================================================*/
-#define SPU_MAX_CONTEXTS 8
+/* A title holds more SPU contexts at once than the machine has SPUs: SPU
+ * thread groups plus a policy-module context per (workload, SPU) that keeps
+ * its engine for as long as the workload exists (eleven at once in Killzone 3).
+ * 64 leaves room for that; a build that needs more can raise it. */
+#ifndef SPU_MAX_CONTEXTS
+#define SPU_MAX_CONTEXTS 64
+#endif
 
 typedef struct {
     spu_context* volatile ctx;
@@ -304,6 +310,7 @@ typedef struct {
 
 static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
 static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
+static unsigned long long s_mfc_overflow_lookups;   /* lookups answered with the shared engine */
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
@@ -322,19 +329,26 @@ static mfc_engine* mfc_for(spu_context* ctx)
         e = &s_mfc_slots[i].mfc;
     }
     if (!e) {
-        /* Out of slots: fall back to a shared engine (correct for single-SPU).
-         * Reachable only with more than SPU_MAX_CONTEXTS contexts running at
-         * the same time, which is more SPUs than the machine has -- and the
-         * sharing is silent, so say it once. Its one-time init is inside the
-         * lock as well, or two threads arriving together would each memset an
-         * engine the other is already using. */
+        /* Out of slots: every context past SPU_MAX_CONTEXTS shares one engine,
+         * so one context's DMA completion can clear a tag bit another one is
+         * waiting on. That is a configuration error, not a mode to run in:
+         * report it as one, at the first overflow and again at 1000 and
+         * 1000000 overflow lookups so it stays visible in a long log. The
+         * one-time init is inside the lock, or two threads arriving together
+         * would each memset an engine the other is already using. */
         static mfc_engine fallback;
         static int fallback_init = 0;
         if (!fallback_init) {
             mfc_engine_init(&fallback);
             fallback_init = 1;
-            fprintf(stderr, "[SPU] more than %d contexts hold an MFC engine at "
-                    "once; the rest share one\n", SPU_MAX_CONTEXTS);
+        }
+        unsigned long long n = ++s_mfc_overflow_lookups;
+        if (n == 1 || n == 1000 || n == 1000000) {
+            fprintf(stderr, "[SPU] ERROR: MFC engine table full: %d SPU contexts "
+                    "hold an engine and context %p has none (overflow lookups so far: %llu). "
+                    "It shares one overflow engine; DMA tag waits between the "
+                    "contexts sharing it are unreliable; rebuild with a larger "
+                    "SPU_MAX_CONTEXTS.\n", SPU_MAX_CONTEXTS, (void*)ctx, n);
             fflush(stderr);
         }
         e = &fallback;
