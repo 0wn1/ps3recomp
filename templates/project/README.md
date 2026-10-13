@@ -77,7 +77,10 @@ continues to work.
 
 This scans only supplied files. It does not decrypt, decompress, infer raw
 job-module boundaries, or promise that a generated program can run correctly.
-Automated lifting currently supports one executable PT_LOAD per ELF. Executable
+Automated lifting currently supports one executable PT_LOAD per ELF with
+nonoverlapping memory ranges across all PT_LOAD segments, including BSS tails.
+Overlapping loads are reported as unsupported because the loader can overwrite
+code that a segment-based lift would use. Executable
 sections bound code when present; stripped images use the executable segment
 and may need manual code/data boundaries. The workload registry distinguishes
 programs by fingerprint; standalone SPU thread selection still uses the

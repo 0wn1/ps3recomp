@@ -18,6 +18,8 @@ Usage:
     python extract_spu_images.py <ppu_elf> [--output DIR]
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import sys

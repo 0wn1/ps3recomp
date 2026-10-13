@@ -20,6 +20,14 @@ def sha256(buf):
 
 
 def code_ranges(info):
+    # The loader applies every PT_LOAD in header order, including zero filling.
+    # Lifting a segment in isolation is unsafe if another load can replace its
+    # bytes. Treat any overlapping memory layout as unsupported until generation
+    # explicitly models the final deployed local store. Adjacent/empty loads
+    # remain valid.
+    loads = sorted((p['addr'], p['addr'] + p['memsz']) for p in info['loads'] if p['memsz'])
+    if any(b > c for (_, b), (c, _) in zip(loads, loads[1:])):
+        raise ValueError('overlapping PT_LOAD memory ranges (including BSS) are unsupported')
     executable = info['executable']
     if len(executable) != 1:
         raise ValueError('automated lifting requires exactly one executable PT_LOAD')

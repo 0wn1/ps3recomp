@@ -61,6 +61,20 @@ class Pipeline(unittest.TestCase):
     def manifest(self):
         return json.loads((self.output / 'inventory.json').read_text())
 
+    def write_runtime_blocks(self):
+        runtime = TOOLS.parent / 'runtime' / 'spu'
+        # Compile the runtime's actual registry/fingerprint/ELF-size blocks
+        # unchanged, without the unrelated DMA/job/platform dependency graph.
+        workload = (runtime / 'spu_workload.c').read_text()
+        workload = workload[workload.index('uint64_t spu_workload_fingerprint('):
+                            workload.index('/* ---- dispatch')]
+        (self.root / 'workload.c').write_text('#include "spu_workload.h"\n#include <stdio.h>\n#include <string.h>\n' + workload)
+        channels = (runtime / 'spu_channels.c').read_text()
+        channels = channels[channels.index('typedef void (*spu_fn)'):
+                            channels.index('/* Which image registered')]
+        (self.root / 'registry.c').write_text('#include "spu_context.h"\n#include <stdio.h>\n' + channels)
+        return runtime
+
     def test_exact_dedup_and_same_address_isolation(self):
         result = self.run_pipeline(('container.bin', b'prefix' + elf(7) + elf(9) + elf(7)))
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
@@ -165,6 +179,71 @@ class Pipeline(unittest.TestCase):
         self.assertIn('ELF entry', self.manifest()['programs'][0]['reason'])
         self.assertFalse((self.output / 'spu_workloads.c').exists())
 
+    def test_load_overwrite_and_bss_overlap_are_rejected(self):
+        cc = shutil.which('clang') or shutil.which('cc')
+        for bss in (False, True):
+            with self.subTest(bss=bss):
+                blob = bytearray(elf(7, multi=True))
+                # The later non-executable load writes onto the first load's
+                # code. In BSS mode its zero-filled tail reaches the same code.
+                struct.pack_into('>I', blob, 84 + 24, 4)
+                if bss:
+                    struct.pack_into('>I', blob, 84 + 8, 0xf0)
+                    struct.pack_into('>I', blob, 84 + 16, 0)
+                    struct.pack_into('>I', blob, 84 + 20, 24)
+                else:
+                    struct.pack_into('>I', blob, 84 + 8, 0x100)
+                    struct.pack_into('>I', blob, 0x108, 0x40800003 | (9 << 7))
+                result = self.run_pipeline(('input.bin', blob))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                program = self.manifest()['programs'][0]
+                self.assertEqual(program['status'], 'unsupported')
+                self.assertIn('overlapping PT_LOAD', program['reason'])
+                self.assertFalse((self.output / 'spu_workloads.c').exists())
+                if not cc:
+                    if __import__('os').environ.get('CI'):
+                        self.fail('C compiler required for runtime overwrite control in CI')
+                    continue
+                # Negative control: the compatibility CLI still demonstrates
+                # why accepting this layout is unsafe. Compile its generated
+                # entry against the actual runtime loader and observe different
+                # loaded instructions versus the instructions baked into C.
+                images = self.root / 'legacy_images'
+                images.mkdir(exist_ok=True)
+                (images / 'sample.elf').write_bytes(blob)
+                output = self.root / 'legacy_lift'
+                subprocess.run([sys.executable, str(TOOLS / 'build_spu_workloads.py'),
+                                '--images', str(images), '--lifted', str(output),
+                                '--out', str(output / 'registry.c'), '--relift'],
+                               check=True, capture_output=True, text=True)
+                runtime = self.write_runtime_blocks()
+                byte_list = ','.join(str(x) for x in blob)
+                loaded = 0 if bss else 9
+                control = (
+                    '#include "spu_workload.h"\n#include <assert.h>\n'
+                    'extern void spu_register_all(void);\n'
+                    '_Thread_local void (*g_spu_trampoline_fn)(spu_context*);\n'
+                    'void spu_indirect_branch(spu_context* ctx) { (void)ctx; assert(0); }\n'
+                    'unsigned char image[] = {' + byte_list + '};\n'
+                    'int main(void) { unsigned char ls[SPU_LS_SIZE] = {0}; uint32_t entry;\n'
+                    'assert(spu_elf_load_to_ls(image, sizeof image, ls, &entry));\n'
+                    'uint32_t word = ((uint32_t)ls[0x100]<<24) | ((uint32_t)ls[0x101]<<16) | '
+                    '((uint32_t)ls[0x102]<<8) | ls[0x103];\n'
+                    'assert(((word>>7)&65535) == ' + str(loaded) + ');\n'
+                    'assert(word != 0x40800383u);\n'
+                    'spu_register_all(); spu_lifted_entry_fn f = spu_workload_find('
+                    'spu_workload_fingerprint(image, spu_elf_image_size(image, sizeof image))); assert(f);\n'
+                    'spu_context ctx = {0}; ctx.ls = ls; f(&ctx);\n'
+                    'assert(ctx.gpr[3]._u32[0] == 7); return 0; }\n')
+                (self.root / 'overlap_control.c').write_text(control)
+                binary = self.root / ('overlap_control.exe' if sys.platform == 'win32' else 'overlap_control')
+                subprocess.run([cc, '-std=c11', '-I' + str(runtime),
+                                str(self.root / 'overlap_control.c'), str(self.root / 'workload.c'),
+                                str(self.root / 'registry.c'), str(output / 'registry.c'),
+                                str(output / 'sample' / 'spu_recomp.c'), '-o', str(binary)],
+                               check=True, capture_output=True, text=True)
+                subprocess.run([str(binary)], check=True)
+
     def test_compiled_runtime_registration_and_cmake(self):
         cc = shutil.which('clang') or shutil.which('cc')
         cmake = shutil.which('cmake')
@@ -177,20 +256,11 @@ class Pipeline(unittest.TestCase):
         result = self.run_pipeline(('input.bin', elf(7) + elf(9) + elf(11, rodata=True) + note))
         self.assertEqual(result.returncode, 0, result.stderr)
         programs = self.manifest()['programs']
-        runtime = TOOLS.parent / 'runtime' / 'spu'
-        # Compile the runtime's actual registry/fingerprint/ELF-size blocks
-        # unchanged, without the unrelated DMA/job/platform dependency graph.
-        workload = (runtime / 'spu_workload.c').read_text()
-        workload = workload[workload.index('uint64_t spu_workload_fingerprint('):
-                            workload.index('/* ---- dispatch')]
-        (self.root / 'workload.c').write_text('#include "spu_workload.h"\n#include <stdio.h>\n#include <string.h>\n' + workload)
-        channels = (runtime / 'spu_channels.c').read_text()
-        channels = channels[channels.index('typedef void (*spu_fn)'):
-                            channels.index('/* Which image registered')]
-        (self.root / 'registry.c').write_text('#include "spu_context.h"\n#include <stdio.h>\n' + channels)
+        runtime = self.write_runtime_blocks()
         body = []
         for i, program in enumerate(programs):
             blob = (self.output / program['name'] / 'image.elf').read_bytes()
+            immediate = (struct.unpack_from('>I', blob, 0x100)[0] >> 7) & 0xffff
             body += [f'unsigned char image{i}[] = {{' + ','.join(str(x) for x in blob) + '};',
                      f'assert(spu_elf_image_size(image{i}, sizeof image{i}) == sizeof image{i});',
                      f'uint64_t fp{i} = spu_workload_fingerprint(image{i}, sizeof image{i});',
@@ -199,7 +269,7 @@ class Pipeline(unittest.TestCase):
                      f'assert(f{i} && id{i} == {program["image_id"]});',
                      f'assert(spu_lookup(0x100, id{i}) == f{i});',
                      f'spu_context c{i} = {{0}}; f{i}(&c{i});',
-                     f'assert(c{i}.gpr[3]._u32[0] == {(struct.unpack_from('>I', blob, 0x100)[0] >> 7) & 0xffff});']
+                     f'assert(c{i}.gpr[3]._u32[0] == {immediate});']
         body += ['assert(f0 != f1 && id0 != id1);', 'assert(spu_workload_count() == 8);']
         (self.root / 'proof.c').write_text(
             '#include "spu_workload.h"\n#include <assert.h>\n'
@@ -217,7 +287,8 @@ class Pipeline(unittest.TestCase):
         cmake_source += f'target_include_directories(proof PRIVATE "{runtime.as_posix()}")\n'
         (self.root / 'CMakeLists.txt').write_text(cmake_source)
         build = self.root / 'build'
-        configured = subprocess.run([cmake, '-S', str(self.root), '-B', str(build), '-DCMAKE_C_COMPILER=' + cc], capture_output=True, text=True)
+        configured = subprocess.run([cmake, '-S', str(self.root), '-B', str(build), '-DCMAKE_C_COMPILER=' + cc,
+                                     '-DPython3_EXECUTABLE=' + sys.executable], capture_output=True, text=True)
         self.assertEqual(configured.returncode, 0, configured.stderr + configured.stdout)
         built = subprocess.run([cmake, '--build', str(build)], capture_output=True, text=True)
         self.assertEqual(built.returncode, 0, built.stderr + built.stdout)
