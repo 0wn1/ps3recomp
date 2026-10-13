@@ -3149,6 +3149,62 @@ s32 cellSpursTaskGetContextSaveAreaSize(u64 size_out_ea, u64 pattern_ea)
     return CELL_OK;
 }
 
+/* cellSpursBarrierInitialize(CellSpursTaskset* taskset, CellSpursBarrier* barrier,
+ *                            u32 total)
+ *
+ * A barrier is 128 bytes, 128-aligned, opaque in the SDK: the PPU only
+ * initialises it, and the tasks of `taskset` meet at it from the SPU through
+ * the barrier code linked into their own images. That code reads the count
+ * of tasks still to arrive as a u32 at +0x04 and the owning taskset's EA at
+ * +0x34, the layout reverse engineering of the SPU side has found; the rest
+ * starts zeroed. Up to 128 tasks, one per taskset slot.
+ */
+s32 cellSpursBarrierInitialize(u64 taskset_ea, u64 barrier_ea, u32 total)
+{
+    if (!taskset_ea || !barrier_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if ((taskset_ea & 127u) || (barrier_ea & 127u)) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (!total || total > 128u) return CELL_SPURS_TASK_ERROR_INVAL;
+
+    for (uint32_t o = 0; o < 128u; o += 8u) vm_write64((uint32_t)barrier_ea + o, 0);
+    vm_write32((uint32_t)barrier_ea + 0x04, total);
+    vm_write32((uint32_t)barrier_ea + 0x34, (uint32_t)taskset_ea);
+
+    printf("[cellSpurs] BarrierInitialize(taskset=0x%08X, barrier=0x%08X, total=%u)\n",
+           (u32)taskset_ea, (u32)barrier_ea, total);
+    return CELL_OK;
+}
+
+/* cellSpursGetTasksetInfo(const CellSpursTaskset* taskset, CellSpursTasksetInfo* info)
+ *
+ * CellSpursTasksetInfo is 128 per-task entries of 0x48 bytes, then the
+ * taskset's own fields: argument (u64, +0x2400), workload id (+0x2408), last
+ * scheduled task (+0x240C), name, exception handler and its argument
+ * (+0x2410..+0x241B), and the taskset's size (+0x241C). The taskset-level
+ * fields are filled from the taskset itself; the per-task entries are left
+ * zeroed, which reads as "no task", since nothing here tracks a task's state
+ * the way the SPU kernel does. Twisted Metal's post-FX init reads the
+ * workload id back from it.
+ */
+#define TSI_ARGUMENT     0x2400u
+#define TSI_WORKLOAD     0x2408u
+#define TSI_LAST_TASK    0x240Cu
+#define TSI_SIZE         0x241Cu
+#define TSI_BYTES        0x2420u
+
+s32 cellSpursGetTasksetInfo(u64 taskset_ea, u64 info_ea)
+{
+    if (!taskset_ea || !info_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (taskset_ea & 127u) return CELL_SPURS_TASK_ERROR_ALIGN;
+
+    const uint32_t ts = (uint32_t)taskset_ea, info = (uint32_t)info_ea;
+    for (uint32_t o = 0; o < TSI_BYTES; o += 4u) vm_write32(info + o, 0);
+    vm_write64(info + TSI_ARGUMENT, vm_read64(ts + CSTS_ARGS));
+    vm_write32(info + TSI_WORKLOAD, vm_read32(ts + CSTS_WID));
+    vm_write32(info + TSI_LAST_TASK, 0);
+    vm_write32(info + TSI_SIZE, vm_read32(ts + CSTS_SIZE_FIELD));
+    return CELL_OK;
+}
+
 /* cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute*, u32 size)
  * CreateTaskset ignores the attribute entirely (it builds the real BE layout
  * itself), so record the request and accept it. */
