@@ -138,6 +138,9 @@ int main(int argc, char** argv) {
 }
 
 /* Link-only boundaries outside this CPU-only fixture. Fail if any is reached. */
+/* spu_workload.c can retain the LV2 runner's publication calls at link time;
+ * this fixture runs its own context directly, without an LV2 SPU thread. */
+void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
 void ppu_resv_break_store(uint64_t ea) { (void)ea; abort(); }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
 unsigned long long ps3_ms_now(void) { abort(); }
