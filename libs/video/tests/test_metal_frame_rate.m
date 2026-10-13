@@ -1,6 +1,44 @@
 #include "../rsx_metal_backend.m"
 #include <assert.h>
 
+/* Observe Metal independently of the production handler, including dropped
+ * frames whose presentedTime is zero. This is fixture-only instrumentation. */
+@interface FixturePresentations : NSObject {
+@public
+ pthread_mutex_t lock;
+ unsigned callbacks;
+ double times[6];
+}
+@end
+@implementation FixturePresentations
+- (instancetype)init {
+ if ((self=[super init])) pthread_mutex_init(&lock,NULL);
+ return self;
+}
+- (void)dealloc { pthread_mutex_destroy(&lock); }
+@end
+
+static void log_display_environment(void) {
+ CGDirectDisplayID displays[16];uint32_t count=0;
+ CGError error=CGGetActiveDisplayList(16,displays,&count);
+ fprintf(stderr,"[FPS fixture] device=%s active_displays=%u display_error=%d app_active=%d window_visible=%d occlusion_visible=%d layer_size=%.0fx%.0f\n",
+     s_dev.name.UTF8String,count,error,NSApp.active,s_window.visible,
+     !!(s_window.occlusionState&NSWindowOcclusionStateVisible),
+     s_layer.bounds.size.width,s_layer.bounds.size.height);
+ for (uint32_t i=0;i<count;i++) fprintf(stderr,
+     "[FPS fixture] display=%u online=%d active=%d builtin=%d vendor=%u model=%u pixels=%zux%zu\n",
+     displays[i],CGDisplayIsOnline(displays[i]),CGDisplayIsActive(displays[i]),
+     CGDisplayIsBuiltin(displays[i]),CGDisplayVendorNumber(displays[i]),
+     CGDisplayModelNumber(displays[i]),CGDisplayPixelsWide(displays[i]),CGDisplayPixelsHigh(displays[i]));
+ NSArray *windows=CFBridgingRelease(CGWindowListCopyWindowInfo(
+     kCGWindowListOptionIncludingWindow,(CGWindowID)s_window.windowNumber));
+ NSDictionary *window=windows.firstObject;
+ fprintf(stderr,"[FPS fixture] window_number=%ld cg_onscreen=%d cg_layer=%ld cg_bounds=%s\n",
+     (long)s_window.windowNumber,[window[(id)kCGWindowIsOnscreen] boolValue],
+     [window[(id)kCGWindowLayer] longValue],
+     [window[(id)kCGWindowBounds] description].UTF8String);
+}
+
 /* Shutdown reaches these only for a fully initialized production engine. */
 void rsx_set_backend(rsx_backend* backend) { (void)backend; }
 void rsx_draw_engine_shutdown(void) {}
@@ -38,11 +76,19 @@ int main(int argc, char **argv) {
     [NSApp finishLaunching];
     [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
     [s_window display];[CATransaction flush];
+    log_display_environment();
+    FixturePresentations *observed=[FixturePresentations new];
     id<MTLCommandBuffer> flush=[s_queue commandBuffer];[flush commit];[flush waitUntilCompleted];
     assert(s_fps_session->stats.displayed==0); /* GPU completion is not a presentation */
     for (int frame=0;frame<6;frame++) {
     id<CAMetalDrawable> drawable=[s_layer nextDrawable];assert(drawable);
     fps_track_drawable(drawable);
+    [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
+     pthread_mutex_lock(&observed->lock);
+     observed->times[frame]=shown.presentedTime;++observed->callbacks;
+     fprintf(stderr,"[FPS fixture] raw_callback frame=%d presented_time=%.9f\n",frame,shown.presentedTime);
+     pthread_mutex_unlock(&observed->lock);
+    }];
     rsx_metal_backend_note_guest_frame();
     id<MTLCommandBuffer> cb=[s_queue commandBuffer];
     MTLRenderPassDescriptor *pass=[MTLRenderPassDescriptor renderPassDescriptor];
@@ -66,6 +112,11 @@ int main(int argc, char **argv) {
      [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
     }
     pthread_mutex_lock(&s_fps_session->lock);
+    pthread_mutex_lock(&observed->lock);
+    fprintf(stderr,"[FPS fixture] raw_callbacks=%u presented_times=%.9f,%.9f,%.9f,%.9f,%.9f,%.9f\n",
+        observed->callbacks,observed->times[0],observed->times[1],observed->times[2],
+        observed->times[3],observed->times[4],observed->times[5]);
+    pthread_mutex_unlock(&observed->lock);
     fprintf(stderr,"[FPS fixture] drawable displayed=%llu guest=%llu\n",
         s_fps_session->stats.displayed,s_fps_session->stats.guest);
     assert(s_fps_session->stats.displayed>0 && s_fps_session->stats.displayed<=6);
