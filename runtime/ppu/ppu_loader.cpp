@@ -1433,6 +1433,18 @@ static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr
  * write hook can name the virtual method that is running when it writes a value. */
 static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
 static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
+/* Nesting depth of ps3_indirect_call on this host thread (the recursion guard
+ * in ps3_indirect_call_impl). A host coroutine that runs guest code and ends by
+ * switching away from inside an indirect call never unwinds its frames, so one
+ * count per thread only grows: every such coroutine leaks its depth, and once
+ * the sum passes the cap the guard skips every indirect call on that thread.
+ * A coroutine layer keeps one count per coroutine by saving *slot when it
+ * switches away and restoring it when it switches back; threads that never
+ * switch keep using their thread-local count. The vcall stack pointer leaks
+ * the same way. */
+static PPU_THREAD_LOCAL int      g_dispatch_depth = 0;
+extern "C" int* ps3_ppu_dispatch_depth_slot(void) { return &g_dispatch_depth; }
+extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
 
 /* Every guest store commits through this: on a line no SPU has reserved (all of
  * them, until SPU code runs) it is the plain memcpy it replaced. */
@@ -2681,7 +2693,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
          * chain that never converges) can dispatch recursively without bound
          * and blow the host stack. Cap the depth, log once, then unwind. */
-        static thread_local int s_depth = 0;
+        int& s_depth = g_dispatch_depth;
         if (s_depth > 4000) {
             static int warned = 0;
             if (warned++ < 8)
