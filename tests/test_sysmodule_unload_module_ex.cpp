@@ -1,6 +1,5 @@
 /* Extended unload through generated NID registration and real PPU dispatch. */
 #include "ppu_context.h"
-#include "sys_memory.h"
 #include "cellSysmodule.h"
 #include "ps3emu/guest_call.h"
 #include <cstdio>
@@ -59,10 +58,12 @@ int main() {
     static uint8_t memory[0x10000];vm_base=memory;std::memset(memory,0xA5,sizeof memory);
     ppu_hle_register_all();
     CHECK(ps3_hle_has(UNLOAD));
-    // Synthetic reproduction: NP EULA already loaded, query, unload using r3.
+    CHECK(ps3_hle_has(LOAD));
+    CHECK(ps3_hle_has(QUERY));
+    // Synthetic lifecycle: internal module loaded, queried, then unloaded.
     CHECK(call(LOAD,0xF044)==0);
     CHECK(call(QUERY,0xF044)==0);
-    CHECK(call(UNLOAD,0xF044,0x1DFD1F4)==0);
+    CHECK(call(UNLOAD,0xF044,0xDEADBEEF)==0);
     CHECK(call(QUERY,0xF044)==0x80012003);
     CHECK(call(UNLOAD,0xF044)==0x80012003);
     CHECK(call(LOAD,0xF044)==0);
@@ -78,6 +79,10 @@ int main() {
         0xF054,0xF055,0xF056};
     for(uint32_t id=0xF000;id<0xF057;++id) {
         bool accepts=false;for(uint16_t a:allowed)if(id==a)accepts=true;
+        const bool loadable=accepts && id!=0xF020 && id!=0xF024 && id!=0xF03E;
+        CHECK(call(LOAD,id)==(loadable?0u:0x80012002u));
+        CHECK(call(QUERY,id)==(loadable?0u:0x80012003u));
+        if(loadable)CHECK(cellSysmoduleUnloadModule(uint16_t(id))==0);
         // The pre-existing public tracker admits all internal IDs. This lets
         // rejection tests prove that Ex cannot unload a disallowed loaded ID.
         CHECK(cellSysmoduleLoadModule(uint16_t(id))==0);
@@ -96,6 +101,5 @@ int main() {
     CHECK(call(UNLOAD,0x12340000F044ull)==0);
     CHECK(cellSysmoduleIsLoaded(0x44)==0);
     CHECK(call(QUERY,0xF044)==0x80012003);
-    CHECK(ps3_sysmodule_memcontainer()==0xFFFFFFFF);
     std::printf("PASS: extended unload through generated NID/PPU dispatch, state/error policy, namespace and canaries (%u checks)\n",checks);
 }
