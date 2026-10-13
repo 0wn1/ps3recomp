@@ -2054,6 +2054,8 @@ static void release_surfaces(void)
 #define ENG_STAGE_MAX    (384u << 20)
 
 static int s_eng_active;
+/* Certificate for synchronous submissions used by depth readback. */
+static int s_eng_checked_completed;
 
 static id<MTLTexture> s_eng_obj[ENG_MAX_OBJECTS];
 static u32 s_eng_obj_count;
@@ -3029,6 +3031,7 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
  * encoding work. */
 static void eng_encode_and_commit(id<MTLTexture> present_dst)
 {
+    s_eng_checked_completed = 0;
     @autoreleasepool {
         id<CAMetalDrawable> drawable = nil;
         id<MTLTexture> dst = nil;
@@ -3052,6 +3055,10 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
                                       options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        if (!cb || (s_eng_stage_used && !stage)) {
+            if (windowed_present) dispatch_semaphore_signal(s_inflight);
+            return;
+        }
         eng_encode_records(cb, stage);
         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
         if (drawable) [cb presentDrawable:drawable];
@@ -3065,6 +3072,8 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         } else {
             [cb commit];
             [cb waitUntilCompleted];
+            s_eng_checked_completed = [cb status] == MTLCommandBufferStatusCompleted &&
+                                      ![cb error] && !s_eng_dropped;
         }
 
         if (s_eng_dropped) {
@@ -3134,6 +3143,61 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
      fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
 }
 
+/* Read depth through the existing full-size R32Float resolve, then copy the
+ * requested rectangle to CPU-coherent shared storage. Resolving only the ROI
+ * would rescale the source and change its coordinates. Never expose bytes
+ * until both the resolve and the copy have completed successfully. */
+static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+                              float* out, u32 out_pitch)
+{
+    id<MTLTexture> src = eng_obj(depth);
+    if (!s_dev || !s_queue || !src || !out || !w || !h ||
+        s_eng_obj_retired[depth - 1u] || [src pixelFormat] != MTL_DEPTH_FORMAT ||
+        [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
+        [src width] > UINT32_MAX || [src height] > UINT32_MAX ||
+        x >= [src width] || y >= [src height] ||
+        w > [src width] - x || h > [src height] - y ||
+        w > UINT32_MAX / sizeof(float) || out_pitch < w * sizeof(float))
+        return -1;
+    const size_t row_bytes = (size_t)w * sizeof(float);
+    if (row_bytes > SIZE_MAX - 255u) return -1;
+    const size_t copy_pitch = (row_bytes + 255u) & ~(size_t)255u;
+    if (h > SIZE_MAX / copy_pitch ||
+        (size_t)(h - 1u) > (SIZE_MAX - row_bytes) / out_pitch)
+        return -1;
+    @autoreleasepool {
+        id<MTLBuffer> staging = [s_dev newBufferWithLength:copy_pitch * h
+                                                 options:MTLResourceStorageModeShared];
+        if (!staging || ![staging contents]) return -1;
+        const u32 snap = eng_depth_snapshot(user, depth, (u32)[src width],
+                                                        (u32)[src height]);
+        if (!snap) return -1;
+        eng_encode_and_commit(nil);
+        if (!s_eng_checked_completed) { eng_obj_release(user, snap); return -1; }
+        id<MTLTexture> resolved = eng_obj(snap);
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        if (!resolved || [resolved pixelFormat] != MTLPixelFormatR32Float || !cb || !blit) {
+            [blit endEncoding]; eng_obj_release(user, snap); return -1;
+        }
+        [blit copyFromTexture:resolved sourceSlice:0 sourceLevel:0
+                sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(w, h, 1)
+                    toBuffer:staging destinationOffset:0
+         destinationBytesPerRow:copy_pitch destinationBytesPerImage:copy_pitch * h];
+        [blit endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+        const int ok = [cb status] == MTLCommandBufferStatusCompleted && ![cb error];
+        if (ok) {
+            const u8* bytes = [staging contents];
+            for (u32 row = 0; row < h; ++row)
+                memcpy((u8*)out + (size_t)row * out_pitch,
+                       bytes + (size_t)row * copy_pitch, row_bytes);
+        }
+        eng_obj_release(user, snap);
+        return ok ? 0 : -1;
+    }
+}
+
 static const rsx_draw_backend s_engine_backend = {
     .user                 = NULL,
     .init                 = eng_init,
@@ -3148,6 +3212,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_target_create  = eng_depth_target_create,
     .depth_target_release = eng_obj_release,
     .depth_snapshot       = eng_depth_snapshot,
+    .depth_readback       = eng_depth_readback,
     .pipeline_create      = eng_pipeline_create,
     .pipeline_release     = eng_pipeline_release,
     .bind_targets         = eng_bind_targets,
