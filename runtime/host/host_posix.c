@@ -176,6 +176,12 @@ static void guest_w32(uint32_t addr, uint32_t v)
     p[2] = (uint8_t)(v >>  8); p[3] = (uint8_t)v;
 }
 
+static uint32_t guest_r32(uint32_t addr)
+{
+    const uint8_t* p = vm_base + addr;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
 /* One guest VM, with its size published for the OOB guard above. */
 static uint8_t* host_vm_alloc(void)
 {
@@ -1094,7 +1100,7 @@ int main(int argc, char** argv)
 {
     /* frames = 0 runs until the window is closed, which is what the .app
      * bundle uses; a fixed count keeps the CI runs bounded. */
-    int frames = 3, do_draw = 0;
+    int frames = 3, do_draw = 0, io_alias = 0;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--frames=", 9) == 0) frames = atoi(argv[i] + 9);
         else if (strcmp(argv[i], "--draw") == 0)   do_draw = 1;
@@ -1119,6 +1125,13 @@ int main(int argc, char** argv)
          * test. The vertex colour differs from the texture colour, so a
          * backend that ignored the texture fails the assertion below. */
         else if (strcmp(argv[i], "--tex") == 0)    do_draw = 2;
+        /* --tex-io: --tex, after the guest has also asked for the offset of
+         * a VRAM address in the same 1 MB page number as the texture's IO
+         * offset. RSX offsets are two overlapping spaces, and the texture
+         * says main memory: a resolver that guesses VRAM for every page a
+         * local offset was ever derived in reads the texture off the end of
+         * this harness's guest memory. */
+        else if (strcmp(argv[i], "--tex-io") == 0) { do_draw = 2; io_alias = 1; }
         /* --shader: load a guest vertex program and a guest fragment program
          * through the FIFO and draw with them, which exercises the whole
          * decompile -> translate -> compile -> bind path a real title's
@@ -1183,6 +1196,12 @@ int main(int argc, char** argv)
     cellGcmSetDisplayBuffer(0, 0, 1280 * 4, 1280, 720);
 
     guest_w32(CTRL_ADDR + 4, 0);            /* get: start of ring */
+    if (io_alias) {
+        const u32 out = host_alloc(4, 4);
+        cellGcmAddressToOffset(0xC0000000u + TEX_OFFSET, (u32*)(uintptr_t)out);
+        printf("[host] --tex-io: local ea 0x%08X has offset 0x%08X, the texture's page\n",
+               0xC0000000u + TEX_OFFSET, guest_r32(out));
+    }
     if (do_draw == 1) upload_triangle();
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
     if (do_draw == 3) upload_shader_triangle();
