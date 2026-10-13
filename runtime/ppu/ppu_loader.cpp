@@ -3515,19 +3515,30 @@ extern "C" void (*g_ppu_thread_entry_trampoline)(ppu_context*);
  * block; this is the same thing for the static path.
  *
  * ponytail: bump allocator, never freed. A thread's block is dead once it
- * exits, but the window holds dozens and titles create their threads at boot
- * and keep them. Reuse a free list if a title ever churns threads. */
+ * exits, but the 1 MB window holds about 250 page-sized blocks (for a small
+ * TLS image) and titles create their threads at boot and keep them. Reuse a
+ * free list if a title ever churns threads. */
 static uint32_t ppu_tls_new_block(void)
 {
     if (!g_tls_memsz) return 0;                 /* no PT_TLS: nothing to copy */
-    uint32_t total = (g_tls_memsz + 0x7000u + 0xFFFu) & ~0xFFFu;
+    /* A block holds the TLS image only. r13 = base + 0x7000 is the ABI's bias
+     * (the guest addresses TLS as r13 - 0x7000 + off with off < memsz), not
+     * storage: counting the 0x7000 in the size made every block 0x8000, so the
+     * 1 MB window held 31 threads and the 32nd onwards shared the main block. */
+    uint32_t total = (g_tls_memsz + 0xFFFu) & ~0xFFFu;
     uint32_t lim   = 0x11000000u;               /* same bound the main block uses */
     if (ppu_vm_size && ppu_vm_size < lim) lim = ppu_vm_size;
     /* Threads are created concurrently, so hand out offsets atomically. */
     static uint32_t s_bump = 0;
     uint32_t off  = __atomic_fetch_add(&s_bump, total, __ATOMIC_RELAXED);
     uint32_t base = PPU_TLS_IMG + total + off;  /* main block occupies the first */
-    if (base + total > lim) return 0;           /* out of room: share, as before */
+    if (base + total > lim) {                   /* out of room: share, as before */
+        static int s_warned = 0;
+        if (!__atomic_exchange_n(&s_warned, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[ppu] TLS window full after %u thread blocks: later "
+                    "threads share the main thread's TLS\n", (unsigned)(off / total));
+        return 0;
+    }
     if (g_tls_filesz) memcpy(vm_base + base, vm_base + g_tls_vaddr, g_tls_filesz);
     if (g_tls_memsz > g_tls_filesz)
         memset(vm_base + base + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
