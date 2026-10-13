@@ -220,6 +220,10 @@ jobs:
           # plausible and still fails here. Exercises rsx_texture_layout and
           # rsx_texture_decode end to end with no GPU involved.
           ./build/ps3recomp_host --tex
+          # The same texture after the guest also derived a VRAM offset in its
+          # 1 MB page number: the texture says main memory, so it must still
+          # resolve through the IO map rather than into VRAM.
+          ./build/ps3recomp_host --tex-io
           # A polygon and a quad strip, neither of which any host API draws:
           # both have to be expanded into triangles first. The pentagon is
           # green and the strip red over it, and the centre pixel belongs to
@@ -329,6 +333,23 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_lockline_peer
+
+      # A task parked in WAIT_SIGNAL, signalled by another SPU. libspurs does
+      # that with PUTLLC on the taskset line, which never woke the parked
+      # task's host thread: it saw the signal only when its 1 s wait timed out.
+      - name: Run the SPURS task wake test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_taskset_wake \
+            runtime/spu/tests/test_spu_taskset_wake.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spu_taskset_wake
 
       # A thread group starting its threads on their image's LIFTED code. This
       # is the path a real title needs and the one that used to be missing: the
