@@ -1482,6 +1482,33 @@ static void hle_cellSaveDataUserAutoLoad(ppu_context* ctx)
                               container, (void*)(uintptr_t)userdata);
 }
 
+/* UserAutoSave takes the same nine arguments as UserAutoLoad. Through the
+ * generic eight-argument binding the ninth (userdata) is lost, so the title's
+ * stat and file callbacks see cbResult->userdata == 0. */
+static void hle_cellSaveDataUserAutoSave(ppu_context* ctx)
+{
+    u32   version   = (u32)ctx->gpr[3];
+    u32   userId    = (u32)ctx->gpr[4];
+    const char* dir = (const char*)(uintptr_t)(u32)ctx->gpr[5];
+    u32   errDialog = (u32)ctx->gpr[6];
+    void* setBuf    = (void*)(uintptr_t)(u32)ctx->gpr[7];
+    void* funcStat  = (void*)(uintptr_t)(u32)ctx->gpr[8];
+    void* funcFile  = (void*)(uintptr_t)(u32)ctx->gpr[9];
+    u32   container = (u32)ctx->gpr[10];
+    uint32_t userdata = savedata_arg9(ctx);
+
+    printf("[cellSaveData] UserAutoSave(user=%u, userdata=0x%08X)\n", userId, userdata);
+    /* cellSaveDataAutoSave, not AutoSave2: AutoSave2 maps dirName to a host
+     * pointer and passes it on to AutoSave, which maps it again; a host
+     * address below 4 GiB would then be read as a guest one. */
+    ctx->gpr[3] = (uint64_t)(int64_t)(s32)
+        cellSaveDataAutoSave(version, dir, errDialog,
+                             (CellSaveDataSetBuf*)setBuf,
+                             (CellSaveDataStatCallback)funcStat,
+                             (CellSaveDataFileCallback)funcFile,
+                             container, (void*)(uintptr_t)userdata);
+}
+
 /* ListAutoLoad's ninth argument is in the guest parameter save area. */
 void ps3_savedata_list_auto_load(ppu_context* ctx)
 {
@@ -1501,6 +1528,8 @@ void cellSaveData_register_ctx_handlers(void)
      * before the generic table. */
     ps3_hle_register_ctx(0xCDC6AEFDu, "cellSaveDataUserAutoLoad",
                          hle_cellSaveDataUserAutoLoad);
+    ps3_hle_register_ctx(0x52AAC4FAu, "cellSaveDataUserAutoSave",
+                         hle_cellSaveDataUserAutoSave);
 }
 
 s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
