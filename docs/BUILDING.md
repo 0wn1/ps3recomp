@@ -311,9 +311,8 @@ With guest programs on, the backend runs on the register-file draw engine
 render-to-texture, MRT, depth textures, cube maps, vertex compaction and pipeline keys,
 and every `ps3recomp_host` scene passes. Not handled yet, and logged once when
 a title reaches them: vertex-texture units, colour targets other
-than RGBA8 and RGBA16F (the FP16 HDR target), depth-only passes, stencil (the depth
-format has no stencil aspect), and depth snapshots on devices whose depth
-format is not `D32_SFLOAT`. Everything is submitted synchronously for now:
+than RGBA8 and RGBA16F (the FP16 HDR target), depth-only passes, stencil on the vtable path, and depth snapshots on devices
+whose depth format is neither `D32_SFLOAT` nor `D32_SFLOAT_S8_UINT`. Everything is submitted synchronously for now:
 correct first, fast later.
 
 ### `RSX_LIVE_DRAW` is not required

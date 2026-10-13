@@ -2427,7 +2427,8 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
     (void)user;
     vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
     if (!z || !out || !w || !h || x + w > z->w || y + h > z->h ||
-        out_pitch < w * 4u || s_vk.depth_format != VK_FORMAT_D32_SFLOAT)
+        out_pitch < w * 4u || (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
+                                  s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT))
         return -1;
     vk_buffer st = {0};
     if (vk_create_host_buffer(&st, (VkDeviceSize)w * h * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
@@ -2435,7 +2436,7 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
     }
     int rc = vk_begin();
     if (!rc) {
-        vk_barrier_image(z->im.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy region = {
             .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
             .imageOffset = { (int32_t)x, (int32_t)y, 0 }, .imageExtent = { w, h, 1 },
