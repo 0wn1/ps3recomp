@@ -249,22 +249,32 @@ int main(void)
     /* P2P streams: an instance's listener and the socket it connects out
      * with share its P2P port, so the peer accepts a connection whose source
      * port is the P2P port signaling reported -- titles check it. */
+    /* Each run needs fresh TCP endpoints: macOS keeps the previous fixed
+     * source/destination pair in TIME_WAIT when this fixture runs twice. */
+    s_p2p_port = 0;
     int32_t l1 = C3("socket", SYS_NET_AF_INET, 10 /* SOCK_STREAM_P2P */, 0);
     put_sockaddr(ADDR_A, LOOP, 4099);
     assert(C3("bind", l1, ADDR_A, 16) == 0 && C1("listen", l1) == 0);
-    s_p2p_port = 36659;
+    vm_write32(LEN, 16);
+    assert(C3("getsockname", l1, ADDR_B, LEN) == 0);
+    uint16_t port_l1 = vm_read16(ADDR_B + 2);
+    assert(port_l1 != 0);
     int32_t l2 = C3("socket", SYS_NET_AF_INET, 10, 0);
     int32_t out = C3("socket", SYS_NET_AF_INET, 10, 0);
     assert(C3("bind", l2, ADDR_A, 16) == 0 && C1("listen", l2) == 0);
+    vm_write32(LEN, 16);
+    assert(C3("getsockname", l2, ADDR_B, LEN) == 0);
+    s_p2p_port = vm_read16(ADDR_B + 2);
+    assert(s_p2p_port != 0 && s_p2p_port != port_l1);
     assert(C3("bind", out, ADDR_A, 16) == 0);
     vm_write32(LEN, 16);
-    assert(C3("getsockname", out, ADDR_B, LEN) == 0 && vm_read16(ADDR_B + 2) == 36659);
-    vm_write16(ADDR_A + 8, 36658);               /* vport = the peer's P2P port */
+    assert(C3("getsockname", out, ADDR_B, LEN) == 0 && vm_read16(ADDR_B + 2) == s_p2p_port);
+    vm_write16(ADDR_A + 8, port_l1);            /* vport = the peer's P2P port */
     assert(C3("connect", out, ADDR_A, 16) == 0);
     vm_write32(LEN, 16);
     int32_t in = C3("accept", l1, ADDR_B, LEN);
-    assert(in >= 0 && vm_read16(ADDR_B + 2) == 36659 && vm_read16(ADDR_B + 8) == 36659);
-    s_p2p_port = 36658;
+    assert(in >= 0 && vm_read16(ADDR_B + 2) == s_p2p_port && vm_read16(ADDR_B + 8) == s_p2p_port);
+    s_p2p_port = port_l1;
 
     /* A stream a peer opened through psnr's relay arrives as a connected host
      * socket: the P2P listener turns readable, and accept hands it out as the
