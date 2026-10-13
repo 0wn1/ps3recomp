@@ -129,8 +129,15 @@ set(SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu" CACHE PATH
     "Directory holding the lifted SPU images (<SPU_DIR>/<image>/spu_recomp.c)")
 option(PORT_ENABLE_SPU "Compile and register the title's lifted SPU images" ON)
 
+set(PORT_SPU_INPUTS "" CACHE STRING
+    "Input files to scan for all embedded SPU ELF programs (semicolon-separated decrypted ELF/PRX/data paths)")
 set(SPU_SOURCES "")
-if(PORT_ENABLE_SPU)
+if(PORT_ENABLE_SPU AND PORT_SPU_INPUTS)
+    include("${PS3RECOMP_DIR}/cmake/PS3RecompSPU.cmake")
+    ps3recomp_generate_spu("${CMAKE_CURRENT_BINARY_DIR}/generated_spu" ${PORT_SPU_INPUTS})
+    list(APPEND SPU_SOURCES ${SPU_GENERATED_SOURCES}
+         "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
+elseif(PORT_ENABLE_SPU)
     file(GLOB SPU_LIFTED CONFIGURE_DEPENDS "${SPU_DIR}/*/spu_recomp.c")
     if(SPU_LIFTED)
         list(LENGTH SPU_LIFTED SPU_IMAGE_COUNT)
