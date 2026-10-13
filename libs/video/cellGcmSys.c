@@ -2668,14 +2668,16 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
         return CELL_GCM_ERROR_INVALID_ALIGNMENT;
     }
 
-    /* Allocate a fresh IO region past the Init command-buffer window. */
-    u32 io_offset = gcm_io_alloc(size);
-
+    /* A free slot first, then the IO region: allocating the region before
+     * the slot check leaked IO space on every refused call. */
     IoMapping* mapping = find_free_mapping();
     if (!mapping) {
         printf("[cellGcmSys] WARNING: no free IO mapping slots\n");
         return CELL_GCM_ERROR_FAILURE;
     }
+
+    /* Allocate a fresh IO region past the Init command-buffer window. */
+    u32 io_offset = gcm_io_alloc(size);
 
     mapping->ea     = ea;
     mapping->io     = io_offset;
@@ -3501,11 +3503,11 @@ u32 cellGcm_control_guest_addr(void) { return GCM_CONTROL_GUEST_ADDR; }
 void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
 {
     populate_offset_table(ea, io, size);
-    if (s_io_mapping_count < CELL_GCM_MAX_IO_MAPPINGS) {
-        s_io_mappings[s_io_mapping_count].ea     = ea;
-        s_io_mappings[s_io_mapping_count].io     = io;
-        s_io_mappings[s_io_mapping_count].size   = size;
-        s_io_mappings[s_io_mapping_count].active = 1;
+    /* A free slot, not s_io_mappings[count]: an unmap leaves a hole, and the
+     * count then indexes a live slot. */
+    IoMapping* m = find_free_mapping();
+    if (m) {
+        m->ea = ea; m->io = io; m->size = size; m->active = 1;
         s_io_mapping_count++;
     }
     if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }
