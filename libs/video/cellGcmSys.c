@@ -277,6 +277,26 @@ static CellGcmZcullInfo s_zcull[CELL_GCM_MAX_ZCULL_COUNT];
 /* Report data area (256 slots, each 16 bytes) */
 static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
 
+/* NV4097_SET_CONTEXT_DMA_REPORT (0x1A8): where NV4097_GET_REPORT writes.
+ * Local (0xFEED0000, the default): the s_report_data slots above, read back
+ * through cellGcmGetReport* / cellGcmGetReportDataAddress. Main memory
+ * (0xFEED0001, or CELL_GCM_CONTEXT_DMA_REPORT_LOCATION_MAIN 0xBAD68000): the
+ * report's 24-bit offset is an IO offset, and the 16-byte report goes to
+ * guest memory at gcm_io2ea(offset), where the title reads it itself.
+ * Killzone 3 sets 0xFEED0001 and keeps its reports in its own frame data. */
+static u32 s_report_dma = 0xFEED0000u;
+static u64 s_report_last_ts;
+
+/* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
+ * walker pass must not share a time stamp or go backwards. */
+static u64 gcm_report_timestamp(void)
+{
+    u64 t = get_timestamp_ns();
+    if (t <= s_report_last_ts) t = s_report_last_ts + 1u;
+    s_report_last_ts = t;
+    return t;
+}
+
 /* Label area (256 labels, each u32). Labels live in GUEST memory so the
  * recompiled game can poll them via vm_read32; cellGcmGetLabelAddress returns a
  * guest address into this window (16-byte spaced as on hardware). A host array
@@ -419,6 +439,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
+    s_report_dma = 0xFEED0000u;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
@@ -1936,12 +1957,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * area. Sample counts are not measured, so a ZPASS query
                      * reports "visible" -- the conservative answer; reading 0
                      * tells the title every queried object is occluded. */
+                    if (m == 0x1A8) s_report_dma = vm_read32(dea);
                     if (m == 0x1800) {
-                        const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
-                        { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
-                        if (idx < CELL_GCM_MAX_REPORT_COUNT) {
-                            s_report_data[idx].timestamp = get_timestamp_ns();
-                            s_report_data[idx].value = (v >> 24) == 1u ? 0xFFFFu : 0u;
+                        const u32 v = vm_read32(dea), off = v & 0xFFFFFFu, idx = off / 16u;
+                        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+                        const u64 ts = gcm_report_timestamp();
+                        const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
+                        { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+                        if (main_mem) {
+                            /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
+                            const u32 rea = gcm_io2ea(off);
+                            if (rea) {
+                                vm_write32(rea, (u32)(ts >> 32));
+                                vm_write32(rea + 4u, (u32)ts);
+                                vm_write32(rea + 8u, val);
+                                vm_write32(rea + 12u, 0u);
+                            } else { static int un = 0; if (un++ < 4) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
+                        } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+                            s_report_data[idx].timestamp = ts;
+                            s_report_data[idx].value = val;
                         }
                     }
                 } else
@@ -3162,6 +3196,7 @@ void cellGcmTerminate(void)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
+    s_report_dma = 0xFEED0000u;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
