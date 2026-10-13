@@ -756,12 +756,17 @@ static u32 gcm_io2ea(u32 io)
 
 /* RSX get pointer (IO offset) + one-deep CALL return slot. The FIFO-wrap
  * recycle path teleports these when it resets a ring without a JUMP command. */
+/* Milliseconds on a monotonic clock, for the runtime's own timeouts and rate
+ * logs. Off Windows this returned 0, so every interval measured with it was
+ * 0 there: rate logs never printed and timeouts never expired. */
 unsigned long long ps3_ms_now(void)
 {
 #ifdef _WIN32
     return (unsigned long long)GetTickCount64();
 #else
-    return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
 #endif
 }
 
