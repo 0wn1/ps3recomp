@@ -91,6 +91,8 @@ typedef struct {
     u32 last_released;
     float last_clear_depth;
     int n_depth_readback;
+    u32 color_w, color_h;         /* size of the last colour surface created */
+    float vp_xf[8];               /* viewport epilogue after the VS constants */
 } StubState;
 
 static StubState stub;
@@ -138,8 +140,9 @@ static void stub_texture_release(void* u, u32 handle)
 static u32 stub_color_create(void* u, rsx_be_format f, u32 w, u32 h,
                              const void* seed, u32 seed_row)
 {
-    (void)u; (void)f; (void)w; (void)h; (void)seed_row;
+    (void)u; (void)f; (void)seed_row;
     stub.n_color_create++;
+    stub.color_w = w; stub.color_h = h;
     if (seed) stub.n_color_seeded++;
     stub.last_created_color = stub_handle();
     return stub.last_created_color;
@@ -181,7 +184,12 @@ static void stub_bind_targets(void* u, const u32* s, u32 count, u32 d)
     stub.bound_depth = d;
 }
 static void stub_bind_pipeline(void* u, u32 p) { (void)u; stub.bound_pipeline = p; }
-static void stub_bind_vs(void* u, const void* d, u32 n) { (void)u; (void)d; (void)n; }
+static void stub_bind_vs(void* u, const void* d, u32 n)
+{
+    (void)u;
+    if (d && n >= RSX_DSP_NUM_CONSTANTS * 16u + sizeof stub.vp_xf)
+        memcpy(stub.vp_xf, (const u8*)d + RSX_DSP_NUM_CONSTANTS * 16u, sizeof stub.vp_xf);
+}
 static void stub_bind_ps(void* u, const void* d, u32 n) { (void)u; (void)d; (void)n; }
 
 static void stub_bind_textures(void* u, const u32* tex,
@@ -1077,6 +1085,56 @@ static void test_depth_clear_value(void)
     engine_down();
 }
 
+/* ---- 9b. antialiased surfaces at sample resolution ------------------------ */
+
+#define M_VIEWPORT_TRANSLATE  0x0A20
+#define M_VIEWPORT_SCALE      0x0A30
+
+static void mf(u32 method, float f) { u32 w; memcpy(&w, &f, 4); m(method, w); }
+
+/* An antialiased surface holds its sample grid in memory (SURFACE_FORMAT
+ * bits 12-15: 3 = 2x1, 4 and 5 = 2x2), so a texture reading it sees that
+ * size. The surface is created at sample resolution; the viewport and
+ * scissor registers stay in guest pixels and are scaled to match. */
+static void test_antialiased_surface(void)
+{
+    printf("-- antialiased surface\n");
+    static const struct { u32 aa, w, h, sx, sy; } cases[] = {
+        { 0, 128,  64, 1, 1 },     /* CENTER_1 */
+        { 3, 256,  64, 2, 1 },     /* DIAGONAL_CENTERED_2 */
+        { 4, 256, 128, 2, 2 },     /* SQUARE_CENTERED_4 */
+        { 5, 256, 128, 2, 2 },     /* SQUARE_ROTATED_4 */
+    };
+    for (u32 i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        engine_up();
+        m(M_SURFACE_FORMAT, 8u | (cases[i].aa << 12));
+        m(M_SURFACE_CLIP_H, 128u << 16);
+        m(M_SURFACE_CLIP_V, 64u << 16);
+        m(M_COLOR_A_OFFSET, 0x80000u);
+        m(M_SCISSOR_H, 8u | (32u << 16));
+        m(M_SCISSOR_V, 4u | (16u << 16));
+        /* The whole 128x64-pixel viewport. */
+        mf(M_VIEWPORT_TRANSLATE + 0, 64.0f); mf(M_VIEWPORT_TRANSLATE + 4, 32.0f);
+        mf(M_VIEWPORT_SCALE + 0, 64.0f);     mf(M_VIEWPORT_SCALE + 4, -32.0f);
+        draw_triangle();
+        CHECK(stub.color_w == cases[i].w && stub.color_h == cases[i].h,
+              "antialias %u: a 128x64 surface is created at %ux%u (got %ux%u)",
+              cases[i].aa, cases[i].w, cases[i].h, stub.color_w, stub.color_h);
+        CHECK(stub.scissor[0] == 8u * cases[i].sx && stub.scissor[1] == 4u * cases[i].sy &&
+              stub.scissor[2] == 32u * cases[i].sx && stub.scissor[3] == 16u * cases[i].sy,
+              "antialias %u: scissor 8,4 32x16 covers %u,%u %ux%u samples (got %u,%u %ux%u)",
+              cases[i].aa, 8u * cases[i].sx, 4u * cases[i].sy, 32u * cases[i].sx,
+              16u * cases[i].sy, stub.scissor[0], stub.scissor[1], stub.scissor[2],
+              stub.scissor[3]);
+        CHECK(stub.vp_xf[0] == 1.0f && stub.vp_xf[1] == 1.0f &&
+              stub.vp_xf[4] == 0.0f && stub.vp_xf[5] == 0.0f,
+              "antialias %u: the full-pixel viewport still maps to the whole surface "
+              "(scale %g,%g offset %g,%g)", cases[i].aa, stub.vp_xf[0], stub.vp_xf[1],
+              stub.vp_xf[4], stub.vp_xf[5]);
+        engine_down();
+    }
+}
+
 /* ---- 10. a zeta or a target read in a texture format of its own --------- */
 
 static void test_depth_read_as_color(void)
@@ -1174,6 +1232,7 @@ int main(void)
     test_transfer_coherence();
     test_inline_array();
     test_depth_clear_value();
+    test_antialiased_surface();
     test_depth_read_as_color();
     test_color_read_as_float();
 
