@@ -156,6 +156,7 @@ typedef struct vk_state {
     vk_image         color;           /* R8G8B8A8_UNORM                 */
     vk_image         depth;           /* D32_SFLOAT or fallback         */
     VkFormat         depth_format;
+    VkImageAspectFlags depth_aspect;  /* DEPTH, plus STENCIL if it has one  */
 
     VkRenderPass     render_pass;
     VkFramebuffer    framebuffer;
@@ -732,7 +733,11 @@ static void vk_cb_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
  * -------------------------------------------------------------------------*/
 static int vk_pick_depth_format(void)
 {
+    /* With stencil first -- titles use it for shadows, reflections and UI
+     * masks -- and D32 first within each group: a D32 depth aspect copies out
+     * as 32-bit floats, which is what depth snapshots are built from. */
     static const VkFormat candidates[] = {
+        VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT,
         VK_FORMAT_D32_SFLOAT, VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D16_UNORM
     };
     const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
@@ -741,7 +746,7 @@ static int vk_pick_depth_format(void)
         VkFormatProperties fp;
         pvkGetPhysicalDeviceFormatProperties(s_vk.phys, candidates[i], &fp);
         if ((fp.optimalTilingFeatures & need) == need) {
-            s_vk.depth_format = candidates[i]; return 0;
+            s_vk.depth_format = candidates[i]; goto chosen;
         }
     }
     /* TRANSFER_DST is a 1.1 format feature bit; 1.0 drivers may not report
@@ -750,11 +755,17 @@ static int vk_pick_depth_format(void)
         VkFormatProperties fp;
         pvkGetPhysicalDeviceFormatProperties(s_vk.phys, candidates[i], &fp);
         if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
-            s_vk.depth_format = candidates[i]; return 0;
+            s_vk.depth_format = candidates[i]; goto chosen;
         }
     }
     VK_LOG("no usable depth format\n");
     return -1;
+chosen:
+    s_vk.depth_aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (s_vk.depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+        s_vk.depth_format == VK_FORMAT_D24_UNORM_S8_UINT)
+        s_vk.depth_aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    return 0;
 }
 
 static int vk_create_render_pass(void)
@@ -767,8 +778,8 @@ static int vk_create_render_pass(void)
           .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL },
         { .format = s_vk.depth_format, .samples = VK_SAMPLE_COUNT_1_BIT,
           .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD,     /* ignored without stencil */
+          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
           .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL },
     };
     VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_GENERAL };
@@ -1466,7 +1477,7 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
 
     if (vk_begin()) return 0;
     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    vk_barrier_image(s_vk.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(s_vk.depth.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = s_vk.render_pass, .framebuffer = s_vk.framebuffer,
                                   .renderArea = { { 0, 0 }, { s_vk.width, s_vk.height } } };
@@ -1511,7 +1522,7 @@ static void vk_draw(u32 prim, u32 first, u32 count)
 
     if (vk_begin()) return;
     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    vk_barrier_image(s_vk.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(s_vk.depth.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = s_vk.render_pass, .framebuffer = s_vk.framebuffer,
                                   .renderArea = { { 0, 0 }, { s_vk.width, s_vk.height } } };
@@ -1573,7 +1584,7 @@ static void vk_cb_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     if (do_depth) {
         VkClearDepthStencilValue d = { depth, 0 };
         VkImageSubresourceRange r = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-        vk_barrier_image(s_vk.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(s_vk.depth.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
         pvkCmdClearDepthStencilImage(s_vk.cmd, s_vk.depth.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
     }
     vk_submit_and_wait();
@@ -2119,15 +2130,15 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
     if (vk_create_image(&o->im, s_vk.depth_format, w, h,
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                        VK_IMAGE_ASPECT_DEPTH_BIT)) {
+                        s_vk.depth_aspect)) {
         vk_destroy_image(&o->im); return 0;
     }
     o->kind = VK_ENG_DEPTH; o->fmt = s_vk.depth_format; o->w = w; o->h = h;
     /* Far plane, for the reason the display depth starts there. */
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
-    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
-    VkImageSubresourceRange r = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    VkImageSubresourceRange r = { s_vk.depth_aspect, 0, 1, 0, 1 };
     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
     if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
     return hd;
@@ -2164,12 +2175,15 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
 static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
                                        float depth_value, u8 stencil)
 {
-    (void)user; (void)stencil;      /* E1: no stencil in the depth format yet */
+    (void)user;
     vk_eng_obj* o = vk_eng_get(depth, VK_ENG_DEPTH);
-    if (!o || !(flags & RSX_BE_CLEAR_DEPTH) || vk_begin()) return;
-    VkClearDepthStencilValue d = { depth_value, 0 };
-    VkImageSubresourceRange r = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageAspectFlags aspect = 0;
+    if (flags & RSX_BE_CLEAR_DEPTH) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
+    if (!o || !aspect || vk_begin()) return;
+    VkClearDepthStencilValue d = { depth_value, stencil };
+    VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
+    vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
     vk_submit_and_wait();
 }
@@ -2346,7 +2360,8 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
 {
     vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
     if (!z) return 0;
-    if (s_vk.depth_format != VK_FORMAT_D32_SFLOAT) {
+    if (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
+        s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) {
         static int warned_fmt;
         if (!warned_fmt) { VK_LOG("engine: depth snapshots need D32_SFLOAT, this device uses %d\n",
                                   (int)s_vk.depth_format); warned_fmt = 1; }
@@ -2384,7 +2399,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     }
     int rc = vk_begin();
     if (!rc) {
-        vk_barrier_image(z->im.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
         vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy out = { .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
                                   .imageExtent = { w, h, 1 } };
@@ -2528,8 +2543,11 @@ static VkRenderPass vk_eng_render_pass(VkFormat cf, u32 n)
             .format = (i < n) ? cf : s_vk.depth_format,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            /* Stencil lives across draws like depth does (a title writes it in
+             * one pass and tests it in the next); ignored for colour and for
+             * depth formats without stencil. */
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
             .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL };
         if (i < n) cref[i] = (VkAttachmentReference){ i, VK_IMAGE_LAYOUT_GENERAL };
     }
@@ -2919,11 +2937,11 @@ static VkImageView vk_eng_scratch_depth(u32 w, u32 h)
     vk_destroy_image(&s_e2.scratch_depth);
     if (vk_create_image(&s_e2.scratch_depth, s_vk.depth_format, w, h,
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        VK_IMAGE_ASPECT_DEPTH_BIT) || vk_begin())
+                        s_vk.depth_aspect) || vk_begin())
         return VK_NULL_HANDLE;
-    vk_barrier_image(s_e2.scratch_depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    vk_barrier_image(s_e2.scratch_depth.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
-    VkImageSubresourceRange r = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    VkImageSubresourceRange r = { s_vk.depth_aspect, 0, 1, 0, 1 };
     pvkCmdClearDepthStencilImage(s_vk.cmd, s_e2.scratch_depth.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
     if (vk_submit_and_wait()) return VK_NULL_HANDLE;
     s_e2.scratch_w = w; s_e2.scratch_h = h;
@@ -3271,7 +3289,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return -1;
     if (vk_create_image(&s_vk.depth, s_vk.depth_format, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT)) return -1;
+                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, s_vk.depth_aspect)) return -1;
     if (vk_create_host_buffer(&s_vk.readback, (VkDeviceSize)s_vk.width * s_vk.height * 4u,
                               VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return -1;
     if (vk_create_render_pass()) return -1;
@@ -3288,11 +3306,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * null backend makes the same choice). */
     if (vk_begin()) return -1;
     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-    vk_barrier_image(s_vk.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    vk_barrier_image(s_vk.depth.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
     VkImageSubresourceRange cr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    VkImageSubresourceRange dr = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    VkImageSubresourceRange dr = { s_vk.depth_aspect, 0, 1, 0, 1 };
     pvkCmdClearColorImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &cr);
     pvkCmdClearDepthStencilImage(s_vk.cmd, s_vk.depth.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &dr);
     if (vk_submit_and_wait()) return -1;
