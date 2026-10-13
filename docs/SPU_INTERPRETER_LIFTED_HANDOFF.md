@@ -79,10 +79,8 @@ and halts do not necessarily hard-unwind the outer driver. The controls record
 that existing behavior deliberately. This patch does not change `spu_stop`,
 whose default lifted behavior differs from its optional hard-unwind mode.
 
-Native MAG evidence motivating the fixture showed WWS policy image 101 ending
-RUNNING at lifted helper entries LS `0x2EF8` and `0x1770` after interpreted job
-code had run. A separate marker observation identified renderer workload 6
-waiting for completion. The synthetic fixture proves a runtime handoff defect
-consistent with those observations; it does not establish that this change
-alone fixes that title's wait, completes its jobs, or produces rendering.
-No native title execution is part of this branch's validation.
+The motivating native observation was a context left RUNNING at a registered
+lifted helper after interpreted code had run. The synthetic fixture proves a
+runtime handoff defect consistent with that observation. It does not establish
+that this change alone resolves a title's wait, completes its jobs, or produces
+rendering. No native title execution is part of this branch's validation.
