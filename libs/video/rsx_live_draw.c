@@ -7465,15 +7465,21 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_DEPTH);
         if (mask & RSX_CLEAR_STENCIL)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_STENCIL);
-        /* ZSTENCIL_CLEAR_VALUE (Z24S8 layout: depth24 << 8 | stencil8; nv40
-         * reset 0xFFFFFF00 = depth 1.0, stencil 0 — so never-written streams
-         * keep the old hardcoded behaviour). Previously decoded upstream but
-         * discarded here: every guest depth clear forced 1.0/0. */
+        /* ZSTENCIL_CLEAR_VALUE is laid out as the zeta is: depth24 << 8 |
+         * stencil8 for Z24S8, a bare depth16 for Z16 (SURFACE_FORMAT depth
+         * field 1). Read as Z24S8, a Z16 surface's 0xFFFF -- its far plane --
+         * would clear it to 255/16777215, nearly the near plane, and every
+         * LESS or LEQUAL draw into it would then fail. The nv40 reset
+         * 0xFFFFFF00 seeded by rsx_dispatch_init clears to 1.0 / 0. Same
+         * decode as the draw engine's clear. */
         {
             const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
-            const float cd = (float)(zs >> 8) / 16777215.0f;
+            const int z16 = sf.depth_format == 1u;
+            const float cd = !zs ? 1.0f
+                           : z16 ? (float)(zs & 0xFFFFu) / 65535.0f
+                                 : (float)(zs >> 8) / 16777215.0f;
             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
-                clear_flags, zs ? cd : 1.0f, (UINT8)(zs & 0xFFu), 0, NULL);
+                clear_flags, cd, z16 ? (UINT8)0 : (UINT8)(zs & 0xFFu), 0, NULL);
         }
         if (zslot) {
             g.zdepths[zslot - 1].cleared = 1;
