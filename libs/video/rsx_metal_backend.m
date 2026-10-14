@@ -52,6 +52,7 @@
 #  import <AppKit/AppKit.h>
 #endif
 
+#include <stdatomic.h>
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 #include "rsx_vertex_fetch.h"
@@ -73,7 +74,10 @@ static id<MTLTexture>      s_offscreen;  /* headless only   */
 static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
 static NSWindow*           s_window;
 static int                 s_headless;
-static int                 s_closed;
+static atomic_int          s_closed;
+#if !TARGET_OS_IPHONE
+static id                  s_window_close_observer;
+#endif
 static int                 s_ready;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
@@ -459,6 +463,28 @@ static int create_offscreen(void)
 }
 
 #if !TARGET_OS_IPHONE
+/* Visibility also changes for hide/order-out/minimize. Only an actual
+ * close of this backend's window ends its presentation session. */
+static void window_close_observer_stop(void)
+{
+    if (s_window_close_observer) {
+        [[NSNotificationCenter defaultCenter] removeObserver:s_window_close_observer];
+        s_window_close_observer = nil;
+    }
+}
+
+static void window_close_observer_start(NSWindow* window)
+{
+    window_close_observer_stop();
+    atomic_store(&s_closed, 0);
+    s_window_close_observer = [[NSNotificationCenter defaultCenter]
+        addObserverForName:NSWindowWillCloseNotification object:window queue:nil
+        usingBlock:^(NSNotification* note) {
+            (void)note;
+            atomic_store(&s_closed, 1);
+        }];
+}
+
 static int create_window_impl(const char* title)
 {
     [NSApplication sharedApplication];
@@ -472,6 +498,7 @@ static int create_window_impl(const char* title)
                     backing:NSBackingStoreBuffered
                       defer:NO];
     if (!s_window) return -1;
+    window_close_observer_start(s_window);
 
     [s_window setTitle:[NSString stringWithUTF8String:(title ? title : "ps3recomp")]];
     [s_window center];
@@ -3279,7 +3306,12 @@ void rsx_metal_backend_shutdown(void)
             s_inflight = nil;
         }
 #if !TARGET_OS_IPHONE
-        if (s_window) { [s_window close]; s_window = nil; }
+        void (^stop_window)(void) = ^{
+            window_close_observer_stop();
+            if (s_window) { [s_window close]; s_window = nil; }
+        };
+        if ([NSThread isMainThread]) stop_window();
+        else dispatch_sync(dispatch_get_main_queue(), stop_window);
 #endif
         free(s_verts); s_verts = NULL;
         free(s_cb); s_cb = NULL; s_cb_used = s_cb_cap = 0;
@@ -3314,15 +3346,14 @@ static int pump_messages_impl(void)
             if (!ev) break;
             [NSApp sendEvent:ev];
         }
-        if (s_window && ![s_window isVisible]) s_closed = 1;
     }
 #endif
-    return s_closed ? -1 : 0;
+    return atomic_load(&s_closed) ? -1 : 0;
 }
 
 int rsx_metal_backend_pump_messages(void)
 {
-    if (s_headless || !s_ready) return s_closed ? -1 : 0;
+    if (s_headless || !s_ready) return 0;
 #if !TARGET_OS_IPHONE
     if ([NSThread isMainThread])
         return pump_messages_impl();
