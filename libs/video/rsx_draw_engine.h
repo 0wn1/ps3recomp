@@ -106,6 +106,7 @@ typedef struct rsx_be_render_state {
 
 /* ---- the backend interface ---------------------------------------------- */
 
+#define RSX_BE_HAS_COLOR_SNAPSHOT 1
 typedef struct rsx_draw_backend {
     void* user;
 
@@ -218,6 +219,12 @@ typedef struct rsx_draw_backend {
      * DEPTH16); left NULL, such a texture reads guest memory as it is. */
     int  (*depth_readback)(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                            float* out, u32 out_pitch);
+    /* Optional same-target colour feedback. Return a fresh, immutable texture
+     * of the target's full physical extent and storage format. Its GPU copy
+     * must execute after all preceding writes and before the next draw. The
+     * engine owns the returned handle and releases it with texture_release.
+     * 0 rejects the consuming draw; NULL retains the legacy guest-upload route. */
+    u32 (*color_snapshot)(void* user, u32 surface);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
