@@ -1334,6 +1334,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
+    const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
+        rsx_dsp_reg(&g.rsx, 0x1FECu), fp_ctrl,
+        rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu);
     const u32 cube_mask = eng_cube_mask();
     const u32 vtex_mask = eng_vtex_mask();
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
@@ -1358,6 +1361,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (!key) return 0;
         const u32 fp_ctrl_key = fp_ctrl & 0x40u;
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
+        if (srgb_output) key = eng_fnv1a(&srgb_output, sizeof srgb_output, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
@@ -1394,6 +1398,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
+            fi = -1;
+        if (fi > 0 && srgb_output &&
+            rsx_fp_apply_srgb_output(s_ps_hlsl, sizeof s_ps_hlsl) < 0)
             fi = -1;
         if (fi > 0 && rs->alpha_test_enable &&
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
