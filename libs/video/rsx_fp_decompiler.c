@@ -72,7 +72,7 @@ enum {
     OP_LIT=0x1E, OP_LRP=0x1F, OP_STR=0x20, OP_SFL=0x21, OP_COS=0x22,
     OP_SIN=0x23, OP_PK2H=0x24, OP_UP2H=0x25, OP_POW=0x26, OP_PK4UB=0x27,
     OP_UP4UB=0x28, OP_PK2US=0x29, OP_UP2US=0x2A, OP_DP2A=0x2E, OP_TXL=0x2F,
-    OP_TXB=0x31, OP_RFL=0x36, OP_DP2=0x38, OP_NRM=0x39, OP_DIV=0x3A,
+    OP_TXB=0x31, OP_TEXBEM=0x33, OP_TXPBEM=0x34, OP_RFL=0x36, OP_DP2=0x38, OP_NRM=0x39, OP_DIV=0x3A,
     OP_DIVSQ=0x3B, OP_LIF=0x3C, OP_FENCT=0x3D, OP_FENCB=0x3E
 };
 
@@ -415,11 +415,54 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
     return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
 }
 
+
+/* EXP_TEX overrides gamma on compatible normalized color formats. Metadata
+ * has already excluded formats without gamma support. */
+u32 rsx_fp_texture_gamma_units(const u8* ucode, u32 max_bytes,
+                                const u8 gamma_masks[16])
+{
+    if (!ucode || !gamma_masks) return 0;
+    u32 units = 0;
+    for (u32 off = 0; off + 16 <= max_bytes;) {
+        const u32 w0 = rsx_fp_read_word(ucode + off);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        const u32 op = (w0 >> 24) & 63u, unit = (w0 >> FP_TEX_UNIT_SHIFT) & 15u;
+        if (!(w2 & FP_BRANCH) && !(w0 & (1u << 21)) && gamma_masks[unit] &&
+            (op == OP_TEX || op == OP_TXP || op == OP_TXB || op == OP_TXL ||
+             op == OP_TXD || op == OP_TEXBEM || op == OP_TXPBEM))
+            units |= 1u << unit;
+        off += 16;
+        if (!(w2 & FP_BRANCH) && ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2)) off += 16;
+        if (w0 & FP_END) return units;
+    }
+    return 0;
+}
+
+static void fp_gamma_helper(Out* out)
+{
+    out_puts(out,
+        "float4 _rsx_gamma_input(float4 v, uint mask) {\n"
+        "    float4 lo = v / 12.92;\n"
+        "    float4 hi = pow(max((v + 0.055) / 1.055, (float4)0), (float4)2.4);\n"
+        "    float4 decoded = float4(v.r > 0.04045 ? hi.r : lo.r,\n"
+        "                            v.g > 0.04045 ? hi.g : lo.g,\n"
+        "                            v.b > 0.04045 ? hi.b : lo.b,\n"
+        "                            v.a > 0.04045 ? hi.a : lo.a);\n"
+        "    return float4((mask & 1u) ? decoded.r : v.r,\n"
+        "                  (mask & 2u) ? decoded.g : v.g,\n"
+        "                  (mask & 4u) ? decoded.b : v.b,\n"
+        "                  (mask & 8u) ? decoded.a : v.a);\n}\n");
+}
+
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
-    int buffered, char* out, u32 out_size, u32* out_constant_count)
+    int buffered, const u8 gamma_masks[16],
+    char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
+    const u32 gamma_units = rsx_fp_texture_gamma_units(ucode, max_bytes, gamma_masks);
 
     u32 buffered_constant_count = 0;
     if (buffered) {
@@ -609,6 +652,14 @@ static int rsx_fp_decompile_internal(
             continue;
         }
 
+        if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
+            (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+            static u32 reported;
+            if (reported++ < 32)
+                fprintf(stderr, "[RSX fp] gamma fetch opcode %u unsupported on unit %u\n", opcode, tex_unit);
+            return -1;
+        }
+
         /* Build the RHS expression for this opcode. */
         char rhs[640];
         int handled = 1;
@@ -736,6 +787,14 @@ static int rsx_fp_decompile_internal(
             out_puts(&o, " */\n");
             handled = 0;
             break;
+        }
+
+        if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            char sample[sizeof rhs]; memcpy(sample, rhs, sizeof sample);
+            const int length = snprintf(rhs, sizeof rhs, "_rsx_gamma_input(%s, %uu)",
+                                        sample, gamma_masks[tex_unit] & 15u);
+            if (length < 0 || (size_t)length >= sizeof rhs) return -1;
         }
 
         int has_dest = !(w0 & FP_OUT_NONE);
@@ -877,7 +936,7 @@ static int rsx_fp_decompile_internal(
     /* Preamble: PSInput matches the backend's placeholder layout; temp/half
      * register files; texture+sampler banks for TEX. Built here, in front of
      * the body, now that the return type is known. */
-    char preamble[2048];
+    char preamble[4096]; /* optional post-sample color helper plus declarations */
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
     out_puts(&p,
@@ -915,6 +974,7 @@ static int rsx_fp_decompile_internal(
             buffered_constant_count ? buffered_constant_count : 1u);
         out_puts(&p, constants_decl);
     }
+    if (gamma_units) fp_gamma_helper(&p);
     if (targets == 1) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
@@ -940,7 +1000,7 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, out, out_size, NULL);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, NULL, out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
@@ -948,7 +1008,7 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 1, out, out_size,
+        ucode, max_bytes, ctrl, tex_cube_mask, 1, NULL, out, out_size,
         out_constant_count);
 }
 
@@ -1263,4 +1323,12 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
             memcpy(q, "rsx_tex", 7);
     }
     return patched;
+}
+
+int rsx_fp_decompile_buffered_color_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+        1, gamma_masks, out, out_size, out_constant_count);
 }
