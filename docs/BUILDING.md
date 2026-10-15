@@ -289,6 +289,10 @@ Without a GPU, Mesa's lavapipe runs every check, e.g.
 (the ICD file name varies by distribution). Without guest programs, the modes
 that need them (`--shader`, `--mip`, `--rtt`, `--depthtex`, `--mrt`,
 `--mrt-a`, `--cube`) report that and are skipped, as on the null backend.
+`--depthbounds` checks the depth bounds test (`SET_DEPTH_BOUNDS_TEST_ENABLE`,
+`_MIN`, `_MAX`), which only the draw engine implements, and only on a device
+with the `depthBounds` feature; run it with `PS3RECOMP_VK_GUEST_PROGRAMS=1`.
+The fixed-function path, Metal and the null backend do not honour the test.
 
 #### Guest programs and the draw engine
 

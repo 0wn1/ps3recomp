@@ -87,6 +87,8 @@ typedef struct {
     rsx_topology draw_topology;
     u32 scissor[4];
     u32 stencil_ref;
+    float depth_bounds[2];
+    int n_depth_bounds;
     u32 last_created_texture, last_created_color;
     u32 last_released;
     float last_clear_depth;
@@ -207,6 +209,12 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
 }
 
 static void stub_stencil_ref(void* u, u32 r) { (void)u; stub.stencil_ref = r; }
+static void stub_depth_bounds(void* u, float lo, float hi)
+{
+    (void)u;
+    stub.depth_bounds[0] = lo; stub.depth_bounds[1] = hi;
+    stub.n_depth_bounds++;
+}
 
 static void stub_draw(void* u, rsx_topology topology, const void* verts,
                       u32 count, u32 stride, const u32* indices,
@@ -301,6 +309,7 @@ static const rsx_draw_backend g_stub_backend = {
     .set_viewport = stub_viewport,
     .set_scissor = stub_scissor,
     .set_stencil_ref = stub_stencil_ref,
+    .set_depth_bounds = stub_depth_bounds,
     .draw = stub_draw,
     .clear_color = stub_clear_color,
     .clear_depth_stencil = stub_clear_ds,
@@ -340,6 +349,9 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_INLINE_ARRAY        0x1818
 #define M_TEX_UNIT            0x1A00   /* + unit * 0x20 */
 #define M_STENCIL_FUNC_REF    0x0334
+#define M_DEPTH_BOUNDS_ENABLE 0x0380
+#define M_DEPTH_BOUNDS_MIN    0x0384
+#define M_DEPTH_BOUNDS_MAX    0x0388
 #define M_CLEAR_BUFFERS       0x1D94
 #define M_VP_UPLOAD_CONST_ID  0x1EFC
 #define M_VP_UPLOAD_CONST     0x1F00
@@ -656,6 +668,10 @@ static void test_pipeline_key(void)
     CHECK(rsx_draw_engine_hash_render_state(&b, 1469598103934665603ull) != base,
           "so is an FP16 render target");
 
+    b = a; b.depth_bounds_test = 1;
+    CHECK(rsx_draw_engine_hash_render_state(&b, 1469598103934665603ull) != base,
+          "so is the depth bounds test");
+
     /* And through the engine: transform constants change every draw of every
      * frame, and must not multiply pipelines. */
     engine_up();
@@ -677,6 +693,29 @@ static void test_pipeline_key(void)
     CHECK(stub.n_pipeline_create == 1 && stub.stencil_ref == 0x7Fu,
           "nor does the stencil reference, which reaches the encoder (%u)",
           stub.stencil_ref);
+
+    /* The depth bounds test is pipeline state; its bounds are not. A deferred
+     * renderer draws its lights in [0, 0.999984] and its sky in
+     * [0.999984, 1] with the same programs. */
+    m(M_DEPTH_BOUNDS_ENABLE, 1u);
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 2,
+          "enabling the depth bounds test builds another pipeline (%d)",
+          stub.n_pipeline_create);
+    m(M_DEPTH_BOUNDS_MIN, 0x00000000u);      /* 0.0  */
+    m(M_DEPTH_BOUNDS_MAX, 0x3F7FFEF9u);      /* 0.999984 */
+    draw_triangle();
+    CHECK(stub.depth_bounds[0] == 0.0f && stub.depth_bounds[1] > 0.99998f &&
+          stub.depth_bounds[1] < 0.99999f,
+          "the bounds reach the backend as floats (%g, %g)",
+          stub.depth_bounds[0], stub.depth_bounds[1]);
+    m(M_DEPTH_BOUNDS_MIN, 0x3F7FFEF9u);
+    m(M_DEPTH_BOUNDS_MAX, 0x3F800000u);      /* 1.0  */
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == 2 && stub.depth_bounds[1] == 1.0f,
+          "and moving them does not build a pipeline (%d)",
+          stub.n_pipeline_create);
+    m(M_DEPTH_BOUNDS_ENABLE, 0u);
 
     engine_down();
 }

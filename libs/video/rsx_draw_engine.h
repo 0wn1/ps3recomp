@@ -81,6 +81,7 @@ typedef struct rsx_be_render_state {
     u32 color_mask;
     u32 rt_fp16;                    /* the target is an FP16 HDR surface */
     u32 stencil_enable, stencil_two_sided;
+    u32 depth_bounds_test;          /* SET_DEPTH_BOUNDS_TEST_ENABLE */
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
 } rsx_be_render_state;
@@ -190,6 +191,11 @@ typedef struct rsx_draw_backend {
     void (*set_viewport)(void* user, float x, float y, float w, float h);
     void (*set_scissor)(void* user, u32 x, u32 y, u32 w, u32 h);
     void (*set_stencil_ref)(void* user, u32 ref);
+    /* Optional: the depth bounds for the next draw, called before every
+     * draw like the stencil reference. The test itself is pipeline state
+     * (rsx_be_render_state.depth_bounds_test); a backend that leaves this
+     * NULL draws as if the test were off. */
+    void (*set_depth_bounds)(void* user, float min, float max);
     /* One draw. `indices` is NULL for a non-indexed one. Everything the
      * hardware has and the host does not -- quads, quad strips, fans,
      * polygons -- has already been expanded into a triangle list by the time
