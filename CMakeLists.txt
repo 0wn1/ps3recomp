@@ -390,6 +390,14 @@ if(PS3RECOMP_BUILD_TESTS)
     # cellVdec through its guest API: the callback-only decoder always, and
     # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
     add_subdirectory(libs/codec/tests)
+    if(NOT WIN32)
+        find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME spu_fnms_zero_extended
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
+        endif()
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
