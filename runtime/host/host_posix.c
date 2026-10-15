@@ -39,6 +39,7 @@
 #  define host_backend_color    rsx_metal_backend_debug_color
 #  define host_backend_center   rsx_metal_backend_readback_center
 #  define host_backend_guest_draws rsx_metal_backend_guest_draws
+#  define HOST_BACKEND_DEPTH_BOUNDS 0
 #elif defined(PS3RECOMP_RSX_VULKAN)
 /* Opt-in (-DPS3RECOMP_RSX_VULKAN=ON): same entry points and test hooks. */
 #  include "rsx_vulkan_backend.h"
@@ -51,6 +52,7 @@
 #  define host_backend_color    rsx_vulkan_backend_debug_color
 #  define host_backend_center   rsx_vulkan_backend_readback_center
 #  define host_backend_guest_draws rsx_vulkan_backend_guest_draws
+#  define HOST_BACKEND_DEPTH_BOUNDS rsx_vulkan_backend_depth_bounds()
 #else
 #  include "rsx_null_backend.h"
 #  define HOST_BACKEND_NAME     "null (headless software)"
@@ -62,6 +64,7 @@
 #  define host_backend_color    rsx_null_backend_debug_color
 #  define host_backend_center   rsx_null_backend_readback_center
 #  define host_backend_guest_draws rsx_null_backend_guest_draws
+#  define HOST_BACKEND_DEPTH_BOUNDS 0
 #endif
 #include "rsx_test_programs.h"
 
@@ -1283,8 +1286,10 @@ int main(int argc, char** argv)
         /* --depthbounds: a red triangle leaves z = 0.25 in the zeta, then a
          * blue one bounded to [0, 0.5] and a green one bounded to [0.5, 1]
          * draw with the depth test off. Blue means the depth bounds test ran;
-         * green means it was ignored; red means it rejected both. Only a
-         * backend that implements set_depth_bounds passes it (Vulkan). */
+         * green means it was ignored; red means it rejected both. Only the
+         * Vulkan engine path implements the test, and only on a device with
+         * the depthBounds feature; anywhere else the mode says so and stops
+         * without a verdict. */
         else if (strcmp(argv[i], "--depthbounds") == 0) do_draw = 12;
     }
     /* The guest-program modes, which a backend without a translator cannot
@@ -1303,6 +1308,16 @@ int main(int argc, char** argv)
         fprintf(stderr, "[host] backend init failed\n");
         free(vm_base);
         return 1;
+    }
+    /* Known only once the backend is up: the device decides. A skip is
+     * reported in words the Vulkan workflow recognises, not as a pass. */
+    if (do_draw == 12 && !HOST_BACKEND_DEPTH_BOUNDS) {
+        printf("[host] --depthbounds: skipped, no depth bounds test here (the %s backend "
+               "honours it only on the draw engine path, on a device with depthBounds)\n",
+               HOST_BACKEND_NAME);
+        host_backend_shutdown();
+        free(vm_base);
+        return 0;
     }
 
     /* Bring up the GCM context exactly as a guest's cellGcmInit would. */

@@ -88,5 +88,11 @@ jobs:
             if grep -q "VUID" run.log; then echo "::error::$name: Vulkan validation messages"; fail=1; fi
             grep -q "register-file draw engine path" run.log || { echo "::error::$name: not on the draw engine"; fail=1; }
             if grep -q "nothing to check" run.log; then echo "::error::$name: skipped, not checked"; fail=1; fi
+            # The one scene that needs an optional device feature: lavapipe has no
+            # depthBounds in every Mesa release, so its skip is a notice, not a
+            # pass and not a failure.
+            if [ "$name" = "--depthbounds" ] && grep -q "skipped, no depth bounds test" run.log; then
+              echo "::notice::$name: skipped, this lavapipe has no depthBounds"
+            fi
           done
           exit $fail

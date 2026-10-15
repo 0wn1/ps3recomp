@@ -292,7 +292,10 @@ that need them (`--shader`, `--mip`, `--rtt`, `--depthtex`, `--mrt`,
 `--depthbounds` checks the depth bounds test (`SET_DEPTH_BOUNDS_TEST_ENABLE`,
 `_MIN`, `_MAX`), which only the draw engine implements, and only on a device
 with the `depthBounds` feature; run it with `PS3RECOMP_VK_GUEST_PROGRAMS=1`.
-The fixed-function path, Metal and the null backend do not honour the test.
+Anywhere else (the fixed-function path, Metal, the null backend, or a device
+without the feature, such as lavapipe in Mesa 25) it reports
+`skipped, no depth bounds test` and exits 0; the Vulkan workflow turns that
+into a notice.
 
 #### Guest programs and the draw engine
 

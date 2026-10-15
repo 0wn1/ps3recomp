@@ -3463,4 +3463,9 @@ u32 rsx_vulkan_backend_guest_draws(void)
     return s_vk.eng_active ? rsx_draw_engine_guest_draws() : s_g.last_draws;
 }
 
+int rsx_vulkan_backend_depth_bounds(void)
+{
+    return s_vk.eng_active && s_vk.depth_bounds_ok;
+}
+
 #endif /* !_WIN32 */
