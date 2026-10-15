@@ -105,6 +105,12 @@ jobs:
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
+      # cellFontInitializeWithRevision initialises the library the way cellFontInit does.
+      - name: Run the cellFont init test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_font_initialize_with_revision libs/font/tests/test_font_initialize_with_revision.c -lm
+          /tmp/test_font_initialize_with_revision
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
