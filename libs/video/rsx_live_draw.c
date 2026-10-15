@@ -332,7 +332,7 @@ typedef struct {
     ID3D12DescriptorHeap*      smp_heap;
     u32                        smp_step, smp_ring_used;
     u32                        smp_ring_slots[SMP_RING_TABLES][SMP_TABLE_SIZE];
-    u32                        smp_keys[SMP_CACHE_SLOTS];
+    u64                        smp_keys[SMP_CACHE_SLOTS];
     u32                        n_samplers;
 
     ID3D12RootSignature*       rootsig_x;
@@ -1527,13 +1527,20 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
     sd.MaxAnisotropy = 1;
     return sd;
 }
-static u32 sampler_key(const rsx_dsp_texture* t)
+/* Cache key of a sampler: exactly the fields decode_sampler reads, so two states share a descriptor only when
+ * they decode alike. The previous key kept wrap bits 0-11 (U and V, none of W at bits 16-19) and shifted the 21-bit
+ * LOD field of control0 left by 18, which drops its top seven bits: min LOD (control0 bits 19-30) above bit 20
+ * and the W address mode were lost, so states differing only there reused another state's descriptor. */
+static u64 sampler_key(const rsx_dsp_texture* t)
 {
-    const u32 minf = (t->filter >> 16) & 0x7;
-    const u32 magf = (t->filter >> 24) & 0x7;
-    const u32 wrap = t->wrap & 0xFFF;
-    const u32 lod  = (t->control0 >> 7) & 0x1FFFFF;
-    return minf | (magf << 3) | (wrap << 6) | (lod << 18);
+    const u64 minf    = (t->filter >> 16) & 0x7;
+    const u64 magf    = (t->filter >> 24) & 0x7;
+    const u64 wrap_u  = t->wrap & 0xF;
+    const u64 wrap_v  = (t->wrap >> 8) & 0xF;
+    const u64 wrap_w  = (t->wrap >> 16) & 0xF;
+    const u64 max_lod = (t->control0 >> 7) & 0xFFF;
+    const u64 min_lod = (t->control0 >> 19) & 0xFFF;
+    return minf | (magf << 3) | (wrap_u << 6) | (wrap_v << 10) | (wrap_w << 14) | (max_lod << 18) | (min_lod << 30);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1648,7 +1655,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot)
     h.ptr += (size_t)slot * g.smp_step;
     return h;
 }
-static u32 sampler_slot(const rsx_dsp_texture* t, u32 key)
+static u32 sampler_slot(const rsx_dsp_texture* t, u64 key)
 {
     for (u32 i = 0; i < g.n_samplers; i++)
         if (g.smp_keys[i] == key) return 1 + i;
