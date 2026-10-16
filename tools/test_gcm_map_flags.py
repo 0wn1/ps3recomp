@@ -15,6 +15,9 @@ with tempfile.TemporaryDirectory(prefix='gcm-map-flags-') as tmp:
     binary=Path(tmp)/'test'
     linker=['-Wl,-dead_strip'] if sys.platform=='darwin' else ['-Wl,--gc-sections','-pthread','-lm']
     subprocess.run([os.environ.get('CC','cc'),'-std=c17','-O1','-UNDEBUG',
+        # A small table: the capacity check fills every slot with 1 MB IO maps,
+        # and #255's default of 512 would run past the 256 MB aperture.
+        '-DCELL_GCM_MAX_IO_MAPPINGS=16',
         '-ffunction-sections','-fdata-sections','-I'+str(root/'include'),
         str(root/'tests/test_gcm_map_flags.c'),*linker,'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True,timeout=10,
