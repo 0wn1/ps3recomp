@@ -90,7 +90,7 @@ static atomic_uintptr_t direct_ctx[2];
 static int direct_rc[2];
 static void resident_policy(spu_context* c)
 {
-    unsigned id=c->gpr[4]._u32[0]-1;
+    unsigned id=c->gpr[4]._u32[1]-1;   /* low half of the u64 argument (#309) */
     assert(id<2);atomic_store(&direct_ctx[id],(uintptr_t)c);
     spu_ls_write32(c,0x4000,0x12340000u+id);
     atomic_fetch_add(&direct_enter,1);
