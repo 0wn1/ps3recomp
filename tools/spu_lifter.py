@@ -1133,6 +1133,7 @@ def main() -> None:
                         "targets + STT_FUNC symbols). When set, .text is "
                         "read from this ELF and the positional <input> arg "
                         "is ignored.")
+    p.add_argument("--report", help="Write machine-readable generation diagnostics JSON")
     p.add_argument("--trace", action="store_true",
                    help="Emit spu_trace_pc/spu_trace_rt around each instruction "
                         "for §3 diff-vs-RPCS3 validation. Output goes to stderr "
@@ -1338,6 +1339,13 @@ def main() -> None:
         f.write(lifter.emit_header())
     with open(sp, "w") as f:
         f.write(lifter.emit_source(args.header_name))
+
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as report:
+            json.dump({"functions": [[f.start_addr, f.end_addr] for f in lifter.functions],
+                       "unsupported": lifter.unsupported,
+                       "call_targets": sorted(lifter.call_targets),
+                       "branch_targets": sorted(lifter.branch_targets)}, report, indent=2)
 
     print(f"Wrote {hp}")
     print(f"Wrote {sp}")
