@@ -1344,8 +1344,25 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 cube_mask = eng_cube_mask();
     const u32 vtex_mask = eng_vtex_mask();
+    rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
+    u32 shadow_mask = 0;
+    const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        if (!(sampled_units & (1u << u))) continue;
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        rsx_fp_shadow_desc_from_texture(&shadow[u], t.format, t.dimension,
+            t.cubemap, t.mipmaps, t.filter, t.wrap, t.control0);
+        if (shadow[u].enabled) shadow_mask |= 1u << u;
+    }
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
-    const u32 unnorm_mask = eng_unnorm_units(unnorm_dim);
+    /* Shadow helpers normalize against the bound resource themselves. Only
+     * sampled ordinary UN units need baked dimensions or cache identity. */
+    const u32 unnorm_mask = eng_unnorm_units(unnorm_dim) &
+        (fixed ? 0xFFFFu : sampled_units) & ~shadow_mask;
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++)
+        if (!(unnorm_mask & (1u << u)))
+            unnorm_dim[u][0] = unnorm_dim[u][1] = 0;
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
@@ -1367,6 +1384,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
+        if (shadow_mask) {
+            key = eng_fnv1a(&shadow_mask, sizeof shadow_mask, key);
+            key = eng_fnv1a(shadow, sizeof shadow, key);
+        }
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
@@ -1397,8 +1418,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
-        fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
-                                          s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        fi = rsx_fp_decompile_buffered_shadow_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
+                shadow_mask ? shadow : NULL, s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
