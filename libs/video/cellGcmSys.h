@@ -71,8 +71,15 @@ extern "C" {
 #define CELL_GCM_LOCATION_LOCAL         0  /* video memory */
 #define CELL_GCM_LOCATION_MAIN          1  /* main memory */
 
-/* IO mapping limits */
-#define CELL_GCM_MAX_IO_MAPPINGS        16
+/* IO mapping limits. libgcm has no small fixed slot count:
+ * cellGcmMapMainMemory fails when the IO address space is full. Killzone 3
+ * maps up to 38 separate 1 MB chunks at level load and keeps vertex buffers in
+ * them; with 16 slots the later calls failed and those draws read unmapped
+ * offsets. 512 slots (16 bytes each) is an assumed bound well above that;
+ * build with -DCELL_GCM_MAX_IO_MAPPINGS=N to change it. */
+#ifndef CELL_GCM_MAX_IO_MAPPINGS
+#define CELL_GCM_MAX_IO_MAPPINGS        512
+#endif
 #define CELL_GCM_IOMAP_FLAG_STRICT_ORDERING 2u
 
 /* Debug output levels */
