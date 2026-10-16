@@ -965,7 +965,15 @@ static int rsx_fp_decompile_internal(
     for (u32 t = FP_MAX_COLOR_TARGETS; t-- > 1; )
         if (wrote[half_exports][t]) { targets = t + 1; break; }
 
-    if (targets == 1) {
+    /* Depth export. SHADER_CONTROL bits 1-3 (0xE,
+     * CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT) make the program's depth the
+     * fragment depth: always the fp32 register r1.z, whatever the colour
+     * export width, clamped to [0,1]. Without SV_Depth the fragment keeps the
+     * interpolated depth of the primitive, so a full-screen pass that rebuilds
+     * a depth buffer writes the quad's constant depth instead. The output
+     * becomes a struct even for one colour target. */
+    const int depth_export = ctrl != RSX_FP_CTRL_AUTO && (ctrl & 0xEu) != 0u;
+    if (targets == 1 && !depth_export) {
         char tail[96];
         snprintf(tail, sizeof(tail),
                  "    float4 _o = %s[0];\n"
@@ -985,6 +993,9 @@ static int rsx_fp_decompile_internal(
                      t, t, t, t);
             out_puts(&o, line);
         }
+        if (depth_export)
+            out_puts(&o, "    float _d = r[1].z;\n"
+                         "    _out.depth = (_d == _d) ? saturate(_d) : 0.0;\n");
         out_puts(&o, "    return _out;\n}\n");
     }
 
@@ -1032,7 +1043,7 @@ static int rsx_fp_decompile_internal(
     if (shadow) for (u32 u = 0; u < 16; u++)
         if ((sampled_units & (1u << u)) && shadow[u].enabled)
             fp_shadow_helper(&p, u, tex_cube_mask, &shadow[u]);
-    if (targets == 1) {
+    if (targets == 1 && !depth_export) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
         out_puts(&p, "struct PSOutput {\n");
@@ -1042,6 +1053,8 @@ static int rsx_fp_decompile_internal(
                      "    float4 t%u : SV_TARGET%u;\n", t, t);
             out_puts(&p, member);
         }
+        if (depth_export)
+            out_puts(&p, "    float depth : SV_Depth;\n");
         out_puts(&p, "};\n"
                      "PSOutput main(PSInput input) {\n");
     }
