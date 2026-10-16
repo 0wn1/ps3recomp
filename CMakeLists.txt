@@ -395,6 +395,13 @@ if(PS3RECOMP_BUILD_TESTS)
     if(UNIX)
         add_subdirectory(tests/gcm_reports)
     endif()
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME spurs_task_exit_code_initialize
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_task_exit_code_initialize.py")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
