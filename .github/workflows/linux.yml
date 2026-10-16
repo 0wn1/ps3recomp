@@ -289,6 +289,12 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
           /tmp/test_guest_ptr_trap
 
+      # PARAM.SFO is written as a binary PSF and read back (PSF and the old text file).
+      - name: Run the savedata PARAM.SFO test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_savedata_param_sfo libs/system/tests/test_savedata_param_sfo.c
+          /tmp/test_savedata_param_sfo
+
       # The lv2 sync-primitive stress suite (mutex, cond, semaphore, event
       # queue) on host threads. It was Windows-only until the shim grew joinable
       # handles and multi-object waits; here it is the memory-model regression

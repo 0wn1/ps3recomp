@@ -6,6 +6,7 @@
  */
 
 #include "cellSaveData.h"
+#include "ps3_psf.h"
 #include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"
@@ -735,7 +736,8 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     }
 }
 
-/* Write a simplified PARAM.SFO with the save's title/subtitle/detail */
+/* Write PARAM.SFO as a real binary PSF (layout in ps3_psf.h). The old simplified text file was not a
+ * PSF, so RPCS3 and a PS3 rejected the save. */
 static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileParam* param)
 {
     if (!param) return;
@@ -748,20 +750,31 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
     }
 #endif
 
+    /* SAVEDATA_DIRECTORY is the last path component of the save directory */
+    const char* dir = save_path;
+    for (const char* q = save_path; *q; q++)
+        if ((*q == '/' || *q == '\\') && q[1]) dir = q + 1;
+
+    /* the guest strings are fixed-size arrays that may lack a terminator: copy with one */
+    char title[CELL_SAVEDATA_SYSP_TITLE_SIZE], sub[CELL_SAVEDATA_SYSP_SUBTITLE_SIZE];
+    char detail[CELL_SAVEDATA_SYSP_DETAIL_SIZE], lp[CELL_SAVEDATA_SYSP_LPARAM_SIZE];
+    snprintf(title, sizeof title, "%.*s", (int)sizeof title - 1, param->title);
+    snprintf(sub, sizeof sub, "%.*s", (int)sizeof sub - 1, param->subTitle);
+    snprintf(detail, sizeof detail, "%.*s", (int)sizeof detail - 1, param->detail);
+    snprintf(lp, sizeof lp, "%.*s", (int)sizeof lp - 1, param->listParam);
+
+    uint8_t buf[4096];
+    size_t n = ps3_psf_build(buf, sizeof buf, dir, title, sub, detail, param->attribute, lp);
+    if (!n) return;
+
     FILE* fp = fopen(sfo_path, "wb");
     if (!fp) return;
-
-    /* Write a simplified text-based PARAM.SFO for easy debugging.
-       Games don't read this directly - our stat callback fills it from here. */
-    fprintf(fp, "TITLE=%s\n", param->title);
-    fprintf(fp, "SUB_TITLE=%s\n", param->subTitle);
-    fprintf(fp, "DETAIL=%s\n", param->detail);
-    fprintf(fp, "ATTRIBUTE=%u\n", param->attribute);
-    fprintf(fp, "LIST_PARAM=%s\n", param->listParam);
+    fwrite(buf, 1, n, fp);
     fclose(fp);
 }
 
-/* Read simplified PARAM.SFO */
+/* Read PARAM.SFO: a binary PSF, or the old simplified text file that earlier builds wrote (existing saves keep
+ * loading; the next save rewrites them as PSF). */
 static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param)
 {
     if (!param) return;
@@ -778,12 +791,25 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     FILE* fp = fopen(sfo_path, "rb");
     if (!fp) return;
 
-    char line[2048];
-    while (fgets(line, sizeof(line), fp)) {
-        /* Remove trailing newline */
+    uint8_t buf[8192];
+    size_t got = fread(buf, 1, sizeof buf, fp);
+    fclose(fp);
+    if (got >= 4 && buf[0] == 0 && buf[1] == 'P' && buf[2] == 'S' && buf[3] == 'F') {
+        uint32_t attr = 0;
+        if (ps3_psf_parse(buf, got, param->title, sizeof param->title, param->subTitle, sizeof param->subTitle,
+                          param->detail, sizeof param->detail, &attr, param->listParam, sizeof param->listParam))
+            param->attribute = attr;
+        return;
+    }
+
+    /* old text format */
+    char text[sizeof buf + 1];
+    memcpy(text, buf, got); text[got] = 0;
+    for (char* line = text; *line; ) {
+        char* nl = line; while (*nl && *nl != '\n') nl++;
+        char saved = *nl; *nl = 0;
         size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
-            line[--len] = '\0';
+        while (len > 0 && line[len-1] == '\r') line[--len] = '\0';
 
         if (strncmp(line, "TITLE=", 6) == 0)
             strncpy(param->title, line + 6, CELL_SAVEDATA_SYSP_TITLE_SIZE - 1);
@@ -795,8 +821,9 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
             param->attribute = (u32)atoi(line + 10);
         else if (strncmp(line, "LIST_PARAM=", 11) == 0)
             strncpy(param->listParam, line + 11, CELL_SAVEDATA_SYSP_LPARAM_SIZE - 1);
+        if (!saved) break;
+        line = nl + 1;
     }
-    fclose(fp);
 }
 
 /* Core save/load implementation shared by List/Fixed/Auto variants */
