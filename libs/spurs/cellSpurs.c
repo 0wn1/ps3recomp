@@ -1008,9 +1008,10 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
      * ponytail: s_tasks[] is shared by every taskset and now only records the
      * last task per slot id -- enough for JoinTask2's lookup; key it by
      * (taskset, id) if a title joins tasks in two tasksets at once. */
-    u32 free_slot = CELL_SPURS_MAX_TASK;
-    for (u32 t = 0; t < CELL_SPURS_MAX_TASK; t++)
-        if (!(vm_read8(taskset_ea + 0x30 + t / 8) & (0x80u >> (t % 8)))) { free_slot = t; break; }
+    /* The search and the enabled bit are one atomic step: a task exiting between
+     * a plain read and the later bit set got its enabled bit back with no task
+     * behind it, so cellSpursJoinTask2 on that id never returned. */
+    u32 free_slot = spurs_taskset_take_slot(taskset_ea, CELL_SPURS_MAX_TASK);
     if (free_slot < CELL_SPURS_MAX_TASK) {
         u32 i = free_slot;
         {

@@ -15,6 +15,11 @@ uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 static unsigned dispatches;
 static const uint8_t* dispatched_image;
 static uint32_t dispatched_size, dispatched_context;
+/* The scheduler updates the taskset's bitset line under the lock-line lock;
+ * single-threaded here, so the lock and the coherency note are no-ops. */
+void spu_lockline_lock(void) {}
+void spu_lockline_unlock(void) {}
+void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint32_t context)
 {
     dispatches++; dispatched_image = image; dispatched_size = size;
