@@ -3604,12 +3604,17 @@ void rsx_metal_backend_shutdown(void)
             s_inflight = nil;
         }
 #if !TARGET_OS_IPHONE
-        void (^stop_window)(void) = ^{
-            window_close_observer_stop();
-            if (s_window) { [s_window close]; s_window = nil; }
-        };
-        if ([NSThread isMainThread]) stop_window();
-        else dispatch_sync(dispatch_get_main_queue(), stop_window);
+        /* Only touch the main queue when there is AppKit state to tear down:
+         * headless runs never pump it, and a dispatch_sync there would hang. */
+        if (fps_session() || s_window || s_window_close_observer) {
+            void (^stop_window)(void) = ^{
+                if (fps_session()) fps_stop();
+                window_close_observer_stop();
+                if (s_window) { [s_window close]; s_window = nil; }
+            };
+            if ([NSThread isMainThread]) stop_window();
+            else dispatch_sync(dispatch_get_main_queue(), stop_window);
+        }
 #endif
         free(s_verts); s_verts = NULL;
         free(s_cb); s_cb = NULL; s_cb_used = s_cb_cap = 0;
