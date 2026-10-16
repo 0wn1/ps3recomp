@@ -2398,9 +2398,19 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * while the guest may be between advancing current and flushing: put
      * then lands on begin, the guest's closing fence is never executed, and
      * it spins on `ref` for good. Safe when the walker has left the head of
-     * the ring well behind, which is the region the guest writes next. */
+     * the ring well behind, which is the region the guest writes next.
+     *
+     * Only for a ring the runtime owns, i.e. one whose buffer-full callback is
+     * still the runtime's (cellGcmSetupContext installs it). A title with its
+     * own callback manages its own buffers, and its context need not be a ring
+     * at all: Killzone 3 flips on a 0x30000-byte draw context whose `end`
+     * moves down as it allocates from the top, so it always looks nearly full.
+     * Rewinding it to `begin` in mid-frame cut the frame short, dropping the
+     * fence release in its tail, and the title then waited for it forever. */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
-    if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+    const u32 cb_opd = vm_read32(ctx + 0xC);
+    const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
+    if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
