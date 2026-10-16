@@ -389,14 +389,15 @@ s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientI
     if (!method || !uri || !transId)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
-    /* CellHttpUri is { const char* scheme, hostname, path, username,
-     * password; u32 port; } -- five 4-byte EAs then the port, twenty bytes
-     * to the guest against forty to us, so nothing but scheme lines up if
-     * you cast. Pull each field out by guest offset. */
+    /* CellHttpUri is { const char* scheme, hostname, username, password,
+     * path; u32 port; u8 reserved[4]; } -- five 4-byte EAs then the port,
+     * twenty-eight bytes to the guest, so nothing but scheme lines up if you
+     * cast. Pull each field out by guest offset: the path is the fifth
+     * pointer (+16); +8 is the username, NULL in most requests. */
     u32 uri_ea = (u32)(uintptr_t)uri;
     u32 ea_scheme   = vm_read32(uri_ea +  0);
     u32 ea_hostname = vm_read32(uri_ea +  4);
-    u32 ea_path     = vm_read32(uri_ea +  8);
+    u32 ea_path     = vm_read32(uri_ea + 16);
     u32 uri_port    = vm_read32(uri_ea + 20);
     const char* uri_scheme   = ea_scheme   ? (const char*)(vm_base + ea_scheme)   : NULL;
     const char* uri_hostname = ea_hostname ? (const char*)(vm_base + ea_hostname) : NULL;
