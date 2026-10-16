@@ -618,7 +618,7 @@ skip_inject: ;
      * LEFT 0x0080, RIGHT 0x0020, CROSS 0x4000, CIRCLE 0x2000, TRIANGLE 0x1000.
      * Legit input simulation on the same footing as PAD_AUTOPRESS/PAD_STICK. */
     { static int s_sc = -1;
-      static struct { double t; unsigned mask; } ev[32]; static int n_ev = 0;
+      static struct { double t; unsigned mask; } ev[256]; static int n_ev = 0;
       static unsigned long long t0 = 0;   /* not ULONGLONG: this builds on POSIX too */
       if (s_sc < 0) {
           s_sc = 0;
@@ -626,14 +626,15 @@ skip_inject: ;
           if (e && *e) {
               s_sc = 1; t0 = GetTickCount64();
               const char* p = e;
-              while (*p && n_ev < 32) {
+              while (*p && n_ev < 256) {
                   double t = strtod(p, (char**)&p);
                   if (*p == ':') p++;
                   unsigned m = (unsigned)strtoul(p, (char**)&p, 0);
                   ev[n_ev].t = t; ev[n_ev].mask = m; n_ev++;
                   while (*p == ',' || *p == ' ') p++;
               }
-              printf("[cellPad] PAD_SCRIPT: %d event(s)\n", n_ev);
+              printf("[cellPad] PAD_SCRIPT: %d event(s)%s\n", n_ev,
+                     *p ? " -- TRUNCATED at 256, the rest are ignored" : "");
           }
       }
       if (s_sc && port_no == 0) {
@@ -644,14 +645,14 @@ skip_inject: ;
            * happens. Fire on the first poll at or after the event time and
            * hold it for a fixed number of polls, which is what a real press
            * looks like regardless of poll rate. */
-          static int fired[32], held[32];
+          static int fired[256], held[256];
           for (int i = 0; i < n_ev; i++) {
               if (!fired[i] && now >= ev[i].t) { fired[i] = 1; held[i] = 40; }
               if (held[i] > 0) {
                   held[i]--;
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(ev[i].mask & 0xFF);
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((ev[i].mask >> 8) & 0xFF);
-                  static int said[32];
+                  static int said[256];
                   if (!said[i]) { said[i] = 1;
                       printf("[cellPad] PAD_SCRIPT t=%.1fs press 0x%04X\n", ev[i].t, ev[i].mask); }
               }
