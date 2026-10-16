@@ -97,6 +97,24 @@ static u32 s_current_display_buffer_id = 0;
 static volatile int s_flip_pending = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
+/* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
+ * those markers the drain has reached. The RSX completes a flip when it
+ * executes it; until the drain reaches the marker, the flip has not happened,
+ * however many vblanks go by. */
+static volatile u32 s_fifo_flips_queued = 0, s_fifo_flips_reached = 0;
+static u32 s_fifo_flips_completed = 0;   /* reached count at the last completion */
+
+/* May this beat complete a flip? Yes if the drain has executed a flip marker
+ * since the last completion, or if no flip is waiting in the stream (a flip
+ * that never went through it). A flip that is queued, or written but not yet
+ * flushed, does not hold back the completion of one already executed: the RSX
+ * reports the flip it did, not the ones still ahead of it. */
+static int gcm_flip_executed_take(void)
+{
+    const u32 r = s_fifo_flips_reached;
+    if (r != s_fifo_flips_completed) { s_fifo_flips_completed = r; return 1; }
+    return r == s_fifo_flips_queued;
+}
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
@@ -706,7 +724,13 @@ void cellGcm_request_tick(void)
           GCM_PENDING_SET(s_fifo_getoff == put ? 3 : 1);
           return;
       } }
-    GCM_PENDING_SET(3);
+    /* A flip queued in the command stream completes when the drain reaches
+     * its marker, as on the RSX; until then this beat is a vblank only.
+     * Completing it on the beat told Twisted Metal the RSX had finished frames
+     * it had not reached, and the title rebuilt command segments the walker
+     * was still waiting to execute. Flips that never went through the stream
+     * are unaffected. */
+    GCM_PENDING_SET(gcm_flip_executed_take() ? 3 : 1);
 }
 
 /* Deliver pending handlers on the calling host thread. Serialize the entire
@@ -763,7 +787,9 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
-    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
+    /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
+     * not happened yet. */
+    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take())
         GCM_PENDING_SET(2);
 }
 
@@ -1379,6 +1405,10 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
         for (u32 io = from; io + 8 <= land; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
             u32 w = vm_read32(ea);
+            /* A flip marker skipped here will never be reached: count it, or
+             * every flip after it waits for the drain forever. */
+            if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER &&
+                s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; continue; }
             if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
             u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
             gcm_ref_push_at(vm_read32(dea), io);
@@ -1679,6 +1709,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             s_fifo_getoff, put);
             }
             s_fifo_getoff = put;
+            /* Whatever the walker had not reached is gone, and so are the flips
+             * queued in it: none of them will ever be executed, so do not let a
+             * flip wait on them. */
+            s_fifo_flips_reached = s_fifo_flips_queued;
             why = "no-io-mapping";
             break;
         }
@@ -1718,6 +1752,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 gcm_set_current_display_buffer(w & 7u);
                 s_flip_pending = 1;
                 s_flip_request_count++;
+                /* Not past `queued`: a resync may already have written off
+                 * this flip. */
+                if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
@@ -2423,6 +2460,7 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * ring wraps, and the recycle above keys on them. */
     if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
+    s_fifo_flips_queued++;
     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
      * (see "recycled the title's own ring"), rewriting ctx->current and put
