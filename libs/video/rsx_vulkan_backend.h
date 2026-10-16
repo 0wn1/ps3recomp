@@ -85,6 +85,11 @@ u32  rsx_vulkan_backend_readback_center(void);
 /* Draws of the last presented frame that ran the guest's own programs. */
 u32  rsx_vulkan_backend_guest_draws(void);
 
+/* 1 when draws honour the depth bounds test: the draw engine drives the
+ * backend and the device has the depthBounds feature (lavapipe in Mesa 25
+ * does not). Valid after init. */
+int  rsx_vulkan_backend_depth_bounds(void);
+
 /* 1 when draws run the guest's own programs: the HLSL -> SPIR-V translator
  * was built (glslang found) and PS3RECOMP_VK_GUEST_PROGRAMS=1 opts in. Then
  * the shared register-file draw engine (rsx_draw_engine.h) is the default

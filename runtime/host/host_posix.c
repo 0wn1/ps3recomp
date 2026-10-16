@@ -39,6 +39,7 @@
 #  define host_backend_color    rsx_metal_backend_debug_color
 #  define host_backend_center   rsx_metal_backend_readback_center
 #  define host_backend_guest_draws rsx_metal_backend_guest_draws
+#  define HOST_BACKEND_DEPTH_BOUNDS 0
 #elif defined(PS3RECOMP_RSX_VULKAN)
 /* Opt-in (-DPS3RECOMP_RSX_VULKAN=ON): same entry points and test hooks. */
 #  include "rsx_vulkan_backend.h"
@@ -51,6 +52,7 @@
 #  define host_backend_color    rsx_vulkan_backend_debug_color
 #  define host_backend_center   rsx_vulkan_backend_readback_center
 #  define host_backend_guest_draws rsx_vulkan_backend_guest_draws
+#  define HOST_BACKEND_DEPTH_BOUNDS rsx_vulkan_backend_depth_bounds()
 #else
 #  include "rsx_null_backend.h"
 #  define HOST_BACKEND_NAME     "null (headless software)"
@@ -62,6 +64,7 @@
 #  define host_backend_color    rsx_null_backend_debug_color
 #  define host_backend_center   rsx_null_backend_readback_center
 #  define host_backend_guest_draws rsx_null_backend_guest_draws
+#  define HOST_BACKEND_DEPTH_BOUNDS 0
 #endif
 #include "rsx_test_programs.h"
 
@@ -429,6 +432,31 @@ static void upload_depth_triangles(void)
     for (int i = 0; i < 6; i++)
         for (int k = 0; k < 8; k++)
             guest_f32(IO_ADDR + ZVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
+}
+
+/* --depthbounds: three full-viewport triangles. Red at z = 0.25 with the
+ * depth test and depth writes on leaves 0.25 in the zeta everywhere; blue and
+ * green follow with the depth test off, the depth bounds test on, and bounds
+ * that do ([0, 0.5]) and do not ([0.5, 1]) hold 0.25. Their own z does not
+ * matter: the test reads the zeta, not the incoming fragment. Layout as
+ * upload_triangle's. */
+#define BVTX_OFFSET (VTX_OFFSET + 0x7000u)
+static void upload_depth_bounds_triangles(void)
+{
+    static const float v[9][8] = {
+        { -1.0f, -1.0f, 0.25f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },   /* red   */
+        {  3.0f, -1.0f, 0.25f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },
+        { -1.0f,  3.0f, 0.25f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f },
+        { -1.0f, -1.0f, 0.75f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f },   /* blue  */
+        {  3.0f, -1.0f, 0.75f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f },
+        { -1.0f,  3.0f, 0.75f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f },
+        { -1.0f, -1.0f, 0.75f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },   /* green */
+        {  3.0f, -1.0f, 0.75f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+        { -1.0f,  3.0f, 0.75f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+    };
+    for (int i = 0; i < 9; i++)
+        for (int k = 0; k < 8; k++)
+            guest_f32(IO_ADDR + BVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
 }
 
 /* --depthtex's first pass: one full-viewport triangle at DTEX_Z, drawn with
@@ -868,6 +896,35 @@ static void emit_depth_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);
 }
 
+static void emit_depth_bounds_draw(void)
+{
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(BVTX_OFFSET +  0));  /* position */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(BVTX_OFFSET + 16));  /* colour   */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+
+    emit(NV4097_SET_DEPTH_TEST_ENABLE, 1u);              /* red writes z = 0.25 */
+    emit(NV4097_SET_DEPTH_FUNC,        0x0201u);         /* GL_LESS             */
+    emit(NV4097_SET_DEPTH_MASK,        1u);
+    emit(NV4097_SET_BEGIN_END, 5u);
+    emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));
+    emit(NV4097_SET_BEGIN_END, 0u);
+
+    emit(NV4097_SET_DEPTH_TEST_ENABLE, 0u);
+    emit(NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE, 1u);
+    emit(NV4097_SET_DEPTH_BOUNDS_MIN, 0x00000000u);      /* 0.0: holds 0.25     */
+    emit(NV4097_SET_DEPTH_BOUNDS_MAX, 0x3F000000u);      /* 0.5                 */
+    emit(NV4097_SET_BEGIN_END, 5u);
+    emit(NV4097_DRAW_ARRAYS,   3u | ((3u - 1u) << 24));  /* blue passes         */
+    emit(NV4097_SET_BEGIN_END, 0u);
+    emit(NV4097_SET_DEPTH_BOUNDS_MIN, 0x3F000000u);      /* 0.5: excludes 0.25  */
+    emit(NV4097_SET_DEPTH_BOUNDS_MAX, 0x3F800000u);      /* 1.0                 */
+    emit(NV4097_SET_BEGIN_END, 5u);
+    emit(NV4097_DRAW_ARRAYS,   6u | ((3u - 1u) << 24));  /* green is rejected   */
+    emit(NV4097_SET_BEGIN_END, 0u);
+    emit(NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE, 0u);
+}
+
 /* The pentagon, then the quad strip over it. Both are fixed-function, so
  * every backend can run this mode. */
 static void emit_quad_draws(void)
@@ -900,7 +957,7 @@ static void submit_frame(int with_draw)
      * in front of it. */
     if (with_draw != 9 && with_draw != 10) {
         emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
-        if (with_draw == 4) {
+        if (with_draw == 4 || with_draw == 12) {
             /* CLEAR_SURFACE bits: 0x01 depth, 0x02 stencil, 0xF0 the four
              * colour channels. ZSTENCIL_CLEAR_VALUE is Z24S8, so 0xFFFFFF00
              * is depth 1.0 and stencil 0 -- the nv40 reset values, and what a
@@ -911,7 +968,8 @@ static void submit_frame(int with_draw)
             emit(NV4097_CLEAR_SURFACE,            0xF0u);
         }
     }
-    if (with_draw == 11)     emit_cube_draw();
+    if (with_draw == 12)     emit_depth_bounds_draw();
+    else if (with_draw == 11) emit_cube_draw();
     else if (with_draw == 10) emit_mrt_draws(0);
     else if (with_draw == 9) emit_mrt_draws(1);
     else if (with_draw == 8) emit_depthtex_draws();
@@ -1225,6 +1283,14 @@ int main(int argc, char** argv)
          * that uploads all six faces and samples them as a cube presents
          * face 5's colour. */
         else if (strcmp(argv[i], "--cube") == 0)  do_draw = 11;
+        /* --depthbounds: a red triangle leaves z = 0.25 in the zeta, then a
+         * blue one bounded to [0, 0.5] and a green one bounded to [0.5, 1]
+         * draw with the depth test off. Blue means the depth bounds test ran;
+         * green means it was ignored; red means it rejected both. Only the
+         * Vulkan engine path implements the test, and only on a device with
+         * the depthBounds feature; anywhere else the mode says so and stops
+         * without a verdict. */
+        else if (strcmp(argv[i], "--depthbounds") == 0) do_draw = 12;
     }
     /* The guest-program modes, which a backend without a translator cannot
      * run. --depth and --quads are not among them: both are fixed-function. */
@@ -1242,6 +1308,16 @@ int main(int argc, char** argv)
         fprintf(stderr, "[host] backend init failed\n");
         free(vm_base);
         return 1;
+    }
+    /* Known only once the backend is up: the device decides. A skip is
+     * reported in words the Vulkan workflow recognises, not as a pass. */
+    if (do_draw == 12 && !HOST_BACKEND_DEPTH_BOUNDS) {
+        printf("[host] --depthbounds: skipped, no depth bounds test here (the %s backend "
+               "honours it only on the draw engine path, on a device with depthBounds)\n",
+               HOST_BACKEND_NAME);
+        host_backend_shutdown();
+        free(vm_base);
+        return 0;
     }
 
     /* Bring up the GCM context exactly as a guest's cellGcmInit would. */
@@ -1262,6 +1338,7 @@ int main(int argc, char** argv)
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
     if (do_draw == 3) upload_shader_triangle();
     if (do_draw == 4) upload_depth_triangles();
+    if (do_draw == 12) upload_depth_bounds_triangles();
     if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
     /* --rtt draws both: the triangle into the surface, the quad out of it. */
     if (do_draw == 6) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
@@ -1335,7 +1412,8 @@ int main(int argc, char** argv)
          * face's colour: any other face's colour means a face went missing on
          * the way up or the image was sampled as 2D.
          */
-        u32 want = (do_draw == 11) ? CUBE_ARGB
+        u32 want = (do_draw == 12) ? 0xFF0000FFu   /* blue, inside its bounds */
+                 : (do_draw == 11) ? CUBE_ARGB
                  : (do_draw == 10) ? MRT_A_ARGB
                  : (do_draw == 9) ? MRT_B_ARGB
                  : (do_draw == 8) ? DTEX_ARGB     /* the sampled depth as a byte */

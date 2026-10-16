@@ -78,6 +78,9 @@ extern u32 ppu_vm_size;
 #define M_BACK_STENCIL_OP_FAIL  0x035C
 #define M_BACK_STENCIL_OP_ZFAIL 0x0360
 #define M_BACK_STENCIL_OP_ZPASS 0x0364
+#define M_DEPTH_BOUNDS_ENABLE 0x0380
+#define M_DEPTH_BOUNDS_MIN    0x0384
+#define M_DEPTH_BOUNDS_MAX    0x0388
 #define M_SCISSOR_HORIZONTAL  0x08C0
 #define M_SCISSOR_VERTICAL    0x08C4
 #define M_DEPTH_FUNC          0x0A6C
@@ -287,6 +290,7 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->bs_fail      = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_FAIL);
     rs->bs_zfail     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
     rs->bs_zpass     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
+    rs->depth_bounds_test = rsx_dsp_reg(rsx, M_DEPTH_BOUNDS_ENABLE) & 1;
 }
 
 u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
@@ -326,6 +330,7 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
     ENG_HASH_FIELD(bs_fail);
     ENG_HASH_FIELD(bs_zfail);
     ENG_HASH_FIELD(bs_zpass);
+    ENG_HASH_FIELD(depth_bounds_test);
 #undef ENG_HASH_FIELD
     return hash;
 }
@@ -2320,6 +2325,16 @@ static void sink_end(void* user, const rsx_dispatch* r)
     /* Dynamic, and deliberately outside the pipeline key. */
     g.be->set_stencil_ref(g.be->user,
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
+    /* The bounds too: a deferred renderer moves them between its light and
+     * sky passes without changing anything else. Raw floats, as written. */
+    if (g.be->set_depth_bounds) {
+        const u32 lo = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MIN);
+        const u32 hi = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MAX);
+        float fmin, fmax;
+        memcpy(&fmin, &lo, sizeof fmin);
+        memcpy(&fmax, &hi, sizeof fmax);
+        g.be->set_depth_bounds(g.be->user, fmin, fmax);
+    }
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,

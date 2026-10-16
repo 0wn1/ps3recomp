@@ -98,7 +98,8 @@
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
-    X(vkCmdSetStencilReference) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
+    X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) \
+    X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
@@ -193,6 +194,7 @@ typedef struct vk_state {
      * additionally blits the frame into the window's swapchain. */
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
+    int              depth_bounds_ok; /* depthBounds enabled                */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
     SDL_Window*      window;
@@ -2506,6 +2508,7 @@ static struct {
     u32          sc[4];
     int          have_vp, have_sc;
     u32          stencil_ref;
+    float        depth_bounds[2];     /* min, max for the next draw */
     vk_buffer    indices;
     u32          warned;
     /* The split set layout (vk_eng_split_layout) and its one set, made the
@@ -2797,7 +2800,14 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         .depthWriteEnable = (rs->depth_test && rs->depth_write) ? VK_TRUE : VK_FALSE,
         .depthCompareOp = vk_gcm_compare(rs->depth_func),
         .stencilTestEnable = rs->stencil_enable ? VK_TRUE : VK_FALSE,
-        .front = front, .back = back };
+        .front = front, .back = back,
+        /* The bounds themselves are dynamic (vk_eng_set_depth_bounds). */
+        .depthBoundsTestEnable = (rs->depth_bounds_test && s_vk.depth_bounds_ok) ? VK_TRUE : VK_FALSE,
+        .minDepthBounds = 0.0f, .maxDepthBounds = 1.0f };
+    if (rs->depth_bounds_test && !s_vk.depth_bounds_ok && !(s_e2.warned & 64u)) {
+        VK_LOG("engine: the device has no depthBounds; the depth bounds test is ignored\n");
+        s_e2.warned |= 64u;
+    }
     /* nv40 COLOR_MASK: B [0:7], G [8:15], R [16:23], A [24:31], any bit set.
      * Every attachment takes target A's blend and mask (see rsx_draw_engine.h). */
     VkColorComponentFlags wm = 0;
@@ -2819,11 +2829,11 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount = P->rt_count, .pAttachments = cba };
-    VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                              VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+    VkDynamicState dyn[4] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                              VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BOUNDS };
     VkPipelineDynamicStateCreateInfo dy = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 3, .pDynamicStates = dyn };
+        .dynamicStateCount = s_vk.depth_bounds_ok ? 4u : 3u, .pDynamicStates = dyn };
     VkGraphicsPipelineCreateInfo gci = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
@@ -2905,6 +2915,21 @@ static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
     s_e2.sc[0] = x; s_e2.sc[1] = y; s_e2.sc[2] = w; s_e2.sc[3] = h; s_e2.have_sc = 1;
 }
 static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_e2.stencil_ref = ref; }
+
+/* Vulkan wants the bounds inside [0, 1] without VK_EXT_depth_range_unrestricted;
+ * a NaN clamps to the open end so a garbage register cannot reject a draw. */
+static float vk_depth_bound(float v, float open)
+{
+    if (!(v == v)) return open;
+    return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+}
+
+static void vk_eng_set_depth_bounds(void* user, float min, float max)
+{
+    (void)user;
+    s_e2.depth_bounds[0] = vk_depth_bound(min, 0.0f);
+    s_e2.depth_bounds[1] = vk_depth_bound(max, 1.0f);
+}
 
 static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, VkImageView dview,
                                         u32 dkey, u32 w, u32 h)
@@ -3138,6 +3163,8 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
     pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
     pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
+    if (s_vk.depth_bounds_ok)
+        pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
     pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                              P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout,
                              0, 1, &set, 0, NULL);
@@ -3178,6 +3205,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .set_viewport         = vk_eng_set_viewport,
     .set_scissor          = vk_eng_set_scissor,
     .set_stencil_ref      = vk_eng_set_stencil_ref,
+    .set_depth_bounds     = vk_eng_set_depth_bounds,
     .draw                 = vk_eng_draw,
     .clear_color          = vk_eng_clear_color,
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
@@ -3261,6 +3289,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     pvkGetPhysicalDeviceFeatures(s_vk.phys, &have);
     want.textureCompressionBC = have.textureCompressionBC;
     s_vk.bc_ok = have.textureCompressionBC ? 1 : 0;
+    /* The depth bounds test: a deferred renderer bounds its light pass to
+     * the geometry and its sky to the far plane with it. Optional in
+     * Vulkan; without it the test stays off, as before. */
+    want.depthBounds = have.depthBounds;
+    s_vk.depth_bounds_ok = have.depthBounds ? 1 : 0;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
@@ -3428,6 +3461,11 @@ u32 rsx_vulkan_backend_readback_center(void)
 u32 rsx_vulkan_backend_guest_draws(void)
 {
     return s_vk.eng_active ? rsx_draw_engine_guest_draws() : s_g.last_draws;
+}
+
+int rsx_vulkan_backend_depth_bounds(void)
+{
+    return s_vk.eng_active && s_vk.depth_bounds_ok;
 }
 
 #endif /* !_WIN32 */
