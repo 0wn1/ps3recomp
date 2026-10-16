@@ -3337,10 +3337,19 @@ static uint16_t be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); 
 static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
 static uint64_t be64(const uint8_t* p) { return ((uint64_t)be32(p) << 32) | be32(p + 4); }
 
-/* Loaded image ranges remain live while the entry stack is constructed. BSS is
- * included: putting arguments in a zero-filled segment corrupts the image too. */
+/* Loaded image ranges remain live during entry-stack construction and later
+ * allocations. BSS is owned too, even though it has no file-backed bytes. */
 struct ppu_image_range { uint64_t begin, end; };
 static std::vector<ppu_image_range> g_ppu_image_ranges;
+extern "C" void sys_memory_set_image_query(uint64_t (*query)(uint64_t, uint64_t));
+
+static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
+{
+    uint64_t next = addr;
+    for (const auto& r : g_ppu_image_ranges)
+        if (addr < r.end && r.begin < end && r.end > next) next = r.end;
+    return next;
+}
 
 extern "C" uint32_t ppu_load_elf(const char* path)
 {
@@ -3363,6 +3372,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
     uint16_t phnum = be16(file + 56);
 
     g_ppu_image_ranges.clear();
+    sys_memory_set_image_query(ppu_image_overlap_end);
     int loaded = 0;
     for (uint16_t i = 0; i < phnum; i++) {
         uint64_t ph_off = phoff + (uint64_t)i * phentsize;

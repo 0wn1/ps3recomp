@@ -418,6 +418,9 @@ if(PS3RECOMP_BUILD_TESTS)
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME loaded_image_memory
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loaded_image_memory.py")
         add_test(NAME loader_memory_domain
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loader_memory_domain.py")

@@ -35,6 +35,12 @@ static mapper_reservation s_mapper_reservations[SYS_MEMORY_ALLOC_MAX];
 
 
 static uint32_t s_total_allocated = 0;
+static uint64_t (*s_image_query)(uint64_t addr, uint64_t end);
+
+void sys_memory_set_image_query(uint64_t (*query)(uint64_t addr, uint64_t end))
+{
+    s_image_query = query;
+}
 
 /* Guest threads are real host threads; serialize the bump allocator. */
 #ifdef _WIN32
@@ -67,16 +73,18 @@ static void write_be32(uint32_t addr, uint32_t val)
  * -----------------------------------------------------------------------*/
 /* Find an aligned gap among live user allocations. Freed blocks are reusable.
  * The small runtime-injected window is reserved even when a port relocates it
- * into this domain. Use 64-bit arithmetic for every exclusive range end. */
+ * into this domain, and loaded ELF data/BSS remain owned by the image.
+ * Use 64-bit arithmetic for every exclusive range end. */
 static uint32_t user_address(uint32_t size, uint32_t alignment)
 {
     uint64_t candidate = SYS_MEM_ALLOC_BASE;
     for (;;) {
         candidate = (candidate + alignment - 1u) & ~(uint64_t)(alignment - 1u);
         if (candidate + size > SYS_MEM_ALLOC_END) return 0;
-        uint64_t next = candidate;
+        uint64_t next = s_image_query ? s_image_query(candidate, candidate + size) : candidate;
         uint64_t injected = VM_HLE_INJECT_BASE;
-        if (candidate < injected + VM_HLE_INJECT_SIZE && injected < candidate + size)
+        if (candidate < injected + VM_HLE_INJECT_SIZE && injected < candidate + size &&
+            injected + VM_HLE_INJECT_SIZE > next)
             next = injected + VM_HLE_INJECT_SIZE;
         if (candidate < (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE &&
             VM_PPU_TLS_BASE < candidate + size && (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE > next)
@@ -310,7 +318,7 @@ static uint32_t mapper_address(uint64_t requested, uint64_t alignment)
         { VM_HLE_INJECT_BASE, (uint64_t)VM_HLE_INJECT_BASE + VM_HLE_INJECT_SIZE }
     };
     for (;;) {
-        uint64_t next = addr;
+        uint64_t next = s_image_query ? s_image_query(addr, addr + size) : addr;
         for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i)
             if (addr < reserved[i][1] && reserved[i][0] < addr + size &&
                 reserved[i][1] > next) next = reserved[i][1];
