@@ -3218,10 +3218,32 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 }
 
 /* NID: 0xD8F88E1A */
+/* libgcm writes this into the context: NV406E SEMAPHORE_OFFSET and
+ * SEMAPHORE_ACQUIRE for the label, then the flip, so the RSX flips once the
+ * label holds the value. The import used to write the label itself, from the
+ * PPU, and flip at call time: whoever was meant to write the label was
+ * overruled, and the flip did not wait for anything. Twisted Metal flips this
+ * way on its main context. Queue it the same way as _cellGcmSetFlipCommand,
+ * and fall back to the immediate form when the context is not a mapped command
+ * buffer or has no room. */
 s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
                                         u32 labelIndex, u32 labelValue)
 {
-    (void)ctx;
+    const u32 c = (u32)(uintptr_t)ctx;
+    if (c && labelIndex < CELL_GCM_MAX_LABEL_COUNT &&
+        bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM && s_display_buffer_set[bufferId]) {
+        const u32 end = vm_read32(c + 4), cur = vm_read32(c + 8);
+        if (cur + 16 + 8 + GCM_RECYCLE_SLACK <= end && gcm_ea2io(cur) != 0xFFFFFFFFu) {
+            vm_write32(cur + 0,  0x00040064u);   /* SEMAPHORE_OFFSET  */
+            vm_write32(cur + 4,  labelIndex * GCM_LABEL_STRIDE);
+            vm_write32(cur + 8,  0x00040068u);   /* SEMAPHORE_ACQUIRE */
+            vm_write32(cur + 12, labelValue);
+            vm_write32(c + 8, cur + 16);
+            if (gcm_flip_into_fifo(c, bufferId))
+                return gcm_flip_request(bufferId, 1);
+            vm_write32(c + 8, cur);              /* no room for the flip */
+        }
+    }
     return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
 }
 
