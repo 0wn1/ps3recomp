@@ -187,7 +187,7 @@ int main(int argc, char** argv)
                           /* src0 reg_type 0 (temp), reg 0 */ RSX_TEST_FP_SWZ_IDENT);
         check_count("pack FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
                                                             g_hlsl, sizeof g_hlsl, NULL), 2);
-        check("pack FP HLSL", g_hlsl, "asfloat(_rsx_pk4ub((input.col0).xyzw))");
+        check("pack FP HLSL", g_hlsl, "asfloat(_rsx_pk4ub((saturate(input.col0)).xyzw))");
         check("pack FP HLSL", g_hlsl, "_rsx_srgb2lin(_rsx_up4ub(((r[0]).xyzw).x))");
         check("pack FP HLSL", g_hlsl, "uint   _rsx_pk4ub(float4 v)");
         check("pack FP HLSL", g_hlsl, "float4 _rsx_srgb2lin(float4 cs)");
