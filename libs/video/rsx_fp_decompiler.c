@@ -71,8 +71,8 @@ enum {
     OP_TXD=0x19, OP_RCP=0x1A, OP_RSQ=0x1B, OP_EX2=0x1C, OP_LG2=0x1D,
     OP_LIT=0x1E, OP_LRP=0x1F, OP_STR=0x20, OP_SFL=0x21, OP_COS=0x22,
     OP_SIN=0x23, OP_PK2H=0x24, OP_UP2H=0x25, OP_POW=0x26, OP_PK4UB=0x27,
-    OP_UP4UB=0x28, OP_PK2US=0x29, OP_UP2US=0x2A, OP_DP2A=0x2E, OP_TXL=0x2F,
-    OP_TXB=0x31, OP_RFL=0x36, OP_DP2=0x38, OP_NRM=0x39, OP_DIV=0x3A,
+    OP_UP4UB=0x28, OP_PK2US=0x29, OP_UP2US=0x2A, OP_PKG=0x2C, OP_UPG=0x2D, OP_DP2A=0x2E, OP_TXL=0x2F,
+    OP_TXB=0x31, OP_TEXBEM=0x33, OP_TXPBEM=0x34, OP_RFL=0x36, OP_DP2=0x38, OP_NRM=0x39, OP_DIV=0x3A,
     OP_DIVSQ=0x3B, OP_LIF=0x3C, OP_FENCT=0x3D, OP_FENCB=0x3E
 };
 
@@ -94,6 +94,10 @@ const char* rsx_fp_opcode_name(u32 op)
     case OP_TXL: return "TXL"; case OP_TXB: return "TXB"; case OP_RFL: return "RFL";
     case OP_DIV: return "DIV"; case OP_DP2: return "DP2"; case OP_NRM: return "NRM";
     case OP_DIVSQ: return "DIVSQ"; case OP_LIF: return "LIF";
+    case OP_PK4B: return "PK4B"; case OP_UP4B: return "UP4B"; case OP_PK2H: return "PK2H";
+    case OP_UP2H: return "UP2H"; case OP_PK4UB: return "PK4UB"; case OP_UP4UB: return "UP4UB";
+    case OP_PK2US: return "PK2US"; case OP_UP2US: return "UP2US"; case OP_PKG: return "PKG";
+    case OP_UPG: return "UPG";
     case OP_FENCT: return "FENCT"; case OP_FENCB: return "FENCB";
     default:     return "?";
     }
@@ -336,8 +340,10 @@ static const char* input_expr(u32 input_src)
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
     case 0x0: return "input.position"; /* WPOS */
-    case 0x1: return "input.col0";     /* COL0 */
-    case 0x2: return "input.col1";     /* COL1 */
+    /* RSX clamps fragment color-input reads before swizzle/abs/negate.
+     * Texture coordinates and the vertex output registers remain unbounded. */
+    case 0x1: return "saturate(input.col0)"; /* COL0 */
+    case 0x2: return "saturate(input.col1)"; /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
     default:
         if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */
@@ -415,12 +421,146 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
     return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
 }
 
+void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
+    u32 dimension, u32 cube, u32 mips, u32 filter, u32 address, u32 control0)
+{
+    memset(out, 0, sizeof *out);
+    const u32 base = format & 0x9Fu, func = (address >> 28) & 15u;
+    if (!(control0 & 0x80000000u) || (control0 & 4u) ||
+        (base != 0x90 && base != 0x91 && base != 0x92 && base != 0x93) ||
+        func == 0 || func == 7) return;
+    const u32 minf = (filter >> 16) & 7u, magf = (filter >> 24) & 7u;
+    const int minlin = minf == 2 || minf == 4 || minf == 6;
+    const int maglin = magf == 2;
+    out->enabled = (base == 0x91 || base == 0x93 || func > 7 || dimension != 2 || cube || mips > 1 ||
+        minf < 1 || minf > 6 || magf < 1 || magf > 2 || minlin != maglin) ? 2 : 1;
+    out->func = (u8)func;
+    out->linear = (u8)minlin;
+    out->unnormalized = (u8)((format & 0x40u) != 0);
+}
+
+u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes)
+{
+    u32 units = 0;
+    if (!ucode) return 0;
+    for (u32 off = 0; off + 16 <= max_bytes;) {
+        const u32 w0 = rsx_fp_read_word(ucode + off);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        const u32 op = (w0 >> 24) & 63u;
+        if (!(w2 & FP_BRANCH) && (op == OP_TEX || op == OP_TXP ||
+            op == OP_TXB || op == OP_TXL || op == OP_TXD ||
+            op == OP_TEXBEM || op == OP_TXPBEM))
+            units |= 1u << ((w0 >> FP_TEX_UNIT_SHIFT) & 15u);
+        off += 16;
+        if (!(w2 & FP_BRANCH) && ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2))
+            off += 16;
+        if (w0 & FP_END) break;
+    }
+    return units;
+}
+
+static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
+                              const rsx_fp_shadow_desc* d)
+{
+    char tex[32], text[4096];
+    snprintf(tex, sizeof tex, cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", unit);
+    const char* cmp[] = { "0.0", "reference < depth", "reference == depth",
+        "reference <= depth", "reference > depth", "reference != depth",
+        "reference >= depth", "1.0" };
+    snprintf(text, sizeof text,
+        "float _rsx_shadow_cmp%u(float reference, float depth) { return (float)(%s); }\n"
+        "float4 _rsx_shadow%u(float3 coordinate) {\n"
+        "    float reference = saturate(coordinate.z);\n",
+        unit, cmp[d->func], unit);
+    out_puts(p, text);
+    if (d->linear || d->unnormalized) {
+        snprintf(text, sizeof text, "    uint width, height; %s.GetDimensions(width, height);\n"
+            "    float2 size = float2(width, height);\n", tex);
+        out_puts(p, text);
+    }
+    out_puts(p, d->unnormalized ? "    float2 uv = coordinate.xy / size;\n" :
+                                     "    float2 uv = coordinate.xy;\n");
+    if (!d->linear) {
+        snprintf(text, sizeof text,
+            "    float depth = %s.SampleLevel(rsx_samp[%u], uv, 0.0).r;\n"
+            "    return (float4)_rsx_shadow_cmp%u(reference, depth);\n}\n",
+            tex, unit, unit);
+        out_puts(p, text);
+        return;
+    }
+    out_puts(p, "    float2 position = uv * size - 0.5;\n"
+        "    float2 base = floor(position); float2 fraction = position - base;\n");
+    for (u32 tap = 0; tap < 4; tap++) {
+        snprintf(text, sizeof text,
+            "    float d%u = %s.SampleLevel(rsx_samp[%u], (base + float2(%s, %s)) / size, 0.0).r;\n"
+            "    float c%u = _rsx_shadow_cmp%u(reference, d%u);\n",
+            tap, tex, unit, (tap & 1) ? "1.5" : "0.5", (tap & 2) ? "1.5" : "0.5", tap, unit, tap);
+        out_puts(p, text);
+    }
+    out_puts(p, "    return (float4)lerp(lerp(c0, c1, fraction.x), lerp(c2, c3, fraction.x), fraction.y);\n}\n");
+}
+
+/* EXP_TEX overrides gamma on compatible normalized color formats. Metadata
+ * has already excluded formats without gamma support. */
+u32 rsx_fp_texture_gamma_units(const u8* ucode, u32 max_bytes,
+                                const u8 gamma_masks[16])
+{
+    if (!ucode || !gamma_masks) return 0;
+    u32 units = 0;
+    for (u32 off = 0; off + 16 <= max_bytes;) {
+        const u32 w0 = rsx_fp_read_word(ucode + off);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        const u32 op = (w0 >> 24) & 63u, unit = (w0 >> FP_TEX_UNIT_SHIFT) & 15u;
+        if (!(w2 & FP_BRANCH) && !(w0 & (1u << 21)) && gamma_masks[unit] &&
+            (op == OP_TEX || op == OP_TXP || op == OP_TXB || op == OP_TXL ||
+             op == OP_TXD || op == OP_TEXBEM || op == OP_TXPBEM))
+            units |= 1u << unit;
+        off += 16;
+        if (!(w2 & FP_BRANCH) && ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2)) off += 16;
+        if (w0 & FP_END) return units;
+    }
+    return 0;
+}
+
+static void fp_gamma_helper(Out* out)
+{
+    out_puts(out,
+        "float4 _rsx_gamma_input(float4 v, uint mask) {\n"
+        "    float4 lo = v / 12.92;\n"
+        "    float4 hi = pow(max((v + 0.055) / 1.055, (float4)0), (float4)2.4);\n"
+        "    float4 decoded = float4(v.r > 0.04045 ? hi.r : lo.r,\n"
+        "                            v.g > 0.04045 ? hi.g : lo.g,\n"
+        "                            v.b > 0.04045 ? hi.b : lo.b,\n"
+        "                            v.a > 0.04045 ? hi.a : lo.a);\n"
+        "    return float4((mask & 1u) ? decoded.r : v.r,\n"
+        "                  (mask & 2u) ? decoded.g : v.g,\n"
+        "                  (mask & 4u) ? decoded.b : v.b,\n"
+        "                  (mask & 8u) ? decoded.a : v.a);\n}\n");
+}
+
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
-    int buffered, char* out, u32 out_size, u32* out_constant_count)
+    int buffered, const rsx_fp_shadow_desc* shadow, const u8 gamma_masks[16],
+    char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
+    const u32 gamma_units = rsx_fp_texture_gamma_units(ucode, max_bytes, gamma_masks);
 
+    const u32 sampled_units = rsx_fp_texture_units(ucode, max_bytes);
+    if (shadow) for (u32 u = 0; u < 16; u++)
+        if ((sampled_units & (1u << u)) && shadow[u].enabled &&
+            (shadow[u].enabled != 1 || shadow[u].func > 7 ||
+             shadow[u].linear > 1 || shadow[u].unnormalized > 1 ||
+             (tex_cube_mask & (1u << u)))) {
+            static u32 n_layout_errors;
+            if (n_layout_errors++ < 32)
+                fprintf(stderr, "[RSX fp] unsupported depth comparison layout on texture unit %u\n", u);
+            return -1;
+        }
     u32 buffered_constant_count = 0;
     if (buffered) {
         rsx_fp_constant_block constants;
@@ -440,6 +580,7 @@ static int rsx_fp_decompile_internal(
      * Emitting the preamble here would mean guessing it. */
     Out o = { out, out_size, 0, 1 };
     out[0] = '\0';
+    int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
     out_puts(&o,
         "    float4 r[48]; float4 h[48];\n"
         /* Fully initialise both register files: RSX programs routinely read a
@@ -487,6 +628,14 @@ static int rsx_fp_decompile_internal(
         u32 opcode    = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
         u32 input_src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
+        if (!(w2 & FP_BRANCH) && shadow && shadow[tex_unit].enabled &&
+            (opcode == OP_TXB || opcode == OP_TXL || opcode == OP_TXD ||
+             opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+            static u32 n_fetch_errors;
+            if (n_fetch_errors++ < 32)
+                fprintf(stderr, "[RSX fp] unsupported depth comparison fetch on texture unit %u\n", tex_unit);
+            return -1;
+        }
         int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
 
         /* Execution condition (exec_if) + condition-code write (set_cond).
@@ -609,6 +758,14 @@ static int rsx_fp_decompile_internal(
             continue;
         }
 
+        if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
+            (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
+            static u32 reported;
+            if (reported++ < 32)
+                fprintf(stderr, "[RSX fp] gamma fetch opcode %u unsupported on unit %u\n", opcode, tex_unit);
+            return -1;
+        }
+
         /* Build the RHS expression for this opcode. */
         char rhs[640];
         int handled = 1;
@@ -625,6 +782,18 @@ static int rsx_fp_decompile_internal(
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
+        /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
+         * builtins): the packed word is a scalar that replicates. */
+        case OP_PK4UB: uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4ub(%s))", a); break;
+        case OP_UP4UB: uses_pack = 1; snprintf(rhs, sizeof(rhs), "_rsx_up4ub((%s).x)", a); break;
+        case OP_PKG:   uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4ub(_rsx_lin2srgb(%s)))", a); break;
+        case OP_UPG:   uses_pack = 1; snprintf(rhs, sizeof(rhs), "_rsx_srgb2lin(_rsx_up4ub((%s).x))", a); break;
+        case OP_PK4B:  uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4b(%s))", a); break;
+        case OP_UP4B:  uses_pack = 1; snprintf(rhs, sizeof(rhs), "_rsx_up4b((%s).x)", a); break;
+        case OP_PK2US: uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk2us(%s))", a); break;
+        case OP_UP2US: uses_pack = 1; snprintf(rhs, sizeof(rhs), "_rsx_up2us((%s).x)", a); break;
+        case OP_PK2H:  uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk2h(%s))", a); break;
+        case OP_UP2H:  uses_pack = 1; snprintf(rhs, sizeof(rhs), "_rsx_up2h((%s).x)", a); break;
         /* Real RSX RSQ ignores the input's sign — 1/sqrt(|x|), not 1/sqrt(x)
          * (oracle: RPCS3 FragmentProgramDecompiler.cpp, "RSQ ignores the sign
          * of the inputs (Metro Last Light, GTA4)"). The strict form NaN'd the
@@ -672,6 +841,10 @@ static int rsx_fp_decompile_internal(
         case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
         case OP_TEX:
+            if (shadow && shadow[tex_unit].enabled) {
+                snprintf(rhs, sizeof(rhs), "_rsx_shadow%u((%s).xyz)", tex_unit, a);
+                break;
+            }
             if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Cubemap: sample with the full 3-component direction vector. */
                 snprintf(rhs, sizeof(rhs),
@@ -684,6 +857,10 @@ static int rsx_fp_decompile_internal(
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             break;
         case OP_TXP:
+            if (shadow && shadow[tex_unit].enabled) {
+                snprintf(rhs, sizeof(rhs), "_rsx_shadow%u((%s).xyz / (%s).w)", tex_unit, a, a);
+                break;
+            }
             if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Projective divide is meaningless for a cube lookup; sample
                  * the direction directly. */
@@ -730,12 +907,25 @@ static int rsx_fp_decompile_internal(
             }
             handled = 0;   /* no destination write */
             break;
-        default:
-            out_puts(&o, "    /* TODO: unhandled FP opcode ");
-            out_puts(&o, rsx_fp_opcode_name(opcode));
-            out_puts(&o, " */\n");
+        default: {
+            /* The number and the raw words, so an opcode outside the table
+             * can be identified from the dumped shader alone. */
+            char todo[160];
+            snprintf(todo, sizeof todo,
+                     "    /* TODO: unhandled FP opcode 0x%02X (%s) words %08X %08X %08X %08X */\n",
+                     opcode, rsx_fp_opcode_name(opcode), w0, w1, w2, w3);
+            out_puts(&o, todo);
             handled = 0;
+            break; }
             break;
+        }
+
+        if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
+            (opcode == OP_TEX || opcode == OP_TXP || opcode == OP_TXB || opcode == OP_TXL)) {
+            char sample[sizeof rhs]; memcpy(sample, rhs, sizeof sample);
+            const int length = snprintf(rhs, sizeof rhs, "_rsx_gamma_input(%s, %uu)",
+                                        sample, gamma_masks[tex_unit] & 15u);
+            if (length < 0 || (size_t)length >= sizeof rhs) return -1;
         }
 
         int has_dest = !(w0 & FP_OUT_NONE);
@@ -787,13 +977,17 @@ static int rsx_fp_decompile_internal(
                                  "      /* exec_if=none: write suppressed */\n");
                     } else {
                         /* Per-component select gated by the CC sign test.
-                         * lerp(dst, _v, mask) == mask ? _v : dst since the
-                         * mask is exactly 0.0/1.0 from the bool->float cast. */
+                         * A real select, not lerp(dst, _v, mask): lerp is
+                         * arithmetic (dst + mask * (_v - dst)), so an Inf or
+                         * NaN in the unselected operand poisons the result
+                         * (0 * Inf = NaN), and a register holding raw bits
+                         * (a packed word) loses its denormal and NaN
+                         * patterns on the way through the ALU. */
                         snprintf(buf, sizeof(buf),
                                  "      float4 _p = (float4)((cc%u).%s %s (float4)0.0);\n"
-                                 "      %s[%u].%s = lerp(%s[%u].%s, _v.%s, _p.%s);\n",
+                                 "      %s[%u].%s = (_p.%s != 0.0) ? _v.%s : %s[%u].%s;\n",
                                  cc_read, cswz, cmp_op,
-                                 reg, dst_idx, m, reg, dst_idx, m, m, m);
+                                 reg, dst_idx, m, m, m, reg, dst_idx, m);
                     }
                     out_puts(&o, buf);
                 }
@@ -851,7 +1045,15 @@ static int rsx_fp_decompile_internal(
     for (u32 t = FP_MAX_COLOR_TARGETS; t-- > 1; )
         if (wrote[half_exports][t]) { targets = t + 1; break; }
 
-    if (targets == 1) {
+    /* Depth export. SHADER_CONTROL bits 1-3 (0xE,
+     * CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT) make the program's depth the
+     * fragment depth: always the fp32 register r1.z, whatever the colour
+     * export width, clamped to [0,1]. Without SV_Depth the fragment keeps the
+     * interpolated depth of the primitive, so a full-screen pass that rebuilds
+     * a depth buffer writes the quad's constant depth instead. The output
+     * becomes a struct even for one colour target. */
+    const int depth_export = ctrl != RSX_FP_CTRL_AUTO && (ctrl & 0xEu) != 0u;
+    if (targets == 1 && !depth_export) {
         char tail[96];
         snprintf(tail, sizeof(tail),
                  "    float4 _o = %s[0];\n"
@@ -871,13 +1073,16 @@ static int rsx_fp_decompile_internal(
                      t, t, t, t);
             out_puts(&o, line);
         }
+        if (depth_export)
+            out_puts(&o, "    float _d = r[1].z;\n"
+                         "    _out.depth = (_d == _d) ? saturate(_d) : 0.0;\n");
         out_puts(&o, "    return _out;\n}\n");
     }
 
     /* Preamble: PSInput matches the backend's placeholder layout; temp/half
      * register files; texture+sampler banks for TEX. Built here, in front of
      * the body, now that the return type is known. */
-    char preamble[2048];
+    char preamble[32768]; /* bounded room for all 16 comparison helpers */
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
     out_puts(&p,
@@ -915,7 +1120,29 @@ static int rsx_fp_decompile_internal(
             buffered_constant_count ? buffered_constant_count : 1u);
         out_puts(&p, constants_decl);
     }
-    if (targets == 1) {
+    if (shadow) for (u32 u = 0; u < 16; u++)
+        if ((sampled_units & (1u << u)) && shadow[u].enabled)
+            fp_shadow_helper(&p, u, tex_cube_mask, &shadow[u]);
+    if (gamma_units) fp_gamma_helper(&p);
+    /* NV40 pack/unpack. A packed word travels on in a float's bits, so the
+     * packs bitcast and the unpacks bitcast back; the sRGB forms follow
+     * RPCS3's _builtin_pkg/_builtin_upg (linear_to_srgb, srgb_to_linear).
+     * These were the opcodes inFAMOUS 2's character materials used and the
+     * decompiler skipped, leaving the destination with whatever it held.
+     * Only for a program that uses one, so every other program's text is
+     * unchanged. */
+    if (uses_pack) out_puts(&p,
+        "uint   _rsx_pk4ub(float4 v) { uint4 b = (uint4)round(saturate(v) * 255.0); return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }\n"
+        "float4 _rsx_up4ub(float v) { uint u = asuint(v); return float4(u & 255u, (u >> 8) & 255u, (u >> 16) & 255u, (u >> 24) & 255u) / 255.0; }\n"
+        "uint   _rsx_pk4b(float4 v) { uint4 b = (uint4)((int4)round(clamp(v, -1.0, 1.0) * 127.0)) & 255u; return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }\n"
+        "float4 _rsx_up4b(float v) { uint u = asuint(v); int4 b = int4(u & 255u, (u >> 8) & 255u, (u >> 16) & 255u, (u >> 24) & 255u); b = (b << 24) >> 24; return clamp((float4)b / 127.0, -1.0, 1.0); }\n"
+        "uint   _rsx_pk2us(float4 v) { uint2 b = (uint2)round(saturate(v.xy) * 65535.0); return b.x | (b.y << 16); }\n"
+        "float4 _rsx_up2us(float v) { uint u = asuint(v); return float4(u & 65535u, u >> 16, u & 65535u, u >> 16) / 65535.0; }\n"
+        "uint   _rsx_pk2h(float4 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }\n"
+        "float4 _rsx_up2h(float v) { uint u = asuint(v); return float4(f16tof32(u & 65535u), f16tof32(u >> 16), f16tof32(u & 65535u), f16tof32(u >> 16)); }\n"
+        "float4 _rsx_lin2srgb(float4 cl) { cl = saturate(cl); float4 low = cl * 12.92; float4 high = 1.055 * pow(cl, 1.0 / 2.4) - 0.055; return saturate((cl < 0.0031308) ? low : high); }\n"
+        "float4 _rsx_srgb2lin(float4 cs) { float4 a = cs / 12.92; float4 b = pow(max(cs + 0.055, 0.0) / 1.055, 2.4); return (cs > 0.04045) ? b : a; }\n");
+    if (targets == 1 && !depth_export) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
         out_puts(&p, "struct PSOutput {\n");
@@ -925,6 +1152,8 @@ static int rsx_fp_decompile_internal(
                      "    float4 t%u : SV_TARGET%u;\n", t, t);
             out_puts(&p, member);
         }
+        if (depth_export)
+            out_puts(&p, "    float depth : SV_Depth;\n");
         out_puts(&p, "};\n"
                      "PSOutput main(PSInput input) {\n");
     }
@@ -940,7 +1169,7 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, out, out_size, NULL);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, NULL, NULL, out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
@@ -948,8 +1177,26 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 1, out, out_size,
+        ucode, max_bytes, ctrl, tex_cube_mask, 1, NULL, NULL, out, out_size,
         out_constant_count);
+}
+
+int rsx_fp_decompile_buffered_shadow_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const rsx_fp_shadow_desc shadow[16],
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+        1, shadow, NULL, out, out_size, out_constant_count);
+}
+
+int rsx_fp_decompile_buffered_shadow_color_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+        1, shadow, gamma_masks, out, out_size, out_constant_count);
 }
 
 static float fp_half_to_float(u16 h)
@@ -1263,4 +1510,82 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
             memcpy(q, "rsx_tex", 7);
     }
     return patched;
+}
+
+/* NV4097_SET_SHADER_PACKER accepts any nonzero value. Floating surfaces and
+ * 32-bit exports bypass the integer framebuffer's RGB transfer function. */
+int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format)
+{
+    return packer != 0 && !(ctrl & FP_CTRL_32BIT_EXPORTS) &&
+           color_format != 0x0Bu && color_format != 0x0Cu && color_format != 0x0Du;
+}
+
+int rsx_fp_apply_srgb_output(char* hlsl, u32 capacity)
+{
+    static const char helper[] =
+        "float4 _rsx_srgb_output(float4 v) {\n"
+        "    float3 lo = v.rgb * 12.92;\n"
+        "    float3 hi = 1.055 * pow(max(v.rgb, (float3)0), (float3)(1.0 / 2.4)) - 0.055;\n"
+        "    float3 rgb = float3(v.r < 0.0031308 ? lo.r : hi.r,\n"
+        "                         v.g < 0.0031308 ? lo.g : hi.g,\n"
+        "                         v.b < 0.0031308 ? lo.b : hi.b);\n"
+        "    return float4(saturate(rgb), v.a);\n}\n";
+    if (!hlsl || !capacity) return -1;
+    size_t len = 0;
+    while (len < capacity && hlsl[len]) ++len;
+    if (len == capacity || strstr(hlsl, "_rsx_srgb_output")) return -1;
+    char* marker = NULL;
+    for (char* p = strstr(hlsl, "    return "); p;
+         p = strstr(p + 1, "    return ")) marker = p;
+    if (!marker) return -1;
+    const char* expression = marker + strlen("    return ");
+    const char* end = strstr(expression, ";\n}\n");
+    if (!end || end == expression || (size_t)(end - expression) >= 96 || end[4])
+        return -1;
+    char output[96];
+    memcpy(output, expression, (size_t)(end - expression));
+    output[end - expression] = 0;
+    const int mrt = strstr(hlsl, "struct PSOutput") != NULL;
+    char suffix[1024];
+    int n = snprintf(suffix, sizeof suffix, "    %s _rsx_color_out = %s;\n",
+                     mrt ? "PSOutput" : "float4", output);
+    if (n < 0 || (size_t)n >= sizeof suffix) return -1;
+    if (mrt) {
+        unsigned targets = 0;
+        for (unsigned t = 0; t < 4; ++t) {
+            char field[64];
+            snprintf(field, sizeof field, "    float4 t%u : SV_TARGET%u;", t, t);
+            if (!strstr(hlsl, field)) continue;
+            const int added = snprintf(suffix + n, sizeof suffix - (size_t)n,
+                "    _rsx_color_out.t%u = _rsx_srgb_output(_rsx_color_out.t%u);\n", t, t);
+            if (added < 0 || (size_t)added >= sizeof suffix - (size_t)n) return -1;
+            n += added; ++targets;
+        }
+        if (!targets) return -1;
+    } else {
+        const int added = snprintf(suffix + n, sizeof suffix - (size_t)n,
+            "    _rsx_color_out = _rsx_srgb_output(_rsx_color_out);\n");
+        if (added < 0 || (size_t)added >= sizeof suffix - (size_t)n) return -1;
+        n += added;
+    }
+    const int added = snprintf(suffix + n, sizeof suffix - (size_t)n,
+                              "    return _rsx_color_out;\n}\n");
+    if (added < 0 || (size_t)added >= sizeof suffix - (size_t)n) return -1;
+    n += added;
+    const size_t prefix = (size_t)(marker - hlsl);
+    const size_t helper_len = sizeof helper - 1;
+    if (helper_len + prefix + (size_t)n + 1 > capacity) return -1;
+    /* All parsing/capacity checks precede the first mutation. */
+    memcpy(marker, suffix, (size_t)n + 1);
+    memmove(hlsl + helper_len, hlsl, prefix + (size_t)n + 1);
+    memcpy(hlsl, helper, helper_len);
+    return 1;
+}
+
+int rsx_fp_decompile_buffered_color_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+        1, NULL, gamma_masks, out, out_size, out_constant_count);
 }

@@ -14,6 +14,9 @@
  *   FP  MOV r0, COL0 (END)                 colour out
  *   FP  MOV r0, COL0.zyxw (END)            colour out, red and blue swapped:
  *                                          what the host's --shader mode runs
+ *   FP  MOV r0, -abs(COL1.zyxw) (END)      colour clamp before source modifiers
+ *   FP  PK4UB r0, COL0 ; UPG r0, r0 (END)  pack to 8-bit, unpack sRGB->linear:
+ *                                          what a character material does
  *   FP  TEX r0, TC0 unit 0 (END)           texture unit 0 sampled at texcoord0
  *   FP  TEX r0, TC0 unit 0, CUBE (END)     ... with unit 0 a cube map
  *   VP  MOV o0, v0 ; TXL o1, v8 (END)      a vertex texture sampled at t16
@@ -44,6 +47,17 @@ static void check(const char* what, const char* text, const char* needle)
     } else {
         printf("[FAIL] %s -- missing \"%s\"\n", what, needle);
         if (!g_verbose && text) printf("----\n%s\n----\n", text);
+        g_fail++;
+    }
+}
+
+static void check_absent(const char* what, const char* text, const char* needle)
+{
+    if (text && !strstr(text, needle)) {
+        printf("[PASS] %s -- no \"%s\"\n", what, needle);
+        g_pass++;
+    } else {
+        printf("[FAIL] %s -- found \"%s\"\n", what, needle);
         g_fail++;
     }
 }
@@ -122,7 +136,7 @@ int main(int argc, char** argv)
         u32 nconst = 0;
         check_count("FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u /* r0 exports */, 0,
                                                        g_hlsl, sizeof g_hlsl, &nconst), 1);
-        check("FP HLSL", g_hlsl, "(input.col0).xyzw");
+        check("FP HLSL", g_hlsl, "(saturate(input.col0)).xyzw");
         check("FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
         check("FP HLSL", g_hlsl, "cbuffer PSConstants : register(b1)");
         /* The alpha test patch must survive translation as well. */
@@ -147,10 +161,63 @@ int main(int argc, char** argv)
         rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ(2, 1, 0, 3));
         check_count("swizzled FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
                                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
-        check("swizzled FP HLSL", g_hlsl, "(input.col0).zyxw");
+        check("swizzled FP HLSL", g_hlsl, "(saturate(input.col0)).zyxw");
         check("swizzled FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
         if (translate("swizzled FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
             check("swizzled FP MSL", g_msl, "fragment ");
+        /* No pack/unpack opcode, so none of the helpers: the text of a program
+         * that does not use them is the same as before they existed. */
+        check_absent("swizzled FP HLSL", g_hlsl, "_rsx_pk4ub");
+    }
+
+    /* ---- fragment program: PK4UB r0, COL0 ; UPG r0, r0 ---------------------
+     * The pack/unpack pair a character material uses for its sRGB<->linear
+     * conversion. The packed word is carried in r0's bits (asfloat), and the
+     * unpack reads them back (asuint): the two must round-trip through
+     * glslang and spirv-cross, which is where a bitcast can go wrong. */
+    {
+        u8 fp[32];
+        rsx_test_fp_instr(fp,
+                          RSX_TEST_FP_OPC(0x27 /* PK4UB */) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_INSRC_COL0 | RSX_TEST_FP_OUTREG(0),
+                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        rsx_test_fp_instr(fp + 16,
+                          RSX_TEST_FP_OPC(0x2D /* UPG */) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_OUTREG(0) | RSX_TEST_FP_END,
+                          /* src0 reg_type 0 (temp), reg 0 */ RSX_TEST_FP_SWZ_IDENT);
+        check_count("pack FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                            g_hlsl, sizeof g_hlsl, NULL), 2);
+        check("pack FP HLSL", g_hlsl, "asfloat(_rsx_pk4ub((saturate(input.col0)).xyzw))");
+        check("pack FP HLSL", g_hlsl, "_rsx_srgb2lin(_rsx_up4ub(((r[0]).xyzw).x))");
+        check("pack FP HLSL", g_hlsl, "uint   _rsx_pk4ub(float4 v)");
+        check("pack FP HLSL", g_hlsl, "float4 _rsx_srgb2lin(float4 cs)");
+        if (translate("pack FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("pack FP MSL", g_msl, "fragment ");
+            check("pack FP MSL", g_msl, "[[color(0)]]");
+        }
+    }
+
+    /* ---- fragment program: MOV r0, -abs(COL1.zyxw) ------------------------
+     * Clamp the interpolated colour before abs/negate: clamping a negated
+     * colour instead would discard the negative result. DWORD1 bits 29 and
+     * 17 are source abs and negate, respectively. */
+    {
+        u8 fp[16];
+        rsx_test_fp_instr(fp,
+                          RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_INSRC(2) /* COL1 */ | RSX_TEST_FP_END,
+                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ(2, 1, 0, 3) |
+                          (1u << 29) /* abs */ | (1u << 17) /* negate */);
+        check_count("modified COL1 FP",
+                    rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("modified COL1 FP HLSL", g_hlsl,
+              "-(abs((saturate(input.col1)).zyxw))");
+        if (translate("modified COL1 FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("modified COL1 FP MSL", g_msl, "fragment ");
+            check("modified COL1 FP MSL", g_msl, "[[user(locn1)]]");
+            check("modified COL1 FP MSL", g_msl, "[[color(0)]]");
+        }
     }
 
     /* ---- fragment program: TEX r0, TC0 (unit 0) --------------------------- */
@@ -160,6 +227,8 @@ int main(int argc, char** argv)
         check_count("TEX FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
                                                            g_hlsl, sizeof g_hlsl, NULL), 1);
         check("TEX FP HLSL", g_hlsl, "rsx_tex[0].Sample(rsx_samp[0]");
+        /* Colour input clamping must not affect texture coordinates. */
+        check("TEX FP HLSL", g_hlsl, "(input.tc0).xyzw");
         check("TEX FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
 
         if (translate("TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
@@ -255,7 +324,7 @@ int main(int argc, char** argv)
         check("MRT FP HLSL", g_hlsl, "PSOutput main(PSInput input) {");
         check("MRT FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
         check("MRT FP HLSL", g_hlsl, "r[2].xyzw = _v.xyzw;");
-        check("MRT FP HLSL", g_hlsl, "(input.col0).zyxw");
+        check("MRT FP HLSL", g_hlsl, "(saturate(input.col0)).zyxw");
 
         if (translate("MRT FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
             check("MRT FP MSL", g_msl, "fragment ");

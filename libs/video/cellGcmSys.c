@@ -277,6 +277,26 @@ static CellGcmZcullInfo s_zcull[CELL_GCM_MAX_ZCULL_COUNT];
 /* Report data area (256 slots, each 16 bytes) */
 static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
 
+/* NV4097_SET_CONTEXT_DMA_REPORT (0x1A8): where NV4097_GET_REPORT writes.
+ * Local (0xFEED0000, the default): the s_report_data slots above, read back
+ * through cellGcmGetReport* / cellGcmGetReportDataAddress. Main memory
+ * (0xFEED0001, or CELL_GCM_CONTEXT_DMA_REPORT_LOCATION_MAIN 0xBAD68000): the
+ * report's 24-bit offset is an IO offset, and the 16-byte report goes to
+ * guest memory at gcm_io2ea(offset), where the title reads it itself.
+ * Killzone 3 sets 0xFEED0001 and keeps its reports in its own frame data. */
+static u32 s_report_dma = 0xFEED0000u;
+static u64 s_report_last_ts;
+
+/* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
+ * walker pass must not share a time stamp or go backwards. */
+static u64 gcm_report_timestamp(void)
+{
+    u64 t = get_timestamp_ns();
+    if (t <= s_report_last_ts) t = s_report_last_ts + 1u;
+    s_report_last_ts = t;
+    return t;
+}
+
 /* Label area (256 labels, each u32). Labels live in GUEST memory so the
  * recompiled game can poll them via vm_read32; cellGcmGetLabelAddress returns a
  * guest address into this window (16-byte spaced as on hardware). A host array
@@ -419,6 +439,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
+    s_report_dma = 0xFEED0000u;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
@@ -785,6 +806,9 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
+/* How long a self-JUMP park may stand with `put` somewhere else before the
+ * drain gives up on it being patched and follows `put` instead. */
+#define GCM_PARK_GRACE_MS 50ull
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -1369,8 +1393,12 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 
 static void gcm_fifo_dump_around(u32 getoff)
 {
+    /* Only ever called on a recovery (bad branch, stuck get), and capped, so
+     * it no longer hides behind GCM_RECDBG: the words the walker stopped on
+     * are the one thing a run that wedged once in three can still tell us,
+     * and GCM_RECDBG is far too loud to leave on for a 15-minute run. */
     static int d = 0;
-    if (!getenv("GCM_RECDBG") || d++ >= 3) return;
+    if (d++ >= 3) return;
     for (u32 t = 0; t < GCM_TRACE_N; t++) {
         u32 k = (s_tr_i + t) % GCM_TRACE_N;
         if (!s_tr_w[k]) continue;
@@ -1727,8 +1755,32 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * park standing -- it only patches a park when it reuses that
                    * block. Waiting for a patch that will not come freezes the
                    * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
-                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                  /* ...but not at once. A title that links its segments by
+                   * patching the park moves `put` first and patches second:
+                   * inFAMOUS 2 ends each of its main-memory command blocks in
+                   * a park, writes the next commands at the ring start, sets
+                   * put, and only then rewrites the park as a JUMP to them. A
+                   * drain that lands between the two saw put elsewhere, went
+                   * straight to it, and dropped everything from the ring
+                   * start to put -- the frame's fence with it, so the title
+                   * waited on that label for the rest of the run. Give the
+                   * patch time to arrive, and resync only for a park that
+                   * has stood with the same put for longer than any title
+                   * takes between the two stores. */
+                  if (put != s_fifo_getoff) {
+                      extern unsigned long long ps3_ms_now(void);
+                      static u32 park_off, park_put;
+                      static unsigned long long park_since;
+                      const unsigned long long now = ps3_ms_now();
+                      if (park_off != s_fifo_getoff || park_put != put) {
+                          park_off = s_fifo_getoff; park_put = put; park_since = now;
+                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                          park_off = 0;
+                          gcm_fifo_dump_around(s_fifo_getoff);
+                          gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
+                      }
+                  }
+                  why = "parked";
                   break;
               }
               s_fifo_getoff = tgt; }
@@ -1825,6 +1877,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (subch == 7 && m == 0x0B00u) {
                     extern void rsx_raise_user_cmd(u32 arg);
                     rsx_raise_user_cmd(vm_read32(dea));
+                    /* A title that registered its handler with the HLE
+                     * cellGcmSetUserHandler has no lv2 interrupt thread
+                     * reading that event; its handler runs from the pump.
+                     * The `continue` skips the 0xEB00 case below, so queue
+                     * it for the pump here. */
+                    if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
                     continue;
                 }
                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
@@ -1936,12 +1994,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * area. Sample counts are not measured, so a ZPASS query
                      * reports "visible" -- the conservative answer; reading 0
                      * tells the title every queried object is occluded. */
+                    if (m == 0x1A8) s_report_dma = vm_read32(dea);
                     if (m == 0x1800) {
-                        const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
-                        { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
-                        if (idx < CELL_GCM_MAX_REPORT_COUNT) {
-                            s_report_data[idx].timestamp = get_timestamp_ns();
-                            s_report_data[idx].value = (v >> 24) == 1u ? 0xFFFFu : 0u;
+                        const u32 v = vm_read32(dea), off = v & 0xFFFFFFu, idx = off / 16u;
+                        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+                        const u64 ts = gcm_report_timestamp();
+                        const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
+                        { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+                        if (main_mem) {
+                            /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
+                            const u32 rea = gcm_io2ea(off);
+                            if (rea) {
+                                vm_write32(rea, (u32)(ts >> 32));
+                                vm_write32(rea + 4u, (u32)ts);
+                                vm_write32(rea + 8u, val);
+                                vm_write32(rea + 12u, 0u);
+                            } else { static int un = 0; if (un++ < 4) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
+                        } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+                            s_report_data[idx].timestamp = ts;
+                            s_report_data[idx].value = val;
                         }
                     }
                 } else
@@ -2358,9 +2429,19 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * while the guest may be between advancing current and flushing: put
      * then lands on begin, the guest's closing fence is never executed, and
      * it spins on `ref` for good. Safe when the walker has left the head of
-     * the ring well behind, which is the region the guest writes next. */
+     * the ring well behind, which is the region the guest writes next.
+     *
+     * Only for a ring the runtime owns, i.e. one whose buffer-full callback is
+     * still the runtime's (cellGcmSetupContext installs it). A title with its
+     * own callback manages its own buffers, and its context need not be a ring
+     * at all: Killzone 3 flips on a 0x30000-byte draw context whose `end`
+     * moves down as it allocates from the top, so it always looks nearly full.
+     * Rewinding it to `begin` in mid-frame cut the frame short, dropping the
+     * fence release in its tail, and the title then waited for it forever. */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
-    if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+    const u32 cb_opd = vm_read32(ctx + 0xC);
+    const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
+    if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
@@ -2668,14 +2749,16 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
         return CELL_GCM_ERROR_INVALID_ALIGNMENT;
     }
 
-    /* Allocate a fresh IO region past the Init command-buffer window. */
-    u32 io_offset = gcm_io_alloc(size);
-
+    /* A free slot first, then the IO region: allocating the region before
+     * the slot check leaked IO space on every refused call. */
     IoMapping* mapping = find_free_mapping();
     if (!mapping) {
         printf("[cellGcmSys] WARNING: no free IO mapping slots\n");
         return CELL_GCM_ERROR_FAILURE;
     }
+
+    /* Allocate a fresh IO region past the Init command-buffer window. */
+    u32 io_offset = gcm_io_alloc(size);
 
     mapping->ea     = ea;
     mapping->io     = io_offset;
@@ -2725,6 +2808,37 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
     populate_offset_table(ea, io, size);
 
     return CELL_OK;
+}
+
+/* NID: 0x626E8518 */
+s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags)
+{
+    /* RPCS3 cellGcmSys.cpp accepts exactly STRICT_ORDERING (not an arbitrary
+     * bit mask). The software FIFO already reads shared guest memory in FIFO
+     * order after its acquire fence; there is no relaxed DMA mapping path to
+     * select here. Preserve that path rather than pretending to enable a new
+     * ordering mode by storing an unused flag. */
+    if (flags != CELL_GCM_IOMAP_FLAG_STRICT_ORDERING)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    if ((ea | io | size) & 0xFFFFFu || !size)
+        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+    const u64 ea_end = (u64)ea + size;
+    const u64 io_end = (u64)io + size;
+    /* The HLE models the standard 256 MiB RSX IO aperture. Widen sums before
+     * checking bounds so wrapping inputs cannot publish aliases at page 0. */
+    if (ea_end > 0x100000000ull || io_end > 0x10000000ull)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    /* The legacy mapper checks only an identical EA base. Preflight complete
+     * intervals on both sides so a rejected flagged map changes neither the
+     * mapping list nor either direction of the translation table. */
+    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+        const IoMapping* m = &s_io_mappings[i];
+        if (m->active &&
+            (((u64)ea < (u64)m->ea + m->size && ea_end > m->ea) ||
+             ((u64)io < (u64)m->io + m->size && io_end > m->io)))
+            return CELL_GCM_ERROR_ADDRESS_OVERWRAP;
+    }
+    return cellGcmMapEaIoAddress(ea, io, size);
 }
 
 /* NID: 0xDB23E867 (disambiguation by context) */
@@ -3162,6 +3276,7 @@ void cellGcmTerminate(void)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
+    s_report_dma = 0xFEED0000u;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
@@ -3501,11 +3616,11 @@ u32 cellGcm_control_guest_addr(void) { return GCM_CONTROL_GUEST_ADDR; }
 void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
 {
     populate_offset_table(ea, io, size);
-    if (s_io_mapping_count < CELL_GCM_MAX_IO_MAPPINGS) {
-        s_io_mappings[s_io_mapping_count].ea     = ea;
-        s_io_mappings[s_io_mapping_count].io     = io;
-        s_io_mappings[s_io_mapping_count].size   = size;
-        s_io_mappings[s_io_mapping_count].active = 1;
+    /* A free slot, not s_io_mappings[count]: an unmap leaves a hole, and the
+     * count then indexes a live slot. */
+    IoMapping* m = find_free_mapping();
+    if (m) {
+        m->ea = ea; m->io = io; m->size = size; m->active = 1;
         s_io_mapping_count++;
     }
     if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }

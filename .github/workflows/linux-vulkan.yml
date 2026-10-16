@@ -8,7 +8,8 @@
 #   - with guest programs, the shared register-file draw engine (the path the
 #     Metal backend takes): all twelve draw scenes, including the ones only a
 #     translating backend can pass (--shader, --mip, --rtt, --depthtex, --mrt,
-#     --mrt-a, --cube), under the Khronos validation layer.
+#     --mrt-a, --cube), plus --depthbounds, which only this backend's engine
+#     implements, under the Khronos validation layer.
 #
 # The second pass fails on any of: a scene's own check, a single validation
 # message, a scene that did not take the engine path, or one that reported
@@ -78,7 +79,8 @@ jobs:
           # --threads is not here: it checks guest thread stacks and returns
           # before any backend exists (the first pass still runs it).
           for m in "" "--draw" "--depth" "--quads" "--shader" \
-                   "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube"; do
+                   "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube" \
+                   "--depthbounds"; do
             rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
             name=${m:-default}
             echo "::group::ps3recomp_host $name -> exit $rc"; cat run.log; echo "::endgroup::"
@@ -86,5 +88,11 @@ jobs:
             if grep -q "VUID" run.log; then echo "::error::$name: Vulkan validation messages"; fail=1; fi
             grep -q "register-file draw engine path" run.log || { echo "::error::$name: not on the draw engine"; fail=1; }
             if grep -q "nothing to check" run.log; then echo "::error::$name: skipped, not checked"; fail=1; fi
+            # The one scene that needs an optional device feature: lavapipe has no
+            # depthBounds in every Mesa release, so its skip is a notice, not a
+            # pass and not a failure.
+            if [ "$name" = "--depthbounds" ] && grep -q "skipped, no depth bounds test" run.log; then
+              echo "::notice::$name: skipped, this lavapipe has no depthBounds"
+            fi
           done
           exit $fail

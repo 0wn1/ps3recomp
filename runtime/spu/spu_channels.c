@@ -276,90 +276,84 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 }
 
 /* ===========================================================================
- * Per-context MFC engine registry
- *
- * One MFC engine per live SPU context, in a small table. A thread group starts
- * all of its threads at once and each one arrives here on its first DMA, so the
- * table is written concurrently by as many host threads as the group has.
- *
- * Two rules keep that safe without putting a lock on the lookup, which every
- * MFC channel access goes through:
- *
- *   - A slot's owner field is written only by the thread that owns the context
- *     in it: the claim below, and the release when that context is done. Every
- *     reader is comparing the field against ITS OWN context pointer, so a read
- *     that races a claim either matches (its own slot, which only it can have
- *     written) or does not, and can never be handed another context's engine.
- *   - Choosing which free slot to claim is done under a lock. It used to be a
- *     scan followed by a store, and two threads that scanned before either
- *     stored both took the same slot and then shared one engine's queue and tag
- *     state -- one SPU's tag wait satisfied by the other SPU's transfer.
+ * One private MFC engine per live virtual context. Persistent policy contexts
+ * outnumber physical SPUs even when their scheduling quanta run sequentially.
+ * Registry nodes have stable addresses and survive a quantum, including stalled
+ * lists and tag state. The registry lock protects lookup/publication/removal;
+ * the context's single execution owner protects its engine after lookup.
+ * Release is permitted only after that owner has stopped using the context.
  * ===========================================================================*/
-#define SPU_MAX_CONTEXTS 8
-
-typedef struct {
-    spu_context* volatile ctx;
-    mfc_engine   mfc;
+typedef struct spu_mfc_slot {
+    spu_context* ctx;
+    mfc_engine mfc;
+    struct spu_mfc_slot* next;
 } spu_mfc_slot;
 
-static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
-static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
+static spu_mfc_slot* s_mfc_slots;
+static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (s_mfc_slots[i].ctx == ctx)
-            return &s_mfc_slots[i].mfc;
-
-    /* No slot yet: take one. The engine is initialized before the slot is
-     * published, so it is never visible to anyone in a half-reset state. */
-    mfc_engine* e = NULL;
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (int i = 0; i < SPU_MAX_CONTEXTS && !e; i++) {
-        if (s_mfc_slots[i].ctx != NULL) continue;
-        mfc_engine_init(&s_mfc_slots[i].mfc);
-        s_mfc_slots[i].ctx = ctx;
-        e = &s_mfc_slots[i].mfc;
-    }
-    if (!e) {
-        /* Out of slots: fall back to a shared engine (correct for single-SPU).
-         * Reachable only with more than SPU_MAX_CONTEXTS contexts running at
-         * the same time, which is more SPUs than the machine has -- and the
-         * sharing is silent, so say it once. Its one-time init is inside the
-         * lock as well, or two threads arriving together would each memset an
-         * engine the other is already using. */
-        static mfc_engine fallback;
-        static int fallback_init = 0;
-        if (!fallback_init) {
-            mfc_engine_init(&fallback);
-            fallback_init = 1;
-            fprintf(stderr, "[SPU] more than %d contexts hold an MFC engine at "
-                    "once; the rest share one\n", SPU_MAX_CONTEXTS);
-            fflush(stderr);
+    AcquireSRWLockShared(&s_mfc_claim_lock);
+    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        if (slot->ctx == ctx) {
+            ReleaseSRWLockShared(&s_mfc_claim_lock);
+            return &slot->mfc;
         }
-        e = &fallback;
     }
+    ReleaseSRWLockShared(&s_mfc_claim_lock);
+
+    /* A concurrent miss may publish while the read lock is released. Recheck
+     * under the writer lock before creating this context's private engine. */
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
+    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        if (slot->ctx == ctx) {
+            ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+            return &slot->mfc;
+        }
+    }
+    spu_mfc_slot* slot = (spu_mfc_slot*)malloc(sizeof(*slot));
+    if (!slot) {
+        fprintf(stderr, "[SPU] cannot allocate private MFC engine for context %p\n", (void*)ctx);
+        fflush(stderr);
+        abort(); /* Shared fallback state would silently corrupt DMA completion. */
+    }
+    slot->ctx = ctx;
+    mfc_engine_init(&slot->mfc);
+    slot->next = s_mfc_slots;
+    s_mfc_slots = slot;
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
-    return e;
+    return &slot->mfc;
 }
 
-/* Give the slot `ctx` holds back to the table, called when its context is done.
- * Slots used to be claimed and never released, so a title with more SPU
- * contexts over its life than there are slots ran the rest of them on the
- * shared fallback engine -- and by then it is not a fresh engine but whatever
- * tag and queue state the previous owners left in it.
- *
- * Only the owner calls this, and only after its SPU has stopped, so the engine
- * is idle. The next claimant re-initializes it. A context that never issued a
- * DMA holds no slot and this is a scan that finds nothing. */
 void spu_mfc_release(spu_context* ctx)
 {
     if (!ctx) return;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
-        if (s_mfc_slots[i].ctx != ctx) continue;
-        s_mfc_slots[i].ctx = NULL;
+    for (spu_mfc_slot** link = &s_mfc_slots; *link; link = &(*link)->next) {
+        if ((*link)->ctx != ctx) continue;
+        spu_mfc_slot* slot = *link;
+        *link = slot->next;
+        free(slot);
         break;
+    }
+    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+}
+
+/* Exit safety net for contexts unwound off a departing thread's stack.
+ * Pointer comparisons suffice: the abandoned context need not be readable. */
+void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
+{
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
+    for (spu_mfc_slot** link = &s_mfc_slots; *link;) {
+        spu_mfc_slot* slot = *link;
+        uintptr_t owner = (uintptr_t)slot->ctx;
+        if (owner >= lo && owner < hi) {
+            *link = slot->next;
+            free(slot);
+        } else {
+            link = &slot->next;
+        }
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
 }
@@ -1066,14 +1060,22 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
          * read the decrementer before writing it. */
         if (!ctx->dec_base_ns) ctx->dec_base_ns = spu_host_ns();
         uint64_t elapsed = spu_host_ns() - ctx->dec_base_ns;
-        uint32_t ticks   = (uint32_t)((elapsed * SPU_DECREMENTER_HZ)
-                                      / 1000000000ull);
+        /* Split seconds from the remainder before scaling: elapsed_ns * 79.8M
+         * overflows 64 bits 231 s after the base stamp, and a context that
+         * never writes its decrementer (the SPURS kernel's) keeps the stamp
+         * from boot, so every timed loop on that SPU saw the counter jump
+         * forward by ~16 s of ticks at 231 s, 462 s, 693 s... */
+        const uint64_t secs = elapsed / 1000000000ull, rem = elapsed % 1000000000ull;
+        uint32_t ticks   = (uint32_t)(secs * SPU_DECREMENTER_HZ +
+                                      (rem * SPU_DECREMENTER_HZ) / 1000000000ull);
         v = ctx->decrementer - ticks;
         break;
     }
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
     case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status; break;
-    case SPU_RdMachStat:    v = (ctx->status == SPU_STATUS_RUNNING) ? 1 : 0; break;
+    /* CBEA 9.8: numeric bit 0 is interrupt-enable, independent of run status.
+     * This runtime models nonisolated SPUs, so the isolation bit stays clear. */
+    case SPU_RdMachStat:    v = ctx->int_enable & 1u; break;
     case SPU_RdSRR0:        v = ctx->srr0;                              break;
     default:
         v = 0;
@@ -1969,7 +1971,9 @@ static int spu_smc_microstep(spu_context* ctx)
             pc += 4; continue;
         }
         if (op9 == 0x041 || op9 == 0x061) {                   /* stqa / lqa (abs) */
-            uint32_t a = (((w >> 7) & 0xFFFF) << 4) & SPU_LS_MASK & ~15u;
+            /* LSA = I16 << 2 (SPU ISA, RI16 form), as in spu_interp.c and
+             * the lifter. */
+            uint32_t a = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u;
             if (op9 == 0x041) spu_ls_write128(ctx, a, ctx->gpr[rt]);
             else              ctx->gpr[rt] = spu_ls_read128(ctx, a);
             pc += 4; continue;
@@ -2041,7 +2045,20 @@ static int spu_smc_microstep(spu_context* ctx)
         /* Stop at the drain's return point too: it sits mid-function, so it is
          * no lifted entry, and a job's return would otherwise run on through
          * the caller's code (GH3's song-freeze; see drain_ret_pc). */
-        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
+        const uint32_t return_pc = ctx->drain_ret_pc;
+        uint32_t result = spu_interp_run_until(ctx, pc, return_pc);
+        /* A live interpreter rejoin is a transfer, not a host return. Nested
+         * drains can repair an empty trampoline, but the top-level driver
+         * otherwise ends the run before executing the lifted target.
+         * An already-owning drain must retain its own host continuation;
+         * stopped states and diagnostic exits keep their existing behavior. */
+        if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
+            (!return_pc || (ctx->pc & SPU_LS_MASK) != return_pc) &&
+            spu_lifted_lookup(ctx, ctx->pc)) {
+            g_spu_trampoline_fn = spu_indirect_branch;
+            return 1;
+        }
+        return result ? 1 : 0;
     }
     { static int _n = 0; if (_n++ < 4)
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
@@ -2072,13 +2089,13 @@ void spu_indirect_branch(spu_context* ctx)
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
     if (ctx->policy_mode) {
-        extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
+        extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
              * Print gated: fires once per policy run = thousands/sec. */
             g_spurs_pm_exited = 1;
-            { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
-              if (s_t) { static unsigned long _n = 0; unsigned long n = ++_n;
+            { static SPU_THREAD_LOCAL int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
+              if (s_t) { static SPU_THREAD_LOCAL unsigned long _n = 0; unsigned long n = ++_n;
                 if (n <= 64 || (n & 0xFFF) == 0)
                     fprintf(stderr, "[spurs-pm] exit-to-kernel#%lu (r3=0x%08X polls=%u)\n",
                             n, ctx->gpr[3]._u32[0], g_spurs_pm_polls); } }
@@ -2088,7 +2105,7 @@ void spu_indirect_branch(spu_context* ctx)
         }
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
             /* cellSpursModulePoll: report "no contention — keep running".
-             * (One virtual SPU per workload here, so nothing ever preempts.) */
+             * (The host scheduler admits bounded workers; this service does not preempt.) */
             unsigned n = ++g_spurs_pm_polls;
             if (n <= 4 || (n % 4096) == 0)
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",

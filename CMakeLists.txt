@@ -390,6 +390,32 @@ if(PS3RECOMP_BUILD_TESTS)
     # cellVdec through its guest API: the callback-only decoder always, and
     # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
     add_subdirectory(libs/codec/tests)
+    # cellGcm's FIFO walker without a backend: where GET_REPORT writes for
+    # each report DMA context. Links the runtime like the POSIX host below.
+    if(UNIX)
+        add_subdirectory(tests/gcm_reports)
+    endif()
+
+    find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME spurs_task_exit_code_initialize
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_task_exit_code_initialize.py")
+        add_test(NAME spurs_taskset_size
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_taskset_size.py")
+        add_test(NAME spu_sdcrz
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")
+    endif()
+    if(NOT WIN32)
+        find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME spu_fnms_zero_extended
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
+        endif()
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

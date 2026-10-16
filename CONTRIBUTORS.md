@@ -468,6 +468,9 @@ came from this work.
   `ps3_ms_now` (#244), real POSIX lwmutex/lwcond (#225), safe stack scans
   (#217), SPU disassembler `orbi`/`xorhi`/`xorbi` (#239), `--chunk-lines`
   (#216), `PS3_NULL_READ_STACK` (#226) and `g_ppu_main_ctx` (#228).
+- Depth bounds test in the draw engine and Vulkan (#319), measured on Twisted
+  Metal's deferred lighting.
+
 
 ### undecuple — [@undecuple](https://github.com/undecuple)
 - **Real video decode in cellVdec** (#215): H.264 and MPEG-2 through FFmpeg,
@@ -476,6 +479,18 @@ came from this work.
   reusable for cellAdec and cellDmux.
 - A detailed set of about 60 general fixes from a *Killzone 3* port (#214),
   each with a focused test against v0.13.0.
+- **v0.15.0, 33 PRs from the Killzone 2/3 ports.** In the lifter: VMX lane
+  order (#269), `lwax` jump tables (#285), `sc` fall-through (#297), carry-form
+  callee-save reloads (#320), and `--chunks` (#254). In the loader: TLS sizing
+  (#253), a per-coroutine call-depth guard (#270), and MinGW thread-locals
+  (#271). In cellGcm: IO table and leak (#255), `GET_REPORT` DMA context
+  (#256), user commands (#273), and in-FIFO flip (#275). Depth export,
+  depth-as-texture, Z16 clears, MSAA, predicated selects and sampler keys
+  (#278-#282, #321). cellFs (#257, #258), PSF saves (#322), UserAutoSave
+  (#276), cellHttp (#260, #261), NP (#259, #323), EDAT klicensee (#274),
+  lwcond layout (#277), cellFont (#324), SPURS argument ABI (#309, #310), SMC
+  `lqa`/`stqa` (#268), and the MFC table (#272).
+
 
 ### robbe1912 — [@robbe1912](https://github.com/robbe1912)
 - **D3D12 fragment-program source capacity** (#230): a 256-instruction program
@@ -485,6 +500,42 @@ came from this work.
 ### tekulvw — [@tekulvw](https://github.com/tekulvw)
 - **SPU interpreter `ILH`** (#234): it had shared `IL`'s case and repeated a
   32-bit immediate instead of a halfword. The test runs the real interpreter.
+- **v0.15.0, 34 PRs: a correctness sweep of the runtime and the Metal
+  backend**, each with a fixture that fails before the fix.
+  - SPURS policy scheduling with per-instance workers and contention limits
+    (#291), private per-context DMA and reservation state (#290), interpreter
+    hand-off (#266), and SPU ELF discovery in the build (#288). Also SDCRZ
+    (#295), FNMS (#318), the interrupt-enable bit (#289), and the SPURS
+    task/taskset fixes (#283, #284, #298, #306).
+  - argv/envp (#263) and HLE registration regeneration (#262).
+  - RSX: depth compare (#302), sRGB output (#304), texture gamma (#305),
+    colour-input clamp (#303), depth24 (#299), depth-export cache keys
+    (#301), and immediate vertices (#292). Metal: depth readback (#300),
+    colour snapshots (#307), clears (#293), window close (#308), and FPS
+    diagnostics (#294).
+  - cellFs directory entries and disc roots (#247, #249), GCM strict IO
+    mapping (#248), network (#250, #265), timezone (#264), sysmodules (#267),
+    dialogs (#251), and Sail (#252).
+
+
+### Noah Peterson — [@NoahBPeterson](https://github.com/NoahBPeterson)
+Runs the *inFAMOUS* port.
+- **Hardware-exact SPU float semantics** (#287): extended range, truncation,
+  denormal flush, `frest`'s table, and an exact-arithmetic referee. NEON paths
+  are bit-identical and 1.6-4x faster. Replaces the old GPL-derived float code.
+- **Exact VMX and branch decode in the PPU lifter** (#286): about 45 VMX ops
+  that were no-ops, VSCR/CR6, BO/BI decoding, and 64-bit CTR.
+- Both are pieces of the LLE firmware and conformance work in #213.
+
+### erikomis — [@erikomis](https://github.com/erikomis)
+Fixes found bringing up *inFAMOUS 2* on the inFamous branch, sent to master as
+well:
+- jump tables behind a tail-call epilogue (#311);
+- a parked FIFO given time to be patched (#312);
+- the `SPU_RdDec` 231 s wrap (#313);
+- NV40 pack/unpack opcodes (#314);
+- cellGem/cellCamera imports (#315);
+- Metal command-buffer errors reported (#316).
 
 ### deucebucket — [@deucebucket](https://github.com/deucebucket)
 - Reported that `fw_spu/` was tracking decrypted firmware PRXs and lifted C,

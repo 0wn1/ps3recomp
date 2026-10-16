@@ -105,6 +105,12 @@ jobs:
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
+      # cellFontInitializeWithRevision initialises the library the way cellFontInit does.
+      - name: Run the cellFont init test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_font_initialize_with_revision libs/font/tests/test_font_initialize_with_revision.c -lm
+          /tmp/test_font_initialize_with_revision
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
@@ -132,6 +138,12 @@ jobs:
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
           /tmp/test_np_nat
+
+      # sceNpCommerce2CreateCtx takes the SDK's five arguments and stores the context id through the fifth.
+      - name: Run the Commerce2 CreateCtx test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_commerce2 libs/network/tests/test_np_commerce2.c
+          /tmp/test_np_commerce2
 
 
       # Guest vertex and fragment programs through the decompilers, glslang
@@ -266,6 +278,8 @@ jobs:
           # is where those get checked at all.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_rsx_draw_engine
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_color_feedback_engine
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
@@ -288,6 +302,12 @@ jobs:
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
           /tmp/test_guest_ptr_trap
+
+      # PARAM.SFO is written as a binary PSF and read back (PSF and the old text file).
+      - name: Run the savedata PARAM.SFO test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_savedata_param_sfo libs/system/tests/test_savedata_param_sfo.c
+          /tmp/test_savedata_param_sfo
 
       # The lv2 sync-primitive stress suite (mutex, cond, semaphore, event
       # queue) on host threads. It was Windows-only until the shim grew joinable

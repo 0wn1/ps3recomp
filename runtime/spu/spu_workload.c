@@ -414,6 +414,9 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
                        ((uint32_t)ti[0x16] << 8) | ti[0x17];
         uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
                        ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
+        /* TaskInfo stores ELF metadata in the low three bits. Keep those
+         * guest bytes intact and use only the address for loading. */
+        elf &= ~7u;
         if (!elf) continue;
         size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
         if (!sz) continue;
@@ -795,7 +798,8 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     /* Nothing on this stack may stay in the lock-line reserver set. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
-      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi); }
+      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
+      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
     return 0;
 }
 #else
