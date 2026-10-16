@@ -25,6 +25,17 @@ u32 rsx_swizzle_offset(u32 x, u32 y, u32 log2w, u32 log2h)
     return off;
 }
 
+u32 rsx_swizzle_offset_3d(u32 x, u32 y, u32 z, u32 log2w, u32 log2h, u32 log2d)
+{
+    u32 off = 0, shift = 0;
+    while (log2w || log2h || log2d) {
+        if (log2w) { off |= (x & 1u) << shift; x >>= 1; shift++; log2w--; }
+        if (log2h) { off |= (y & 1u) << shift; y >>= 1; shift++; log2h--; }
+        if (log2d) { off |= (z & 1u) << shift; z >>= 1; shift++; log2d--; }
+    }
+    return off;
+}
+
 void rsx_texture_layout(u32 rsx_fmt, u32 w, u32 h, rsx_tex_layout* out)
 {
     rsx_texture_layout_pitched(rsx_fmt, w, h, 0, out);

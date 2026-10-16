@@ -401,6 +401,15 @@ static void test_swizzle_offset(void)
     CHECK_EQ(rsx_swizzle_offset(1, 1, 2, 2), 3);
     CHECK_EQ(rsx_swizzle_offset(2, 0, 2, 2), 4);
     CHECK_EQ(rsx_swizzle_offset(3, 3, 2, 2), 15);
+    /* 3D: x, y, z bits interleave in that order; a flat volume degenerates
+     * to the 2D order. */
+    CHECK_EQ(rsx_swizzle_offset_3d(1, 0, 0, 1, 1, 1), 1);
+    CHECK_EQ(rsx_swizzle_offset_3d(0, 1, 0, 1, 1, 1), 2);
+    CHECK_EQ(rsx_swizzle_offset_3d(0, 0, 1, 1, 1, 1), 4);
+    CHECK_EQ(rsx_swizzle_offset_3d(1, 1, 1, 1, 1, 1), 7);
+    CHECK_EQ(rsx_swizzle_offset_3d(3, 3, 3, 2, 2, 2), 63);
+    CHECK_EQ(rsx_swizzle_offset_3d(2, 0, 1, 2, 2, 2), 4 + 8);
+    CHECK_EQ(rsx_swizzle_offset_3d(3, 3, 0, 2, 2, 0), rsx_swizzle_offset(3, 3, 2, 2));
 
     /* Every texel of a 4x4 image maps to a distinct offset in [0,16). */
     int seen[16] = {0};
