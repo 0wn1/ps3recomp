@@ -39,6 +39,35 @@ extern "C" void ydkj_host_bt(const char* tag);
 #define O_BINARY 0       /* POSIX has no text/binary distinction */
 #endif
 
+/* 64-bit file offsets and sizes. Windows is LLP64: `long` is 32 bits, so
+ * fseek(long)/ftell and `struct stat` (st_size is a 32-bit _off_t on MinGW, and
+ * stat() is stat64i32) cannot express a file past 2 GiB. Disc archives are
+ * routinely bigger: Lseek truncated the offset, Fstat's size came from ftell's
+ * overflow result and Stat's from the 32-bit wrapper, and what those return
+ * differs between CRTs: MinGW-w64's own stat() wrapper (msvcrt builds) fails
+ * with EOVERFLOW, UCRT's _stat64i32 (llvm-mingw) returns the size truncated, so
+ * the same title took different paths depending on the toolchain. POSIX LP64
+ * is unaffected. */
+#ifdef _WIN32
+#  define FS_SEEK64(f, o, w) _fseeki64((f), (int64_t)(o), (w))
+#  define FS_TELL64(f)       ((int64_t)_ftelli64(f))
+typedef struct _stat64 fs_stat64_t;
+/* _stat64 rejects a trailing slash (MinGW's stat wrapper stripped it). */
+static int FS_STAT64(const char* p, fs_stat64_t* s)
+{
+    char t[1100]; size_t n = strlen(p);
+    if (n >= sizeof t) return _stat64(p, s);
+    memcpy(t, p, n + 1);
+    while (n > 1 && (t[n - 1] == '/' || t[n - 1] == '\\') && t[n - 2] != ':') t[--n] = 0;
+    return _stat64(t, s);
+}
+#else
+#  define FS_SEEK64(f, o, w) fseeko((f), (off_t)(o), (w))
+#  define FS_TELL64(f)       ((int64_t)ftello(f))
+#  define FS_STAT64(p, s)    stat((p), (s))
+typedef struct stat fs_stat64_t;
+#endif
+
 extern "C" uint8_t* vm_base;
 extern "C" void ppu_guest_caller(char* out, size_t n);
 extern "C" uint32_t ppu_vm_size;
@@ -533,8 +562,8 @@ static void cellFsLseek(ppu_context* ctx)
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    fseek(g_files[fd], (long)off, worigin);
-    long p = ftell(g_files[fd]);
+    FS_SEEK64(g_files[fd], off, worigin);
+    int64_t p = FS_TELL64(g_files[fd]);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
@@ -565,8 +594,8 @@ static void cellFsStat(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t sb = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
-    struct stat st;
-    if (stat(hpath, &st) != 0) {
+    fs_stat64_t st;
+    if (FS_STAT64(hpath, &st) != 0) {
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
@@ -585,10 +614,10 @@ static void cellFsFstat(ppu_context* ctx)
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
-    long cur = ftell(g_files[fd]);
-    fseek(g_files[fd], 0, SEEK_END);
-    long sz = ftell(g_files[fd]);
-    fseek(g_files[fd], cur, SEEK_SET);
+    int64_t cur = FS_TELL64(g_files[fd]);
+    FS_SEEK64(g_files[fd], 0, SEEK_END);
+    int64_t sz = FS_TELL64(g_files[fd]);
+    FS_SEEK64(g_files[fd], cur, SEEK_SET);
     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
@@ -597,12 +626,12 @@ static void cellFsFstat(ppu_context* ctx)
     { const char* cap = getenv("FS_FSTAT_CAP");
       const char* only = getenv("FS_FSTAT_CAP_PATH");
       if (cap && only && *only && !(g_fd_path[fd][0] && strstr(g_fd_path[fd], only))) cap = 0;
-      if (cap) { long c = strtol(cap, 0, 0);
+      if (cap) { long long c = strtoll(cap, 0, 0);
           if (c > 0 && sz > c) {
-              fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
+              fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, c);
               sz = c; } } }
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
-    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
+    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
     ctx->gpr[3] = CELL_OK;
 }
 
