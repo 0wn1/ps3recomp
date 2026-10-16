@@ -42,6 +42,7 @@ TOC = 0x100000
 def w_cmplwi(bf, ra, ui):  return (10 << 26) | (bf << 23) | (ra << 16) | (ui & 0xFFFF)
 def w_lwz(rt, ra, d):      return (32 << 26) | (rt << 21) | (ra << 16) | (d & 0xFFFF)
 def w_lwzx(rt, ra, rb):    return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (23 << 1)
+def w_lwax(rt, ra, rb):    return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (341 << 1)
 def w_add(rt, ra, rb):     return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (266 << 1)
 def w_slwi(ra, rs, n):     return (21 << 26) | (rs << 21) | (ra << 16) | (n << 11) | (0 << 6) | ((31 - n) << 1)
 def w_bctr():              return (19 << 26) | (20 << 21) | (528 << 1)
@@ -84,9 +85,10 @@ def check(name, got, want):
 
 def test_encodings():
     ins = decode_all([w_cmplwi(0, 9, 3), w_lwz(11, 2, 16), w_lwzx(0, 9, 11),
-                      w_add(0, 0, 11), w_slwi(9, 3, 2), w_mtctr(0), w_bctr()])
+                      w_add(0, 0, 11), w_slwi(9, 3, 2), w_mtctr(0), w_bctr(),
+                      w_lwax(0, 9, 11)])
     got = [i.mnemonic for i in ins]
-    want = ['cmplwi', 'lwz', 'lwzx', 'add', 'rlwinm', 'mtctr', 'bctr']   # slwi is rlwinm
+    want = ['cmplwi', 'lwz', 'lwzx', 'add', 'rlwinm', 'mtctr', 'bctr', 'lwax']   # slwi is rlwinm
     if got != want:
         print(f"ENCODING mismatch: got {got}, want {want}")
         sys.exit(2)
@@ -129,6 +131,26 @@ def test_offset_idiom():
     got = discover([w_cmplwi(0, 3, 2), w_lwz(11, 2, 16), w_slwi(9, 3, 2),
                     w_lwzx(0, 9, 11), w_add(0, 0, 11), w_mtctr(0), w_bctr()], mem)
     check("offset table, gcc idiom", got, [0x11100, 0x11200, 0x11300])
+
+
+def test_offset_idiom_lwax():
+    """The offset idiom with the table loaded by `lwax` instead of `lwzx`.
+
+        lwz r11,16(r2); slwi r9,r3,2; lwax r0,r9,r11; add r0,r0,r11; mtctr r0; bctr
+
+    `lwax` is the sign-extending word load; some compilers use it for offset
+    tables, whose entries are signed (a case body may sit below the table, as
+    the negative entry here does). Only `lwzx` was accepted as the indexed load,
+    so the dispatcher was dropped and the bctr lifted to an unresolved indirect
+    call.
+    """
+    table = 0x11000
+    mem = {TOC + 16: table,
+           table + 0: 0x100, table + 4: (-0x200) & 0xFFFFFFFF, table + 8: 0x300,
+           table + 12: 0xFFFFFFFF}                   # misaligned target: the table ends
+    got = discover([w_cmplwi(0, 3, 2), w_lwz(11, 2, 16), w_slwi(9, 3, 2),
+                    w_lwax(0, 9, 11), w_add(0, 0, 11), w_mtctr(0), w_bctr()], mem)
+    check("offset table loaded with lwax", got, [0x10E00, 0x11100, 0x11300])
 
 
 def test_offset_both_operands_r2_loaded():
@@ -251,6 +273,7 @@ def main() -> int:
     test_encodings()
     test_absolute_base_is_second_operand()
     test_offset_idiom()
+    test_offset_idiom_lwax()
     test_offset_both_operands_r2_loaded()
     test_tie_keeps_first_candidate()
     test_two_level_base_past_early_return()
