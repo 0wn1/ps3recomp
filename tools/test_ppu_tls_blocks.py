@@ -28,6 +28,10 @@ while depth:
     i += 1
 func = src[m.start():i]
 tls_img = re.search(r'^#define PPU_TLS_IMG\s+(\S+)', src, re.M).group(1)
+# #296 spells it VM_PPU_TLS_BASE from runtime/memory/vm.h; resolve that to the number.
+if not tls_img[0].isdigit():
+    vm_h = (root / 'runtime/memory/vm.h').read_text()
+    tls_img = re.search(r'^#define ' + tls_img + r'\s+(\S+)', vm_h, re.M).group(1)
 
 HARNESS = r'''
 #include <cstdint>
