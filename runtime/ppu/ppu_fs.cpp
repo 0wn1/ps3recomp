@@ -55,6 +55,7 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
 #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
 #define CELL_FS_EIO          (-2147418111)
+#define CELL_FS_ENOSYS       (-2147418109)   /* 0x80010003 */
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
 #define CELL_FS_O_RDONLY     0
@@ -750,6 +751,29 @@ static void cellFsFsync(ppu_context* ctx)
  * grow files on write, so accepting is correct -- no preallocation needed. */
 static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 
+/* Free space for (path, u32* block_size, u64* free_block_count). Unregistered,
+ * the call took the unresolved-NID path: CELL_OK with both out-params left as
+ * unwritten, so a title sizing a cache read whatever was there. Report a
+ * 4 KiB block and 32 GiB free: enough for any cache, and the same on every host. */
+static void cellFsGetFreeSize(ppu_context* ctx)
+{
+    uint32_t bs = (uint32_t)ctx->gpr[4], fb = (uint32_t)ctx->gpr[5];
+    if (bs) vm_write32(bs, 4096);
+    if (fb) vm_write64(fb, (32ULL << 30) / 4096);
+    ctx->gpr[3] = CELL_OK;
+}
+static void cellFsChmod(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* host ignores PS3 mode bits */
+static void cellFsUtime(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* timestamps are not modelled */
+/* SDATA opened from an already-open fd is not implemented: fail visibly rather
+ * than return CELL_OK with *sdata_fd never written. */
+static void cellFsSdataOpenByFd(ppu_context* ctx)
+{
+    static int n;
+    if (n++ < 4) fprintf(stderr, "[fs] cellFsSdataOpenByFd(fd=%d) not implemented -> CELL_ENOSYS\n",
+                         (int)(uint32_t)ctx->gpr[3]);
+    ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOSYS;
+}
+
 /* ---- cellFs AIO -----------------------------------------------------------
  *
  * Scott Pilgrim loads everything through cellFsAioRead: it opens gamedata.fat
@@ -848,6 +872,10 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsGetFreeSize"),   "cellFsGetFreeSize",   cellFsGetFreeSize);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsChmod"),         "cellFsChmod",         cellFsChmod);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsUtime"),         "cellFsUtime",         cellFsUtime);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsSdataOpenByFd"), "cellFsSdataOpenByFd", cellFsSdataOpenByFd);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsAllocateFileAreaWithoutZeroFill"),
                          "cellFsAllocateFileAreaWithoutZeroFill", cellFsAllocateFileAreaWithoutZeroFill);
     /* AIO by literal import NID -- ps3_compute_nid() of the friendly name does

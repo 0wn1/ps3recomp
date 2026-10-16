@@ -492,7 +492,7 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
     return CELL_OK;
 }
 
-/* NID: 0x4D5FF8E2 */
+/* NID: 0x2CB51F0D */
 s32 cellFsClose(CellFsFd fd)
 {
     printf("[cellFs] Close(fd=%d)\n", fd);
@@ -509,7 +509,7 @@ s32 cellFsClose(CellFsFd fd)
     return CELL_OK;
 }
 
-/* NID: 0xBABF9143 */
+/* NID: 0x4D5FF8E2 */
 s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 {
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
@@ -551,7 +551,7 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     return CELL_OK;
 }
 
-/* NID: 0x1E9B6714 */
+/* NID: 0xECDCF2AB */
 s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
 {
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
@@ -601,7 +601,7 @@ s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
     return CELL_OK;
 }
 
-/* NID: 0xEF3BBD5A */
+/* NID: 0xEF3EFA34 */
 s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
 {
     printf("[cellFs] Fstat(fd=%d)\n", fd);
@@ -641,7 +641,7 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
     return CELL_OK;
 }
 
-/* NID: 0x2CB51F0D */
+/* NID: 0x7DE6DCED */
 s32 cellFsStat(const char* path, CellFsStat* sb)
 {
     printf("[cellFs] Stat(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
@@ -672,7 +672,7 @@ s32 cellFsStat(const char* path, CellFsStat* sb)
     return CELL_OK;
 }
 
-/* NID: 0x6D3BB15B */
+/* NID: 0xC9DC3AC5 */
 s32 cellFsTruncate(const char* path, u64 size)
 {
     printf("[cellFs] Truncate(path='%s', size=%llu)\n", gpath(path) ? gpath(path) : "<null>",
@@ -704,7 +704,7 @@ s32 cellFsTruncate(const char* path, u64 size)
     return CELL_OK;
 }
 
-/* NID: 0x82D3AB53 */
+/* NID: 0x0E2939E5 */
 s32 cellFsFtruncate(CellFsFd fd, u64 size)
 {
     printf("[cellFs] Ftruncate(fd=%d, size=%llu)\n", fd, (unsigned long long)size);
@@ -726,7 +726,7 @@ s32 cellFsFtruncate(CellFsFd fd, u64 size)
     return CELL_OK;
 }
 
-/* NID: 0xC1C507E7 */
+/* NID: 0x1A108AB7 */
 s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
 {
     printf("[cellFs] GetBlockSize(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
@@ -740,7 +740,7 @@ s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
     return CELL_OK;
 }
 
-/* NID: 0x2C2C5F71 */
+/* NID: 0xAA3B4BCD */
 s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
 {
     printf("[cellFs] GetFreeSize(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
@@ -770,7 +770,7 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
     return CELL_OK;
 }
 
-/* NID: 0x3F61245C */
+/* NID: 0x99406D0B */
 s32 cellFsChmod(const char* path, s32 mode)
 {
     printf("[cellFs] Chmod(path='%s', mode=0%o)\n", gpath(path) ? gpath(path) : "<null>", mode);
@@ -786,7 +786,7 @@ s32 cellFsChmod(const char* path, s32 mode)
  * Directory operations
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x5C74903D */
+/* NID: 0x3F61245C */
 s32 cellFsOpendir(const char* path, CellFsDir* fd)
 {
     printf("[cellFs] Opendir(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
@@ -832,7 +832,7 @@ s32 cellFsOpendir(const char* path, CellFsDir* fd)
     return CELL_OK;
 }
 
-/* NID: 0x9F951810 */
+/* NID: 0x5C74903D */
 s32 cellFsReaddir(CellFsDir fd, CellFsDirent* entry, u64* nread)
 {
     if (fd < 0 || fd >= MAX_OPEN_DIRS || !s_dirs[fd].in_use)
@@ -918,7 +918,7 @@ s32 cellFsClosedir(CellFsDir fd)
     return CELL_OK;
 }
 
-/* NID: 0x7C1B2FCC */
+/* NID: 0xBA901FE6 */
 s32 cellFsMkdir(const char* path, s32 mode)
 {
     printf("[cellFs] Mkdir(path='%s', mode=0%o)\n", gpath(path) ? gpath(path) : "<null>", mode);
@@ -944,7 +944,7 @@ s32 cellFsMkdir(const char* path, s32 mode)
     return CELL_OK;
 }
 
-/* NID: 0xE3F6F665 */
+/* NID: 0xF12EECC8 */
 s32 cellFsRename(const char* from, const char* to)
 {
     printf("[cellFs] Rename(from='%s', to='%s')\n",
@@ -972,7 +972,7 @@ s32 cellFsRename(const char* from, const char* to)
     return CELL_OK;
 }
 
-/* NID: 0x196CE171 */
+/* NID: 0x7F4677A8 */
 s32 cellFsUnlink(const char* path)
 {
     printf("[cellFs] Unlink(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
