@@ -16,6 +16,7 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#include "spu_coherency.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -168,6 +169,39 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    /* Upper16 command-channel bits carry replacement/transfer class IDs. */
+    if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
+        /* CBEA 1.02 section 7.7.3: SDCRZ writes zeros in EA space, without an
+         * LSA operand. Storage-control alignment is implementation-specific
+         * (table 7-6); currently support whole 128-byte blocks, up to 16 KiB.
+         * Reject other forms visibly instead of applying ordinary LS DMA
+         * validation or claiming an unsupported command completed. */
+        if (!size || size > MFC_MAX_DMA_SIZE || (size & 127u) || (ea & 127u) ||
+            (ea >> 32) || !mfc_ea_range_committed(ea, size)) {
+            fprintf(stderr, "[mfc] REJECTED SDCRZ range: ea=0x%016llX size=%u\n",
+                    (unsigned long long)ea, size);
+            return -1;
+        }
+        /* Storage controls impose a barrier in their tag group. Ordinary
+         * transfers finish synchronously, but a stalled list does not. This
+         * engine cannot execute SDCRZ ahead of that still-pending transfer. */
+        if (spu->list_stall_mask & (1u << (spu->mfc_tag & 31u))) {
+            fprintf(stderr, "[mfc] REJECTED SDCRZ behind stalled tag %u\n",
+                    spu->mfc_tag & 31u);
+            return -1;
+        }
+        /* Serialize zeroing with reservation compare-and-commit. Notify each
+         * touched line even for a zero-to-zero write: byte comparisons alone
+         * cannot detect that a peer's reservation was lost. Issuer exclusion
+         * follows the existing plain-MFC-write model; issuer reservation
+         * behavior for storage controls is not separately modeled here. */
+        spu_lockline_lock();
+        memset(vm_base + (uint32_t)ea, 0, size);
+        for (uint32_t offset = 0; offset < size; offset += 128u)
+            spu_coh_notify_write_except((uint32_t)ea + offset, spu);
+        spu_lockline_unlock();
+        return 0;
+    }
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
@@ -1467,7 +1501,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     /* Mark tag as completed -- EXCEPT a list parked at a stall-and-notify
      * element: its tag group stays incomplete until MFC_WrListStallAck resumes
      * it to the end (mfc_list_stall_ack marks completion then). */
-    if (!(spu->list_stall_mask & (1u << (tag & 0x1F))))
+    if (!(spu->list_stall_mask & (1u << (tag & 0x1F))) &&
+        ((cmd & 0xFFFFu) != MFC_SDCRZ_CMD || rc == 0))
         mfc->tag_completed |= (1u << tag);
 
     return rc;
