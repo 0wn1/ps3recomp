@@ -500,15 +500,14 @@ came from this work.
 ### tekulvw — [@tekulvw](https://github.com/tekulvw)
 - **SPU interpreter `ILH`** (#234): it had shared `IL`'s case and repeated a
   32-bit immediate instead of a halfword. The test runs the real interpreter.
-- **v0.15.0, 39 PRs: a correctness sweep of the runtime and the Metal
+- **v0.15.0, 34 PRs: a correctness sweep of the runtime and the Metal
   backend**, each with a fixture that fails before the fix.
   - SPURS policy scheduling with per-instance workers and contention limits
     (#291), private per-context DMA and reservation state (#290), interpreter
     hand-off (#266), and SPU ELF discovery in the build (#288). Also SDCRZ
     (#295), FNMS (#318), the interrupt-enable bit (#289), and the SPURS
     task/taskset fixes (#283, #284, #298, #306).
-  - Separate user and mapper memory domains (#296), argv/envp (#263), and HLE
-    registration regeneration (#262).
+  - argv/envp (#263) and HLE registration regeneration (#262).
   - RSX: depth compare (#302), sRGB output (#304), texture gamma (#305),
     colour-input clamp (#303), depth24 (#299), depth-export cache keys
     (#301), and immediate vertices (#292). Metal: depth readback (#300),

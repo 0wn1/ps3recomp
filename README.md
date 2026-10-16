@@ -416,9 +416,9 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Changelog
 
-### v0.15.0 — *"Seventy-Seven"* (October 2026)
+### v0.15.0 — *"Seventy-Six"* (October 2026)
 
-*77 pull requests from six contributors, merged in #325. They come from five
+*76 pull requests from six contributors, merged in #325. They come from five
 ports in progress: Killzone 2 and 3, inFAMOUS and inFAMOUS 2, and Twisted
 Metal, plus tekulvw's correctness sweep of the runtime and Metal. Every
 change ships with a test or a measurement.*
@@ -467,10 +467,8 @@ change ships with a test or a measurement.*
   per-coroutine indirect-call depth guard (#270), and thread-locals that stay
   thread-local under MinGW (#271).
 - Jump tables behind a tail-call epilogue are found (*@erikomis*, #311).
-- Memory and boot, from *@tekulvw*: user allocations and mapper reservations
-  live in separate domains, and runtime-owned ranges are kept out of both
-  (#296). PPU entry argv/envp live in stack-owned storage (#263), and HLE
-  registrations regenerate when library sources change (#262).
+- Boot, from *@tekulvw*: PPU entry argv/envp live in stack-owned storage
+  (#263), and HLE registrations regenerate when library sources change (#262).
 
 **RSX, draw engine, Metal and Vulkan**
 - **Depth:** from *@undecuple*, fragment depth export (#279), depth buffers
