@@ -10,6 +10,7 @@
  * NIDs are computed from the names (ps3_compute_nid), so this stays correct
  * without hand-written NID literals.
  */
+#define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
 #include "ppu_recomp.h"     /* ppu_context */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
 #include <stdint.h>
