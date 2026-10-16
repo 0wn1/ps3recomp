@@ -390,6 +390,11 @@ if(PS3RECOMP_BUILD_TESTS)
     # cellVdec through its guest API: the callback-only decoder always, and
     # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
     add_subdirectory(libs/codec/tests)
+    # cellGcm's FIFO walker without a backend: where GET_REPORT writes for
+    # each report DMA context. Links the runtime like the POSIX host below.
+    if(UNIX)
+        add_subdirectory(tests/gcm_reports)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
