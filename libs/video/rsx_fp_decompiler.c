@@ -1580,6 +1580,8 @@ int rsx_fp_apply_srgb_output(char* hlsl, u32 capacity)
     memmove(hlsl + helper_len, hlsl, prefix + (size_t)n + 1);
     memcpy(hlsl, helper, helper_len);
     return 1;
+}
+
 int rsx_fp_decompile_buffered_color_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     const u8 gamma_masks[16], char* out, u32 out_size, u32* out_constant_count)
