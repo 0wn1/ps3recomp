@@ -2503,7 +2503,9 @@ static int jg_wait(u32 ea)
  * this queue, and would only notify again after the event arrives -- so
  * signalling at walker exit deadlocks both sides. Signal when the WORK
  * completes: at END, and on reaching a guard with jobs run this lap. */
-#ifdef _WIN32
+/* __declspec(thread) for MSVC only: MinGW GCC ignores it, which would make
+ * these process-wide. spurs_job.c and cellSpurs.c must agree. */
+#if defined(_MSC_VER)
 #  define SPURS_JOB_TLS __declspec(thread)
 #else
 #  define SPURS_JOB_TLS __thread
