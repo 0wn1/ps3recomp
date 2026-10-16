@@ -1363,6 +1363,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             t.cubemap, t.mipmaps, t.filter, t.wrap, t.control0);
         if (shadow[u].enabled) shadow_mask |= 1u << u;
     }
+    u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
+    if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
+        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (t.enabled) gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
+    }
+    const u32 gamma_units = fixed ? 0 : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
+    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
+        if (!(gamma_units & (1u << u))) gamma_masks[u] = 0;
+
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
     /* Shadow helpers normalize against the bound resource themselves. Only
      * sampled ordinary UN units need baked dimensions or cache identity. */
@@ -1392,6 +1401,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         if (srgb_output) key = eng_fnv1a(&srgb_output, sizeof srgb_output, key);
+        if (gamma_units) key = eng_fnv1a(gamma_masks, sizeof gamma_masks, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         if (shadow_mask) {
             key = eng_fnv1a(&shadow_mask, sizeof shadow_mask, key);
@@ -1427,8 +1437,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
-        fi = rsx_fp_decompile_buffered_shadow_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
-                shadow_mask ? shadow : NULL, s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        fi = rsx_fp_decompile_buffered_shadow_color_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
+                shadow_mask ? shadow : NULL, gamma_masks, s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
