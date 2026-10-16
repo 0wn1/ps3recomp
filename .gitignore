@@ -111,3 +111,6 @@ scratch/
 fw_spu/
 *.prx
 *.PRX
+
+# SPU differential test build products (runtime/spu/tests/build_diff_test.sh)
+runtime/spu/tests/build_diff/
