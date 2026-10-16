@@ -19,6 +19,19 @@
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
+/* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
+ * wall-clock seconds. A loaded machine runs a title at a third of its usual
+ * frame rate, and a wall-clock schedule then presses START on the logos; a
+ * flip schedule replays the same screens however slow the run is. */
+extern u32 cellGcm_flip_request_count(void);
+static double pad_clock(unsigned long long t0_ms)
+{
+    static int flips = -1;
+    if (flips < 0) { const char* e = getenv("PAD_CLOCK"); flips = e && !strcmp(e, "flips"); }
+    return flips ? (double)cellGcm_flip_request_count()
+                 : (double)(GetTickCount64() - t0_ms) / 1000.0;
+}
+
 /* ---------------------------------------------------------------------------
  * Backend selection
  * -----------------------------------------------------------------------*/
@@ -610,7 +623,7 @@ skip_inject: ;
       } }
 
     /* PAD_SCRIPT="<sec>:<mask>,<sec>:<mask>,..." -- press a NAMED button at a
-     * given wall-clock second, each held ~250 ms. PAD_AUTOPRESS only pulses
+     * given wall-clock second (or flip, under PAD_CLOCK=flips), each held ~250 ms. PAD_AUTOPRESS only pulses
      * CROSS and START, which is enough to clear a "press start" screen but not
      * to navigate a menu: You Don't Know Jack needs DOWN to move off its name
      * field before CROSS means anything. Masks are CELL_PAD_CTRL_* packed as
@@ -638,7 +651,7 @@ skip_inject: ;
           }
       }
       if (s_sc && port_no == 0) {
-          double now = (double)(GetTickCount64() - t0) / 1000.0;
+          double now = pad_clock(t0);
           /* Latch, do not window. A fixed time window is missed whenever the
            * title stops polling the pad for longer than the window (it does
            * exactly that on a loading screen), so the press silently never
@@ -715,7 +728,7 @@ skip_inject: ;
                  sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
                  s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
                  s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
-      if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+      if (s_st && pad_clock(s_t0) >= s_from && pad_clock(s_t0) < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                   hs->connected = 1; }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
