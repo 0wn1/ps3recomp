@@ -639,26 +639,39 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
 
 /* ---- coherence with guest memory around 2D transfers ------------------- */
 
-/* The surface holding guest bytes [offset, offset + pitch * h) as a w x h
- * rectangle of 32-bit pixels, and the rectangle's position inside it. Only a
- * surface laid out with the transfer's own pitch qualifies: another pitch puts
- * the rows elsewhere, and an FP16 target right after an RGBA8 one would
- * otherwise resolve into the RGBA8 one's rows. The CLOSEST base at or below
- * the address wins: surfaces' guest ranges overlap (rsx_live_draw.c's resolve
- * takes the same rule, and its comment records copying out of a stale surface
- * at 0x0 before it did). */
-static u32 eng_surface_at(u32 location, u32 offset, u32 pitch, u32* x, u32* y)
+/* Bytes per pixel of a surface a 2D transfer can touch: A8R8G8B8, and the
+ * FP16 RGBA target an HDR pass renders into (Twisted Metal copies its bloom
+ * out of one for the SPU post-FX). 0 for any other format. */
+static u32 eng_transfer_bpp(rsx_be_format fmt)
+{
+    switch (fmt) {
+    case RSX_BE_FMT_R8G8B8A8:      return 4u;
+    case RSX_BE_FMT_R16G16B16A16F: return 8u;
+    default:                       return 0u;
+    }
+}
+
+/* The surface holding guest bytes [offset, offset + pitch * h), with the byte
+ * position of `offset` inside its row (*xb) and its row (*y). Only a surface
+ * laid out with the transfer's own pitch qualifies: another pitch puts the
+ * rows elsewhere. The CLOSEST base at or below the address wins: surfaces'
+ * guest ranges overlap, and an FP16 target right after an RGBA8 one must not
+ * resolve into the RGBA8 one's rows (rsx_live_draw.c's resolve takes the same
+ * rule, and its comment records copying out of a stale surface at 0x0 before
+ * it did). */
+static u32 eng_surface_at(u32 location, u32 offset, u32 pitch, u32* xb, u32* y)
 {
     u32 best = ENG_INVALID;
     for (u32 i = 0; i < g.n_surfaces; i++) {
         const eng_surface* s = &g.surfaces[i];
         if (!s->handle || s->location != location || offset < s->offset) continue;
-        if (s->fmt != RSX_BE_FMT_R8G8B8A8 || s->pitch != pitch) continue;
+        const u32 bpp = eng_transfer_bpp(s->fmt);
+        if (!bpp || s->pitch != pitch) continue;
         const u32 d = offset - s->offset;
-        if (d / pitch >= s->h || (d % pitch) / 4u >= s->w) continue;
+        if (d / pitch >= s->h || d % pitch >= s->w * bpp) continue;
         if (best != ENG_INVALID && g.surfaces[best].offset > s->offset) continue;
         best = i;
-        *x = (d % pitch) / 4u;
+        *xb = d % pitch;
         *y = d / pitch;
     }
     return best;
@@ -677,10 +690,16 @@ static int eng_coherence_log(void)
     return left > 0 ? left-- : 0;
 }
 
-static u32 eng_nonzero_pixels(const u8* rows, u32 n)
+/* Pixels of `bpp` bytes whose colour (the first three quarters: R,G,B) is
+ * not all zero. */
+static u32 eng_nonzero_pixels(const u8* rows, u32 n, u32 bpp)
 {
     u32 k = 0;
-    for (u32 i = 0; i < n; i++, rows += 4) k += (rows[0] | rows[1] | rows[2]) != 0;
+    for (u32 i = 0; i < n; i++, rows += bpp) {
+        u8 any = 0;
+        for (u32 b = 0; b < bpp * 3u / 4u; b++) any |= rows[b];
+        k += any != 0;
+    }
     return k;
 }
 
@@ -698,8 +717,8 @@ static u8* eng_coherence_buffer(u32 bytes)
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
 {
     if (!g.ready || !g.be->readback || !pitch || !w || !h) return;
-    u32 x = 0, y = 0;
-    const u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
+    u32 xb = 0, y = 0;
+    const u32 slot = eng_surface_at(location, offset, pitch, &xb, &y);
     if (slot == ENG_INVALID) {
         if (eng_coherence_log())
             fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u: no surface\n",
@@ -707,25 +726,41 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
         return;
     }
     const eng_surface* s = &g.surfaces[slot];
-    if (x + w > s->w) w = s->w - x;
+    const u32 bpp = eng_transfer_bpp(s->fmt);
+    /* The transfer counts 32-bit pixels, so w * 4 bytes per row; an FP16
+     * surface pixel is two of them. Read back every surface pixel those bytes
+     * touch, then store exactly the bytes. */
+    u32 bytes = w * 4u;
+    if (xb + bytes > s->w * bpp) bytes = s->w * bpp - xb;
     if (y + h > s->h) h = s->h - y;
-    u8* rows = eng_coherence_buffer(w * 4u * h);
+    const u32 x = xb / bpp, skip = xb % bpp;
+    const u32 n = (skip + bytes + bpp - 1u) / bpp;
+    u8* rows = eng_coherence_buffer(n * bpp * h);
     if (!rows) return;
     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
-    g.be->readback(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+    g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
     if (eng_coherence_log())
-        fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X at %u,%u:"
-                        " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
-                eng_nonzero_pixels(rows, w * h));
+        fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X (%u bpp) at %u,%u:"
+                        " %u non-zero pixels\n", location, offset, w, h, s->offset, bpp, x, y,
+                eng_nonzero_pixels(rows, n * h, bpp));
     const int rgba = rsx_texture_argb_is_rgba();
     for (u32 r = 0; r < h; r++) {
-        u8* dst = (u8*)eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
+        u8* dst = (u8*)eng_guest_ptr(NULL, location, offset + r * pitch, bytes);
         if (!dst) return;
-        const u8* src = rows + (size_t)r * w * 4u;
-        for (u32 c = 0; c < w; c++, src += 4, dst += 4) {
-            if (rgba) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; }
-            else      { dst[0] = src[3]; dst[1] = src[0]; dst[2] = src[1]; dst[3] = src[2]; }
+        u8* src = rows + (size_t)r * n * bpp;
+        if (bpp == 8u) {
+            /* R,G,B,A halves, each stored big-endian: the layout
+             * rsx_texture_decode reads W16_Z16_Y16_X16_FLOAT from. */
+            for (u32 c = 0; c < n * 4u; c++) {
+                const u8 t = src[2 * c]; src[2 * c] = src[2 * c + 1]; src[2 * c + 1] = t;
+            }
+        } else if (!rgba) {
+            for (u32 c = 0; c < n; c++) {
+                u8* p = src + c * 4u;
+                const u8 a = p[3]; p[3] = p[2]; p[2] = p[1]; p[1] = p[0]; p[0] = a;
+            }
         }
+        memcpy(dst, src + skip, bytes);
     }
 }
 
@@ -734,12 +769,14 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
     if (!g.ready || !g.be->color_target_write || !pitch || !w || !h) return;
     u32 x = 0, y = 0;
     const u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
-    if (slot == ENG_INVALID) {
+    /* color_target_write takes R,G,B,A bytes: an A8R8G8B8 surface only. */
+    if (slot == ENG_INVALID || g.surfaces[slot].fmt != RSX_BE_FMT_R8G8B8A8) {
         if (eng_coherence_log())
-            fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u: no surface\n",
+            fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u: no A8R8G8B8 surface\n",
                     location, offset, w, h);
         return;
     }
+    x /= 4u;
     const eng_surface* s = &g.surfaces[slot];
     if (x + w > s->w) w = s->w - x;
     if (y + h > s->h) h = s->h - y;
@@ -758,7 +795,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
     if (eng_coherence_log())
         fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u -> surface 0x%08X at %u,%u:"
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
-                eng_nonzero_pixels(rows, w * h));
+                eng_nonzero_pixels(rows, w * h, 4u));
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
 }
 

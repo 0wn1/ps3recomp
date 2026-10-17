@@ -266,14 +266,21 @@ static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.
 /* One pixel of a surface, in the R,G,B,A order rsx_texture_decode produces:
  * the readback hook has to put those back into the guest's A8R8G8B8. */
 static u8 g_stub_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
+/* An FP16 surface's pixel: R,G,B,A halves 1.0, 2.0, 3.0, 4.0, little-endian
+ * as a host GPU hands them back. */
+static const u8 g_stub_pixel16[8] = { 0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44 };
 
+/* The engine asks for rows packed at the surface's own pixel size, so the
+ * pitch tells the two formats apart. */
 static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                           void* out, u32 pitch)
 {
     (void)u; (void)s; (void)x; (void)y;
+    const u32 bpp = pitch >= w * 8u ? 8u : 4u;
     for (u32 r = 0; r < h; r++)
         for (u32 c = 0; c < w; c++)
-            memcpy((u8*)out + (size_t)r * pitch + c * 4u, g_stub_pixel, 4);
+            memcpy((u8*)out + (size_t)r * pitch + c * bpp,
+                   bpp == 8u ? g_stub_pixel16 : g_stub_pixel, bpp);
 }
 
 /* Every depth target reads back as 0.5, which Z24S8 stores as 0x800000. */
@@ -1040,6 +1047,48 @@ static void test_transfer_coherence(void)
     engine_down();
 }
 
+/* An HDR pass renders into an FP16 RGBA target, and the title copies it out
+ * with a 2D transfer that counts 32-bit pixels: Twisted Metal's bloom and
+ * flames reach its SPU post-FX that way. The copy has to get the GPU's
+ * pixels, as big-endian halves, and only the bytes it names. */
+static void test_transfer_reads_fp16(void)
+{
+    printf("-- transfer reads an FP16 surface\n");
+    engine_up();
+    m(M_SURFACE_FORMAT, 0xBu);                 /* F_W16Z16Y16X16 */
+    m(M_COLOR_A_PITCH, 2048u);                 /* 256 pixels of 8 bytes */
+    draw_triangle();
+
+    const u32 row = 0x40000u + 3u * 2048u;
+    u8* rd = vm_base + GUEST_LOCAL_EA + row;
+    static const u8 px[8] = { 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44, 0x00 };
+
+    /* Four 32-bit pixels from surface pixel 2: two FP16 pixels. */
+    memset(rd, 0xEE, 64);
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, row + 2u * 8u, 2048u, 4u, 1u);
+    CHECK(memcmp(rd + 16, px, 8) == 0 && memcmp(rd + 24, px, 8) == 0,
+          "two FP16 pixels land as big-endian R,G,B,A halves (%02X %02X %02X %02X)",
+          rd[16], rd[17], rd[18], rd[19]);
+    CHECK(rd[15] == 0xEE && rd[32] == 0xEE, "and nothing around them is written");
+
+    /* One 32-bit pixel starting half way into a surface pixel: its B,A. */
+    memset(rd, 0xEE, 64);
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, row + 5u * 8u + 4u, 2048u, 1u, 1u);
+    CHECK(memcmp(rd + 44, px + 4, 4) == 0 && rd[43] == 0xEE && rd[48] == 0xEE,
+          "a transfer starting mid-pixel gets exactly the bytes it names");
+
+    /* The last pixel of the row, asked for past the surface's width. */
+    memset(rd + 2040, 0xEE, 8);
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, row + 255u * 8u, 2048u, 8u, 1u);
+    CHECK(memcmp(rd + 2040, px, 8) == 0, "a transfer past the width stops at the surface's edge");
+
+    /* Bytes copied INTO an FP16 target are not pushed as A8R8G8B8 rows. */
+    memset(&g_written, 0, sizeof g_written);
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, row, 2048u, 4u, 1u);
+    CHECK(g_written.n == 0, "a transfer into an FP16 surface does not write it as A8R8G8B8");
+    engine_down();
+}
+
 static unsigned custom_reads;
 static const u8* custom_guest_read(void* user, u32 location, u32 offset, u32 bytes)
 {
@@ -1416,6 +1465,7 @@ int main(void)
     test_custom_guest_mapping();
     test_queued_flip_buffer();
     test_transfer_coherence();
+    test_transfer_reads_fp16();
     test_inline_array();
     test_depth_clear_value();
     test_antialiased_surface();
