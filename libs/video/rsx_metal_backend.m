@@ -2792,6 +2792,29 @@ static void eng_pipeline_release(void* user, u32 pipeline)
 
 /* ---- per-draw binding ---------------------------------------------------- */
 
+/* PS3_ANISO=2..16: anisotropic filtering on the guest's samplers that minify
+ * linearly through a mip chain, which is where a surface seen at a grazing
+ * angle (a road, a wall along the view) blurs. Point-filtered and unmipped
+ * samplers -- lookup tables, render targets, UI -- keep their filtering, so
+ * nothing that depends on exact texels changes. Unset or 0/1 = off, the
+ * filtering the guest asked for. */
+static int eng_aniso_from(const char* e)
+{
+    if (!e || !*e) return 0;
+    const int a = atoi(e);
+    return a <= 1 ? 0 : a > 16 ? 16 : a;
+}
+
+static int eng_aniso(void)
+{
+    static int a = -1;
+    if (a < 0) {
+        a = eng_aniso_from(getenv("PS3_ANISO"));
+        if (a) fprintf(stderr, "[RSX metal] anisotropic filtering %dx (PS3_ANISO)\n", a);
+    }
+    return a;
+}
+
 static int eng_sampler_slot(const rsx_be_sampler_desc* d)
 {
     const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1)
@@ -2817,6 +2840,8 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
     sd.tAddressMode = gcm_wrap_to_metal(d->wrap_t);
     sd.rAddressMode = gcm_wrap_to_metal(d->wrap_r);
     sd.borderColor  = MTLSamplerBorderColorTransparentBlack;
+    if (d->min_linear && d->mip_present && eng_aniso() > 1)
+        sd.maxAnisotropy = (NSUInteger)eng_aniso();
     id<MTLSamplerState> s = [s_dev newSamplerStateWithDescriptor:sd];
     if (!s) return -1;
     const int slot = (int)s_eng_samp_count++;
