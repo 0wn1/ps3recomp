@@ -885,6 +885,10 @@ static u32 nv309e_swz(u32 x, u32 y, u32 l2w, u32 l2h)
     return off;
 }
 
+/* IMAGE_IN_POINT is 12.4 fixed point per axis; DS_DX / DT_DY step the source in 20 fractional bits (1.0 = 0x100000).
+ * The origin in the steps' scale is therefore origin << 16: an origin of one texel (0x10) is 0x100000. */
+static inline u64 nv3089_origin(u32 p) { return (u64)p << 16; }
+
 /* The draw engine renders on the host GPU, so the scene a title copies out
  * with NV3089 is not in guest memory, and what it copies in never reaches the
  * engine's surfaces. Around the guest-memory copy below: write the source
@@ -1085,8 +1089,8 @@ static void nv3089_blit(void)
     static int rowcopy = -1;
     if (rowcopy < 0) { const char* e = getenv("NV3089_ROWCOPY"); rowcopy = e ? atoi(e) : 1; }
     if (rowcopy && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
-        /* the integer source start the per-pixel loop derives for x = y = 0 */
-        const u32 sx0 = (u32)(((u64)u0 << 8) >> 20), sy0 = (u32)(((u64)v0 << 8) >> 20);
+        /* the source start in whole texels: IMAGE_IN_POINT is 12.4 */
+        const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
         u32 xa = 0, xb = out_w;                       /* destination x range inside the clip */
         if (out_x < cx0) xa = cx0 - out_x;
         if ((u64)out_x + xb > cx1) xb = cx1 > out_x ? cx1 - out_x : 0;
