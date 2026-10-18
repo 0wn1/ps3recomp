@@ -17,6 +17,9 @@
  *      even with a newer flip written behind it and not yet flushed.
  *   5. A flip the walker abandons when it resyncs out of unmapped IO does not
  *      hold back the flip status.
+ *   6. With every flip completed, a beat completes nothing: not after the
+ *      status was reset, and not for a flip queued after that beat.
+ *   7. A flip requested outside the stream completes on the next beat, once.
  *
  * gcc -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_flip_stream.c
  *   -ffunction-sections -fdata-sections -Wl,--gc-sections -pthread
@@ -175,6 +178,32 @@ int main(void)
     cellGcm_request_tick();
     p = GCM_PENDING_TAKE();
     check((p & 1) && (p & 2), "a flip abandoned by a resync does not hold back the status");
+
+    /* 6: everything queued has completed. The title resets the status and
+     * builds its next frame; beats go by before it queues the flip. */
+    cellGcmResetFlipStatus();
+    cellGcm_request_tick();
+    p = GCM_PENDING_TAKE();
+    check((p & 1) && !(p & 2), "with no flip outstanding, a beat completes nothing");
+    const u32 cur4 = vm_read32(ctx + 8);
+    (void)_cellGcmSetFlipCommandWithWaitLabel((void*)(uintptr_t)ctx, 1, LABEL, VALUE);
+    cellGcm_request_tick();
+    p = GCM_PENDING_TAKE();
+    check(!(p & 2), "and the flip queued after it waits for the drain");
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(cur4) + 20);
+    cellGcm_rsx_process_fifo();
+    cellGcm_request_tick();
+    p = GCM_PENDING_TAKE();
+    check(p & 2, "which completes it");
+
+    /* 7 */
+    check(cellGcmSetFlipCommand(1) == CELL_OK, "a flip outside the stream is accepted");
+    cellGcm_request_tick();
+    p = GCM_PENDING_TAKE();
+    check(p & 2, "it completes on the next beat");
+    cellGcm_request_tick();
+    p = GCM_PENDING_TAKE();
+    check(!(p & 2), "once");
 
     printf("[gcm_flip_stream] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     free(vm_base);

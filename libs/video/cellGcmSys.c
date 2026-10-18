@@ -103,17 +103,25 @@ static volatile int s_flip_pending = 0;
  * however many vblanks go by. */
 static volatile u32 s_fifo_flips_queued = 0, s_fifo_flips_reached = 0;
 static u32 s_fifo_flips_completed = 0;   /* reached count at the last completion */
+/* A flip requested outside the command stream (cellGcmSetFlipCommand, or a
+ * 0xFEAD word the drain met), not completed yet. */
+static volatile int s_flip_direct_pending = 0;
 
 /* May this beat complete a flip? Yes if the drain has executed a flip marker
- * since the last completion, or if no flip is waiting in the stream (a flip
- * that never went through it). A flip that is queued, or written but not yet
- * flushed, does not hold back the completion of one already executed: the RSX
- * reports the flip it did, not the ones still ahead of it. */
+ * since the last completion, or if a flip that never went through the stream
+ * is waiting. A flip that is queued, or written but not yet flushed, does not
+ * hold back the completion of one already executed: the RSX reports the flip
+ * it did, not the ones still ahead of it. With no flip outstanding there is
+ * nothing to complete: Twisted Metal resets the flip status, takes about a
+ * second to build its next frame here, then queues the flip, and a beat in
+ * between that reported a flip made it take the new one for done. It then
+ * rebuilt the command segment the walker was still waiting in. */
 static int gcm_flip_executed_take(void)
 {
     const u32 r = s_fifo_flips_reached;
     if (r != s_fifo_flips_completed) { s_fifo_flips_completed = r; return 1; }
-    return r == s_fifo_flips_queued;
+    if (s_flip_direct_pending) { s_flip_direct_pending = 0; return 1; }
+    return 0;
 }
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
@@ -2419,6 +2427,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
         gcm_set_current_display_buffer(bufferId);
         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
         s_flip_request_count++;
+        s_flip_direct_pending = 1;
     }
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
