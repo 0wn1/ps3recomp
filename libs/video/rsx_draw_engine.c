@@ -119,6 +119,8 @@ typedef struct {
     u32 location, offset, format, width, height, pitch, remap, cubemap;
     u32 handle;
     u64 content_hash;
+    u64 sparse_hash;            /* eng_texture_sparse_hash, the per-frame check */
+    u32 last_full_frame;        /* g.frames of the last full content hash */
     u32 last_hash_frame;
     u64 last_use_serial;
 } eng_texture;
@@ -889,6 +891,45 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
     return hash;
 }
 
+/* The cheap per-frame change check: 64 bytes out of every 2 KB, plus the
+ * last 64. A rewrite of the whole texture (a video frame, a UI redraw, a
+ * streamed replacement) changes it at once; a small write between the
+ * sampled blocks is left to the full hash, which every texture still gets
+ * every ENG_TEXHASH_FULL_EVERY frames. */
+#define ENG_TEXHASH_STRIDE      2048u
+#define ENG_TEXHASH_FULL_EVERY  8u          /* a power of two */
+#define ENG_TEXHASH_SMALL       16384u      /* at or below: full every frame */
+static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
+                                   int* readable)
+{
+    const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+    if (!src) { *readable = 0; return 0; }
+    u64 hash = 1469598103934665603ull;
+    for (u32 i = 0; i + 64 <= span; i += ENG_TEXHASH_STRIDE)
+        for (u32 k = 0; k < 64; k += 8) {
+            u64 word;
+            memcpy(&word, src + i + k, sizeof(word));
+            hash = (hash ^ word) * 1099511628211ull;
+        }
+    for (u32 i = span > 64 ? span - 64 : 0; i < span; i++)
+        hash = (hash ^ src[i]) * 1099511628211ull;
+    *readable = 1;
+    return hash;
+}
+
+/* Whether a cached texture gets the full hash at this use: always when it
+ * is small or under PS3RECOMP_ENG_TEXHASH_FULL=1 (the old behaviour, read
+ * at engine init), otherwise once ENG_TEXHASH_FULL_EVERY frames have passed
+ * since its last one. New entries start staggered by slot, so the full
+ * hashes of a scene's textures spread over the frames instead of landing on
+ * the same one. */
+static int s_texhash_full_always;
+static int eng_texture_full_rehash(u32 span, u32 last_full_frame)
+{
+    return s_texhash_full_always || span <= ENG_TEXHASH_SMALL ||
+           (u32)(g.frames - last_full_frame) >= ENG_TEXHASH_FULL_EVERY;
+}
+
 static int eng_staging_reserve(u32 bytes)
 {
     if (g.tex_staging_cap >= bytes) return 1;
@@ -958,9 +999,21 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             e->cubemap != (u32)(cube != 0))
             continue;
         if (e->handle && e->last_hash_frame != g.frames) {
+            /* Every cached texture used to be hashed in full every frame;
+             * in a big scene that is hundreds of MB a second for the few
+             * that change. Now the sparse check every frame, and the full
+             * hash when it differs, when this entry's turn has come, for a
+             * small texture, or after a write the engine saw. */
             int readable = 0;
-            const u64 hash = eng_texture_content_hash(location, offset, span,
-                                                      &readable);
+            u64 hash = e->content_hash;
+            const u64 sparse = eng_texture_sparse_hash(location, offset, span,
+                                                       &readable);
+            if (readable && (sparse != e->sparse_hash ||
+                             eng_texture_full_rehash(span, e->last_full_frame))) {
+                hash = eng_texture_content_hash(location, offset, span, &readable);
+                e->last_full_frame = g.frames;
+            }
+            if (readable) e->sparse_hash = sparse;
             e->last_hash_frame = g.frames;
             if (readable && hash != e->content_hash) {
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
@@ -994,9 +1047,11 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.width = w; e.height = h; e.pitch = pitch;
     e.remap = remap; e.cubemap = (u32)(cube != 0);
     e.last_hash_frame = g.frames;
+    e.last_full_frame = g.frames - (index & (ENG_TEXHASH_FULL_EVERY - 1u));
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
-      e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
+      e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
+      e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
@@ -1021,8 +1076,10 @@ static void eng_textures_touch(u32 location, u32 offset, u32 bytes)
 {
     for (u32 i = 0; i < g.n_textures; i++) {
         eng_texture* e = &g.textures[i];
-        if (e->location == location && e->offset >= offset && e->offset - offset < bytes)
+        if (e->location == location && e->offset >= offset && e->offset - offset < bytes) {
             e->last_hash_frame = g.frames - 1u;
+            e->last_full_frame = g.frames - ENG_TEXHASH_FULL_EVERY;   /* hash it all */
+        }
     }
 }
 
@@ -2576,6 +2633,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
     if (!g.be) return -1;
     g.width  = width  ? width  : 1280;
     g.height = height ? height : 720;
+    { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
+      s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
