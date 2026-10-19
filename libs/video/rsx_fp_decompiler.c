@@ -359,14 +359,23 @@ static const char* input_expr(u32 input_src)
 }
 
 /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
-static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
+static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int has_k,
                      int buffered, u32 constant_slot, char* buf, u32 bufsz)
 {
     char base[96];
     if (s->type == FP_REG_TYPE_TEMP) {
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
-        snprintf(base, sizeof(base), "%s", input_expr(input_src));
+        /* SRC2.perspective_corr on a texcoord read (TC0..TC9) multiplies it
+         * by 1/w (RPCS3 FragmentProgramDecompiler: "Perspective correct flag
+         * multiplies the result by 1/w"). A vertex program that writes uv*w
+         * relies on it: inFAMOUS 2's water samples its screen copy that way,
+         * and read raw it lands far outside the copy and the river is black. */
+        if (persp && input_src >= 0x4 && input_src <= 0xD)
+            snprintf(base, sizeof(base), "(%s * _rsx_inv_w(input.position))",
+                     input_expr(input_src));
+        else
+            snprintf(base, sizeof(base), "%s", input_expr(input_src));
     } else { /* CONST */
         if (buffered && has_k)
             snprintf(
@@ -786,15 +795,19 @@ static int rsx_fp_decompile_internal(
             has_k = 1;
         }
 
+        /* SRC2 bit 31 is perspective_corr for the instruction's input read
+         * (RPCS3 RSXFragmentProgram.h SRC2); on a branch the word is an
+         * address instead. */
+        const int persp = !is_branch && (w3 >> 31) != 0;
         char a[200], b[200], c[200];
         emit_src(
-            &s0, input_src, k, has_k, buffered, constant_slot,
+            &s0, input_src, persp, k, has_k, buffered, constant_slot,
             a, sizeof(a));
         emit_src(
-            &s1, input_src, k, has_k, buffered, constant_slot,
+            &s1, input_src, persp, k, has_k, buffered, constant_slot,
             b, sizeof(b));
         emit_src(
-            &s2, input_src, k, has_k, buffered, constant_slot,
+            &s2, input_src, persp, k, has_k, buffered, constant_slot,
             c, sizeof(c));
         if (has_k)
             constant_slot++;
@@ -1248,6 +1261,18 @@ static int rsx_fp_decompile_internal(
     if (strstr(o.p, "input._rsx_front"))
         out_puts(&p, "    bool _rsx_front : SV_IsFrontFace;\n");
     out_puts(&p, "};\n");
+    /* 1/w of the fragment for perspective_corr reads. SV_POSITION.w is the
+     * clip w under FXC (D3D12) but already 1/w once glslang lowers it to
+     * SPIR-V FragCoord (Vulkan, and Metal's [[position]] is (x, y, z, 1/w));
+     * the glslang paths define RSX_FRAGCOORD_W_IS_RCP. Emitted only where the
+     * body uses it, so every other program stays byte-identical. */
+    if (strstr(o.p, "_rsx_inv_w("))
+        out_puts(&p,
+            "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"
+            "#define _rsx_inv_w(p) ((p).w)\n"
+            "#else\n"
+            "#define _rsx_inv_w(p) (1.0 / (p).w)\n"
+            "#endif\n");
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
