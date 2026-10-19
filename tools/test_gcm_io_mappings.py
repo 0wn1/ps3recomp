@@ -4,7 +4,7 @@
 Builds the real find_free_mapping, gcm_io_alloc, cellGcmMapMainMemory and
 cellGcm_syscall_iomap (pulled verbatim out of libs/video/cellGcmSys.c, with
 CELL_GCM_MAX_IO_MAPPINGS from cellGcmSys.h) against small stubs for guest
-memory and the offset table, and checks:
+memory and the offset table (EA side only), and checks:
 
 1. a title mapping separate 1 MB chunks gets at least 40 distinct IO offsets
    before the first refusal (Killzone 3 maps up to 38);
@@ -65,7 +65,13 @@ static int s_io_mapping_count = 0;
 static unsigned char mem[0x1000];
 static void vm_write32(u32 a, u32 v) { for (int i = 0; i < 4; i++) mem[a + i] = (unsigned char)(v >> (24 - 8 * i)); }
 static u32 rd32(u32 a) { return (u32)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
-static void populate_offset_table(u32 ea, u32 io, u32 size) { (void)ea; (void)io; (void)size; }
+/* IO page -> EA page, 0xFFFF = free: gcm_io_alloc skips pages already taken. */
+static u16 s_ea_address_table[65536];
+static void populate_offset_table(u32 ea, u32 io, u32 size)
+{
+    for (u32 i = 0; i < ((size + 0xFFFFFu) >> 20) && (io >> 20) + i < 65536; i++)
+        s_ea_address_table[(io >> 20) + i] = (u16)((ea >> 20) + i);
+}
 static u32 s_io_alloc_next = 0;
 static u32 gcm_io_alloc(u32 size);
 %s
@@ -73,6 +79,7 @@ int main(void)
 {
     u32* out = (u32*)(uintptr_t)0x100;     /* guest out-param address */
     int ok = 1;
+    memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
 
     /* 3: map A and B, unmap A (as cellGcmUnmapIoAddress does), then iomap C. */
     cellGcmMapMainMemory(0x20000000u, 0x100000u, out);

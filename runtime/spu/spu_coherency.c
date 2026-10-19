@@ -184,12 +184,24 @@ int spu_coh_is_reserved(uint32_t addr)
  *
  * The PUTLLC path already guards this case by dropping its own reservation
  * before notifying; this gives the DMA path the same ability. */
-void ppu_resv_break_line(uint32_t ea);   /* ppu_loader.cpp */
+/* ppu_loader.cpp, when linked. The loader is compiled per game, so the host,
+ * the fixtures and any build without it have no PPU reservations to break:
+ * weak on POSIX, the linker's own default under link.exe/lld-link (see
+ * ppu_gcm_pump in ppu_loader.cpp). */
+#if defined(_MSC_VER)
+void ppu_resv_break_line(uint32_t ea);
+void ppu_resv_break_line_absent(uint32_t ea) { (void)ea; }
+#pragma comment(linker, "/alternatename:ppu_resv_break_line=ppu_resv_break_line_absent")
+#define PPU_RESV_BREAK_LINE(ea) ppu_resv_break_line(ea)
+#else
+__attribute__((weak)) void ppu_resv_break_line(uint32_t ea);
+#define PPU_RESV_BREAK_LINE(ea) do { if (ppu_resv_break_line) ppu_resv_break_line(ea); } while (0)
+#endif
 
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
-    ppu_resv_break_line(ea);
+    PPU_RESV_BREAK_LINE(ea);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c || (const void*)c == self) continue;
@@ -205,7 +217,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
-    ppu_resv_break_line(ea);
+    PPU_RESV_BREAK_LINE(ea);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c) continue;

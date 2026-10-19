@@ -20,6 +20,10 @@ static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint
     dispatches++; dispatched_image = image; dispatched_size = size;
     dispatched_context = context; return 1;
 }
+/* Taskset2 exit-code slot: these tasksets are not registered as Taskset2,
+ * where production returns without touching memory. */
+static void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint32_t code)
+{ (void)taskset_ea; (void)task; (void)exited; (void)code; }
 /* PRODUCTION_FUNCTIONS */
 static unsigned passed, failed;
 #define CHECK(test, message) do { if (test) passed++; else { failed++; fprintf(stderr, "FAIL: %s\n", message); } } while (0)
