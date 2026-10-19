@@ -212,6 +212,14 @@ int rsx_fp_decompile_buffered_shadow_color_expand_ex(
     const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
     const u8 expand_masks[16],
     char* out, u32 out_size, u32* out_constant_count);
+/* As above, with tex_vol_mask naming the units bound to a 3D texture: they
+ * are declared Texture3D and sampled with three coordinates (TXP divides
+ * all three by w), like cube units on their own t-register. */
+int rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
+    const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
+    const u8 expand_masks[16],
+    char* out, u32 out_size, u32* out_constant_count);
 int rsx_fp_decompile_buffered_shadow_color_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],

@@ -140,6 +140,9 @@ u32 rsx_texture_cube_face_stride(u32 rsx_fmt, u32 w, u32 h, u32 levels,
  * Interleaves the low bits of x and y, then appends whichever axis still has
  * bits left when the other is exhausted (non-square images). */
 u32 rsx_swizzle_offset(u32 x, u32 y, u32 log2w, u32 log2h);
+/* The same for a 3D image: x, y and z bits interleave (x first) while all
+ * three have bits, then whichever still do (RPCS3 convert_linear_swizzle_3d). */
+u32 rsx_swizzle_offset_3d(u32 x, u32 y, u32 z, u32 log2w, u32 log2h, u32 log2d);
 
 /* ceil(log2(v)); 0 for v <= 1. */
 u32 rsx_log2_ceil(u32 v);
