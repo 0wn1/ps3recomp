@@ -948,10 +948,38 @@ static inline int64_t spu__sf_key(uint32_t x) {
     return (x & 0x80000000u) ? -m : m;
 }
 static inline int64_t spu__sf_mag(uint32_t x) { return (x & 0x7F800000u) ? (int64_t)(x & 0x7FFFFFFFu) : 0; }
-SPU__SF_V2(spu_fceq,  spu__sf_key(x) == spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
-SPU__SF_V2(spu_fcgt,  spu__sf_key(x) >  spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
-SPU__SF_V2(spu_fcmeq, spu__sf_mag(x) == spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
-SPU__SF_V2(spu_fcmgt, spu__sf_mag(x) >  spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fceq_ref,  spu__sf_key(x) == spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fcgt_ref,  spu__sf_key(x) >  spu__sf_key(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fcmeq_ref, spu__sf_mag(x) == spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
+SPU__SF_V2(spu_fcmgt_ref, spu__sf_mag(x) >  spu__sf_mag(y) ? 0xFFFFFFFFu : 0u)
+#if (defined(__SSE2__) || defined(_M_X64)) && !defined(SPU_SCALAR_HELPERS)
+#include <emmintrin.h>
+/* SSE2 forms (tests/test_spu_helpers.c checks them against the _ref loops,
+ * which compilers leave scalar and branchy). A magnitude is at most
+ * 0x7FFFFFFF and its negation fits too, so the keys compare as int32. */
+static inline __m128i spu__sse_mag(__m128i x) {
+    const __m128i m = _mm_and_si128(x, _mm_set1_epi32(0x7FFFFFFF));
+    const __m128i denorm = _mm_cmpeq_epi32(_mm_and_si128(x, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
+    return _mm_andnot_si128(denorm, m);
+}
+static inline __m128i spu__sse_key(__m128i x) {
+    const __m128i neg = _mm_srai_epi32(x, 31);
+    return _mm_sub_epi32(_mm_xor_si128(spu__sse_mag(x), neg), neg);
+}
+#define SPU__SSE_CMP(name, cmp, key) static inline u128 name(u128 a, u128 b) { \
+    __m128i A, B; memcpy(&A, &a, 16); memcpy(&B, &b, 16); \
+    const __m128i r = cmp(key(A), key(B)); u128 out; memcpy(&out, &r, 16); return out; }
+SPU__SSE_CMP(spu_fceq,  _mm_cmpeq_epi32, spu__sse_key)
+SPU__SSE_CMP(spu_fcgt,  _mm_cmpgt_epi32, spu__sse_key)
+SPU__SSE_CMP(spu_fcmeq, _mm_cmpeq_epi32, spu__sse_mag)
+SPU__SSE_CMP(spu_fcmgt, _mm_cmpgt_epi32, spu__sse_mag)
+#undef SPU__SSE_CMP
+#else
+static inline u128 spu_fceq(u128 a, u128 b)  { return spu_fceq_ref(a, b); }
+static inline u128 spu_fcgt(u128 a, u128 b)  { return spu_fcgt_ref(a, b); }
+static inline u128 spu_fcmeq(u128 a, u128 b) { return spu_fcmeq_ref(a, b); }
+static inline u128 spu_fcmgt(u128 a, u128 b) { return spu_fcmgt_ref(a, b); }
+#endif
 #undef SPU__SF_V2
 #undef SPU__SF_V3
 
