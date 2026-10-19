@@ -2287,6 +2287,42 @@ static id<MTLRenderPipelineState> s_eng_blit_pso;
 static MTLPixelFormat             s_eng_blit_pso_fmt;
 static id<MTLRenderPipelineState> s_eng_depth_pso;
 static id<MTLSamplerState>        s_eng_point_sampler;
+static id<MTLSamplerState>        s_eng_linear_sampler;   /* FXAA's taps */
+
+/* Post-processing in the present, read once; unset, the present is the plain
+ * sample (and gamma) it always was.
+ *   PS3_AA=fxaa        FXAA 3.11 (quality preset 29) on the display buffer,
+ *                      at the guest's resolution, before the present
+ *   PS3_SHARPEN=0..1   contrast-adaptive sharpening (AMD FidelityFX CAS) in
+ *                      the present pass; 0 = off, 1 = strongest
+ * -1 = not read yet. */
+static int   s_eng_fxaa = -1;
+static float s_eng_sharpen = -1.0f;
+static id<MTLRenderPipelineState> s_eng_fxaa_pso;
+static MTLPixelFormat             s_eng_fxaa_pso_fmt;
+static id<MTLTexture>             s_eng_fxaa_tex;
+
+static float eng_sharpen_from(const char* e)
+{
+    if (!e || !*e) return 0.0f;
+    const double v = strtod(e, NULL);
+    return !(v > 0.0) ? 0.0f : v > 1.0 ? 1.0f : (float)v;
+}
+
+static void eng_post_options(void)
+{
+    if (s_eng_fxaa < 0) {
+        const char* e = getenv("PS3_AA");
+        s_eng_fxaa = (e && !strcasecmp(e, "fxaa"));
+        if (e && *e && !s_eng_fxaa && strcasecmp(e, "off") && strcmp(e, "0"))
+            fprintf(stderr, "[RSX metal] PS3_AA=%s unknown (fxaa); off\n", e);
+    }
+    if (s_eng_sharpen < 0.0f) s_eng_sharpen = eng_sharpen_from(getenv("PS3_SHARPEN"));
+    static int logged;
+    if (!logged++ && (s_eng_fxaa || s_eng_sharpen > 0.0f))
+        fprintf(stderr, "[RSX metal] present: AA %s, sharpen %.2f\n",
+                s_eng_fxaa ? "FXAA" : "off", (double)s_eng_sharpen);
+}
 
 static NSString* const kEngHelperMSL = @
 "#include <metal_stdlib>\n"
@@ -2303,13 +2339,125 @@ static NSString* const kEngHelperMSL = @
 "                            sampler s [[sampler(0)]]) {\n"
 "    return src.sample(s, i.uv);\n"
 "}\n"
+/* The present: optional contrast-adaptive sharpening (AMD FidelityFX CAS,
+ * the non-scaling form: a cross whose negative weight grows where the 3x3
+ * neighbourhood has headroom), at the source's texel spacing, then the video
+ * out's gamma. sharp = 0 is the plain sample. */
+"struct PresentP { float gamma; float sharp; float2 px; };\n"
 "fragment float4 eng_present_fs(BOut i [[stage_in]],\n"
 "                               texture2d<float> src [[texture(0)]],\n"
 "                               sampler s [[sampler(0)]],\n"
-"                               constant float& gamma [[buffer(0)]]) {\n"
+"                               constant PresentP& p [[buffer(0)]]) {\n"
 "    float4 c = src.sample(s, i.uv);\n"
-"    if (gamma != 1.0) c.rgb = pow(max(c.rgb, 0.0), float3(gamma));\n"
+"    if (p.sharp > 0.0) {\n"
+"        float2 d = p.px;\n"
+"        float3 a  = saturate(src.sample(s, i.uv + float2(-d.x, -d.y)).rgb);\n"
+"        float3 b  = saturate(src.sample(s, i.uv + float2( 0.0, -d.y)).rgb);\n"
+"        float3 cc = saturate(src.sample(s, i.uv + float2( d.x, -d.y)).rgb);\n"
+"        float3 l  = saturate(src.sample(s, i.uv + float2(-d.x,  0.0)).rgb);\n"
+"        float3 e  = saturate(c.rgb);\n"
+"        float3 r  = saturate(src.sample(s, i.uv + float2( d.x,  0.0)).rgb);\n"
+"        float3 g  = saturate(src.sample(s, i.uv + float2(-d.x,  d.y)).rgb);\n"
+"        float3 h  = saturate(src.sample(s, i.uv + float2( 0.0,  d.y)).rgb);\n"
+"        float3 k  = saturate(src.sample(s, i.uv + float2( d.x,  d.y)).rgb);\n"
+"        float3 mn = min(min(min(l, e), min(r, b)), h);\n"
+"        mn += min(mn, min(min(a, cc), min(g, k)));\n"
+"        float3 mx = max(max(max(l, e), max(r, b)), h);\n"
+"        mx += max(mx, max(max(a, cc), max(g, k)));\n"
+"        float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));\n"
+"        float3 w = amp * (-1.0 / mix(8.0, 5.0, saturate(p.sharp)));\n"
+"        c.rgb = saturate((b * w + l * w + r * w + h * w + e) / (1.0 + 4.0 * w));\n"
+"    }\n"
+"    if (p.gamma != 1.0) c.rgb = pow(max(c.rgb, 0.0), float3(p.gamma));\n"
 "    return c;\n"
+"}\n"
+/* FXAA 3.11, quality preset 29 (Timothy Lottes, public domain), with luma
+ * from RGB: the display buffer's alpha is not luma, and it is kept. */
+"static float fx_l(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+"constant float FX_P[12] = { 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0 };\n"
+"fragment float4 eng_fxaa_fs(BOut i [[stage_in]],\n"
+"                            texture2d<float> t [[texture(0)]],\n"
+"                            sampler s [[sampler(0)]],\n"
+"                            constant float2& rcp [[buffer(0)]]) {\n"
+"    const float subpix = 0.75, thr = 0.166, thr_min = 0.0833;\n"
+"    float2 posM = i.uv;\n"
+"    float4 rgbyM = t.sample(s, posM);\n"
+"    float lumaM = fx_l(rgbyM.rgb);\n"
+"    float lumaS = fx_l(t.sample(s, posM, int2( 0,  1)).rgb);\n"
+"    float lumaE = fx_l(t.sample(s, posM, int2( 1,  0)).rgb);\n"
+"    float lumaN = fx_l(t.sample(s, posM, int2( 0, -1)).rgb);\n"
+"    float lumaW = fx_l(t.sample(s, posM, int2(-1,  0)).rgb);\n"
+"    float rangeMax = max(max(lumaN, lumaW), max(lumaE, max(lumaS, lumaM)));\n"
+"    float rangeMin = min(min(lumaN, lumaW), min(lumaE, min(lumaS, lumaM)));\n"
+"    float range = rangeMax - rangeMin;\n"
+"    if (range < max(thr_min, rangeMax * thr)) return rgbyM;\n"
+"    float lumaNW = fx_l(t.sample(s, posM, int2(-1, -1)).rgb);\n"
+"    float lumaSE = fx_l(t.sample(s, posM, int2( 1,  1)).rgb);\n"
+"    float lumaNE = fx_l(t.sample(s, posM, int2( 1, -1)).rgb);\n"
+"    float lumaSW = fx_l(t.sample(s, posM, int2(-1,  1)).rgb);\n"
+"    float lumaNS = lumaN + lumaS, lumaWE = lumaW + lumaE;\n"
+"    float subpixRcpRange = 1.0 / range;\n"
+"    float subpixNSWE = lumaNS + lumaWE;\n"
+"    float edgeHorz1 = -2.0 * lumaM + lumaNS, edgeVert1 = -2.0 * lumaM + lumaWE;\n"
+"    float lumaNESE = lumaNE + lumaSE, lumaNWNE = lumaNW + lumaNE;\n"
+"    float edgeHorz2 = -2.0 * lumaE + lumaNESE, edgeVert2 = -2.0 * lumaN + lumaNWNE;\n"
+"    float lumaNWSW = lumaNW + lumaSW, lumaSWSE = lumaSW + lumaSE;\n"
+"    float edgeHorz4 = abs(edgeHorz1) * 2.0 + abs(edgeHorz2);\n"
+"    float edgeVert4 = abs(edgeVert1) * 2.0 + abs(edgeVert2);\n"
+"    float edgeHorz3 = -2.0 * lumaW + lumaNWSW, edgeVert3 = -2.0 * lumaS + lumaSWSE;\n"
+"    float edgeHorz = abs(edgeHorz3) + edgeHorz4, edgeVert = abs(edgeVert3) + edgeVert4;\n"
+"    float subpixNWSWNESE = lumaNWSW + lumaNESE;\n"
+"    float lengthSign = rcp.x;\n"
+"    bool horzSpan = edgeHorz >= edgeVert;\n"
+"    float subpixA = subpixNSWE * 2.0 + subpixNWSWNESE;\n"
+"    if (!horzSpan) { lumaN = lumaW; lumaS = lumaE; }\n"
+"    if (horzSpan) lengthSign = rcp.y;\n"
+"    float subpixB = subpixA * (1.0 / 12.0) - lumaM;\n"
+"    float gradientN = lumaN - lumaM, gradientS = lumaS - lumaM;\n"
+"    float lumaNN = lumaN + lumaM, lumaSS = lumaS + lumaM;\n"
+"    bool pairN = abs(gradientN) >= abs(gradientS);\n"
+"    float gradient = max(abs(gradientN), abs(gradientS));\n"
+"    if (pairN) lengthSign = -lengthSign;\n"
+"    float subpixC = saturate(abs(subpixB) * subpixRcpRange);\n"
+"    float2 posB = posM;\n"
+"    float2 offNP = float2(horzSpan ? rcp.x : 0.0, horzSpan ? 0.0 : rcp.y);\n"
+"    if (!horzSpan) posB.x += lengthSign * 0.5; else posB.y += lengthSign * 0.5;\n"
+"    float2 posN = posB - offNP * FX_P[0], posP = posB + offNP * FX_P[0];\n"
+"    float subpixD = -2.0 * subpixC + 3.0;\n"
+"    float lumaEndN = fx_l(t.sample(s, posN).rgb);\n"
+"    float subpixE = subpixC * subpixC;\n"
+"    float lumaEndP = fx_l(t.sample(s, posP).rgb);\n"
+"    if (!pairN) lumaNN = lumaSS;\n"
+"    float gradientScaled = gradient * (1.0 / 4.0);\n"
+"    float lumaMM = lumaM - lumaNN * 0.5;\n"
+"    float subpixF = subpixD * subpixE;\n"
+"    bool lumaMLTZero = lumaMM < 0.0;\n"
+"    lumaEndN -= lumaNN * 0.5; lumaEndP -= lumaNN * 0.5;\n"
+"    bool doneN = abs(lumaEndN) >= gradientScaled, doneP = abs(lumaEndP) >= gradientScaled;\n"
+"    if (!doneN) posN -= offNP * FX_P[1];\n"
+"    if (!doneP) posP += offNP * FX_P[1];\n"
+"    for (int k = 2; k < 12 && (!doneN || !doneP); k++) {\n"
+"        if (!doneN) lumaEndN = fx_l(t.sample(s, posN).rgb) - lumaNN * 0.5;\n"
+"        if (!doneP) lumaEndP = fx_l(t.sample(s, posP).rgb) - lumaNN * 0.5;\n"
+"        doneN = abs(lumaEndN) >= gradientScaled; doneP = abs(lumaEndP) >= gradientScaled;\n"
+"        if (!doneN) posN -= offNP * FX_P[k];\n"
+"        if (!doneP) posP += offNP * FX_P[k];\n"
+"    }\n"
+"    float dstN = horzSpan ? posM.x - posN.x : posM.y - posN.y;\n"
+"    float dstP = horzSpan ? posP.x - posM.x : posP.y - posM.y;\n"
+"    bool goodSpanN = (lumaEndN < 0.0) != lumaMLTZero;\n"
+"    bool goodSpanP = (lumaEndP < 0.0) != lumaMLTZero;\n"
+"    float spanLengthRcp = 1.0 / (dstP + dstN);\n"
+"    bool directionN = dstN < dstP;\n"
+"    float dst = min(dstN, dstP);\n"
+"    bool goodSpan = directionN ? goodSpanN : goodSpanP;\n"
+"    float subpixG = subpixF * subpixF;\n"
+"    float pixelOffset = dst * (-spanLengthRcp) + 0.5;\n"
+"    float subpixH = subpixG * subpix;\n"
+"    float pixelOffsetSubpix = max(goodSpan ? pixelOffset : 0.0, subpixH);\n"
+"    if (!horzSpan) posM.x += pixelOffsetSubpix * lengthSign;\n"
+"    else           posM.y += pixelOffsetSubpix * lengthSign;\n"
+"    return float4(t.sample(s, posM).rgb, rgbyM.a);\n"
 "}\n"
 "fragment float eng_depth_fs(BOut i [[stage_in]],\n"
 "                            depth2d<float> src [[texture(0)]],\n"
@@ -2439,7 +2587,10 @@ static int eng_init(void* user, u32 width, u32 height)
     sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
     sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
     s_eng_point_sampler = [s_dev newSamplerStateWithDescriptor:sd];
-    return s_eng_point_sampler ? 0 : -1;
+    sd.minFilter = MTLSamplerMinMagFilterLinear;
+    sd.magFilter = MTLSamplerMinMagFilterLinear;
+    s_eng_linear_sampler = [s_dev newSamplerStateWithDescriptor:sd];
+    return s_eng_point_sampler && s_eng_linear_sampler ? 0 : -1;
 }
 
 static void eng_shutdown(void* user)
@@ -2462,6 +2613,9 @@ static void eng_shutdown(void* user)
     s_eng_blit_pso = nil;
     s_eng_depth_pso = nil;
     s_eng_point_sampler = nil;
+    s_eng_linear_sampler = nil;
+    s_eng_fxaa_pso = nil;
+    s_eng_fxaa_tex = nil;
     s_eng_active = 0;
     s_eng_encoding_failed = 0;
     s_eng_checked_completed = 0;
@@ -3327,13 +3481,65 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
     }
 }
 
+/* PS3_AA=fxaa: the display buffer through FXAA into a texture of its own
+ * size and format. nil (and the frame goes on without it) if that fails. */
+static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
+{
+    const MTLPixelFormat fmt = [src pixelFormat];
+    if (!s_eng_fxaa_pso || s_eng_fxaa_pso_fmt != fmt) {
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_fxaa_fs"];
+        pd.colorAttachments[0].pixelFormat = fmt;
+        NSError* err = nil;
+        s_eng_fxaa_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!s_eng_fxaa_pso) {
+            fprintf(stderr, "[rsx engine/metal] FXAA pipeline failed (FXAA off): %s\n",
+                    [[err localizedDescription] UTF8String]);
+            s_eng_fxaa = 0;
+            return nil;
+        }
+        s_eng_fxaa_pso_fmt = fmt;
+    }
+    if (!s_eng_fxaa_tex || [s_eng_fxaa_tex width] != [src width] ||
+        [s_eng_fxaa_tex height] != [src height] || [s_eng_fxaa_tex pixelFormat] != fmt) {
+        MTLTextureDescriptor* td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:[src width]
+                                                              height:[src height] mipmapped:NO];
+        td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        s_eng_fxaa_tex = [s_dev newTextureWithDescriptor:td];
+        if (!s_eng_fxaa_tex) return nil;
+    }
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture     = s_eng_fxaa_tex;
+    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!e) return nil;
+    const float rcp[2] = { 1.0f / (float)[src width], 1.0f / (float)[src height] };
+    [e setRenderPipelineState:s_eng_fxaa_pso];
+    [e setFragmentTexture:src atIndex:0];
+    [e setFragmentSamplerState:s_eng_linear_sampler atIndex:0];
+    [e setFragmentBytes:rcp length:sizeof rcp atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    return s_eng_fxaa_tex;
+}
+
 /* Put a surface on the drawable. A straight blit would need matching formats
  * and sizes; a full-screen sample needs neither, and the guest's surfaces are
- * routinely a different size from the window. */
+ * routinely a different size from the window.
+ *
+ * With PS3_AA=fxaa the surface goes through FXAA first, at its own size; with
+ * PS3_SHARPEN this pass sharpens it as it samples. Either one that is off or
+ * fails is skipped. */
 static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
                                 id<MTLTexture> dst)
 {
     if (!src || !dst || !s_eng_helper_lib) return;
+    eng_post_options();
+    if (s_eng_fxaa) { id<MTLTexture> t = eng_fxaa(cb, src); if (t) src = t; }
     if (!s_eng_blit_pso || s_eng_blit_pso_fmt != [dst pixelFormat]) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
@@ -3358,10 +3564,13 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     [e setFragmentTexture:src atIndex:0];
     [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
     /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
-     * setting): out = in^gamma, as RPCS3's calibration pass applies it. */
+     * setting): out = in^gamma, as RPCS3's calibration pass applies it. The
+     * sharpening taps are one source texel apart. */
     { extern float cellAvconfExt_display_gamma(void);
-      const float gamma = cellAvconfExt_display_gamma();
-      [e setFragmentBytes:&gamma length:sizeof gamma atIndex:0]; }
+      const struct { float gamma, sharp, px[2]; } p = {
+          cellAvconfExt_display_gamma(), s_eng_sharpen,
+          { 1.0f / (float)[src width], 1.0f / (float)[src height] } };
+      [e setFragmentBytes:&p length:sizeof p atIndex:0]; }
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
