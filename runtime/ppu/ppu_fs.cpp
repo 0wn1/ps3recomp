@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <atomic>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
@@ -90,9 +91,17 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_O_RDONLY     0
 #define CELL_FS_O_WRONLY     1
 #define CELL_FS_O_RDWR       2
-#define CELL_FS_O_CREAT      0x0200
-#define CELL_FS_O_TRUNC      0x0400
-#define CELL_FS_O_APPEND     0x0100
+/* Open flags: the PS3 SDK values (octal), byte for byte the set
+ * libs/filesystem/cellFs.h declares. The hex guesses that used to be here
+ * (O_CREAT 0x0200, O_TRUNC 0x0400, O_APPEND 0x0100) put the right numbers on
+ * the wrong names -- 0x200 and 0x400 are TRUNC and APPEND, not CREAT and
+ * TRUNC -- so a title opening a file with O_RDWR|O_CREAT (flags 0x42 =
+ * 000002 | 000100) hit an unnamed bit and got a plain read-only open; the file
+ * was never created. */
+#define CELL_FS_O_CREAT      0x0040   /* 000100 */
+#define CELL_FS_O_TRUNC      0x0200   /* 001000 */
+#define CELL_FS_O_APPEND     0x0400   /* 002000 */
+#define CELL_FS_O_EXCL       0x0080   /* 000200 */
 #define CELL_FS_SEEK_SET     0
 #define CELL_FS_SEEK_CUR     1
 #define CELL_FS_SEEK_END     2
@@ -130,6 +139,20 @@ static void host_path(char* out, size_t cap, const char* guest)
     if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
     if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
         snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
+        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+        return;
+    }
+
+    /* /dev_hdd1 is the CACHE partition (cellSysCacheMount mounts it), and it
+     * must be WRITABLE and separate from the disc mount: without its own root
+     * the mount table below resolves /dev_hdd1 to <ppu_vfs_root>/cache/..., i.e.
+     * into the read-only disc tree, so a title's first cache open fails and it
+     * never creates its media threads. PS3_HDD1_ROOT selects the host dir, the
+     * same convention as PS3_HDD0_ROOT. */
+    static const char* hdd1_root = nullptr; static int hdd1_init = 0;
+    if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
+    if (hdd1_root && *hdd1_root && strncmp(guest, "/dev_hdd1/", 10) == 0) {
+        snprintf(out, cap, "%s/%s", hdd1_root, guest + 10);
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;
     }
@@ -239,7 +262,7 @@ static void cellFsOpen(ppu_context* ctx)
     }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
+        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)
@@ -821,8 +844,14 @@ static void cellFsSdataOpenByFd(ppu_context* ctx)
  */
 #ifdef _WIN32
 #  define HOST_FSEEK64(f,off) _fseeki64((f), (__int64)(off), SEEK_SET)
+#  define HOST_FTELL64(f)     _ftelli64(f)
+#  define HOST_LOCKFILE(f)    _lock_file(f)
+#  define HOST_UNLOCKFILE(f)  _unlock_file(f)
 #else
 #  define HOST_FSEEK64(f,off) fseeko((f), (off_t)(off), SEEK_SET)
+#  define HOST_FTELL64(f)     ftello(f)
+#  define HOST_LOCKFILE(f)    flockfile(f)
+#  define HOST_UNLOCKFILE(f)  funlockfile(f)
 #endif
 
 static uint32_t guest_be32(uint32_t a)
@@ -854,7 +883,7 @@ static void cellFsAioRead(ppu_context* ctx)
     uint32_t buf    = guest_be32(aio + 0x10);
     uint64_t size   = guest_be64(aio + 0x18);
 
-    static int32_t s_next_id = 1;
+    static std::atomic<int32_t> s_next_id{1};
     int32_t id = s_next_id++;
     if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
 
@@ -863,10 +892,20 @@ static void cellFsAioRead(ppu_context* ctx)
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
         fs_prefault(buf, size);
-        /* AIO reads are absolute -- they do not disturb the fd's own file
-         * position, and the guest interleaves them freely across threads. */
-        if (HOST_FSEEK64(g_files[fd], offset) == 0)
-            n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+        /* AIO reads are absolute: they must not move the fd's own position,
+         * and the guest issues them from several threads at once (FIOS media
+         * threads, audio streamers) on the same fd as its plain reads. A bare
+         * seek + read on the shared FILE* did both: another thread's seek
+         * could land between the two, and the next cellFsRead continued from
+         * wherever the AIO stopped. Hold the stream lock across seek, read
+         * and the seek back (stdio's own calls take the same lock). */
+        FILE* f = g_files[fd];
+        HOST_LOCKFILE(f);
+        const int64_t pos = (int64_t)HOST_FTELL64(f);
+        if (HOST_FSEEK64(f, offset) == 0)
+            n = fread(vm_base + buf, 1, (size_t)size, f);
+        if (pos >= 0) HOST_FSEEK64(f, pos);
+        HOST_UNLOCKFILE(f);
         err = CELL_OK;
     }
     if (getenv("PS3_FSLOG"))

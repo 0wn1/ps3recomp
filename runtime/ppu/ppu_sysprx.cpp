@@ -526,6 +526,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
 extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
 extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
 extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
+extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
 static uint32_t g_net_errno_ea = 0;
 static void hle_net_errno_loc(ppu_context* ctx)
 {
@@ -742,9 +743,10 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
  */
 #define SPINLOCK_BE1  0x01000000u          /* be32(1) */
 
-static inline volatile long* spin_word(uint32_t ea)
+static inline volatile LONG* spin_word(uint32_t ea)
 {
-    return (volatile long*)(vm_base + ea);
+    /* LONG stays 32-bit on LP64 hosts, unlike native long. */
+    return (volatile LONG*)(vm_base + ea);
 }
 
 /* Test-and-set, not compare-and-swap: writing "locked" over an already-locked
@@ -752,7 +754,7 @@ static inline volatile long* spin_word(uint32_t ea)
  * Exchange is the one RMW the POSIX shim in win32_compat.h already provides. */
 static inline int spin_try(uint32_t ea)
 {
-    return _InterlockedExchange(spin_word(ea), (long)SPINLOCK_BE1) == 0;
+    return _InterlockedExchange(spin_word(ea), (LONG)SPINLOCK_BE1) == 0;
 }
 
 static void sys_spinlock_initialize(ppu_context* ctx)
@@ -859,6 +861,8 @@ extern "C" void ppu_sysprx_register(void)
      * (userdata) is on the guest stack, so they need the full context too.
      * Registered here so no project has to remember the call. */
     cellSaveData_register_ctx_handlers();
+    /* cellVideoOutSetGamma's float argument is in f1. */
+    avconf_register_ctx();
     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
      * sys_net NID LBP imports so none fall to the unresolved-NID default. */
     ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);

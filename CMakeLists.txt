@@ -300,6 +300,7 @@ if(PS3RECOMP_RSX_VULKAN)
             target_link_libraries(ps3recomp_runtime PRIVATE
                 glslang::glslang-default-resource-limits)
         endif()
+        set(PS3RECOMP_SPIRV_TRANSLATION ON)
         message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
                        "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
     else()
@@ -387,6 +388,10 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
+    # Syscall 14's address/flags classification as a plain unit test: the
+    # check is pure, so the test links one runtime translation unit
+    # (lv2_lock_line.c) and nothing else.
+    add_subdirectory(tests/syscalls)
     # cellVdec through its guest API: the callback-only decoder always, and
     # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
     add_subdirectory(libs/codec/tests)
@@ -398,6 +403,9 @@ if(PS3RECOMP_BUILD_TESTS)
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME spinlock_word_width
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
         add_test(NAME spurs_task_exit_code_initialize
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_task_exit_code_initialize.py")
@@ -458,6 +466,25 @@ if(UNIX)
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
         )
         target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
+    endif()
+
+    # The HLSL -> SPIR-V translation cache, memory and disk. Needs glslang
+    # only, no GPU.
+    if(PS3RECOMP_SPIRV_TRANSLATION)
+        add_executable(test_shader_spirv
+            libs/video/tests/test_shader_spirv.c
+            libs/video/rsx_shader_spirv.cpp
+        )
+        target_include_directories(test_shader_spirv PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_link_libraries(test_shader_spirv PRIVATE glslang::glslang glslang::SPIRV)
+        if(TARGET glslang::glslang-default-resource-limits)
+            target_link_libraries(test_shader_spirv PRIVATE
+                glslang::glslang-default-resource-limits)
+        endif()
+        set_target_properties(test_shader_spirv PROPERTIES LINKER_LANGUAGE CXX)
     endif()
 endif()
 

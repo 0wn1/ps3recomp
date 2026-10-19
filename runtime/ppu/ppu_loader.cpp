@@ -34,6 +34,7 @@
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
@@ -3030,6 +3031,18 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+/* cellGcmSys.c, when linked. ppu_hle.cpp already holds a weak reference, and
+ * under COFF a second weak declaration emits a second fallback definition, so
+ * every port failed to link. On Windows use the linker's own default instead. */
+#if defined(_MSC_VER)   /* MSVC and clang-cl: link.exe/lld-link */
+extern "C" void ppu_gcm_pump(void);
+extern "C" void ppu_gcm_pump_absent(void) {}
+#pragma comment(linker, "/alternatename:ppu_gcm_pump=ppu_gcm_pump_absent")
+#define PPU_GCM_PUMP_LINKED 1
+#else
+extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
+#define PPU_GCM_PUMP_LINKED (ppu_gcm_pump != nullptr)
+#endif
 /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
@@ -3046,6 +3059,15 @@ extern "C" void lv2_syscall(ppu_context* ctx)
           const char* e = getenv("PPU_GUARD_EA");
           if (e && *e) ppu_guard_page((uint32_t)strtoul(e, 0, 16)); } }
     uint64_t num = ctx->gpr[11];
+    /* Deliver pending GCM vblank/flip/user callbacks at the timer sleeps too,
+     * not only at HLE imports (ppu_hle.cpp): on hardware they fire
+     * asynchronously, and a guest thread that polls with usleep alone would
+     * otherwise never see the handler it is waiting for. inFAMOUS 2 defers its
+     * FIFO put to the flip handler (0x13AC88 stores it at obj+72, 0x13AC34
+     * writes it) and then spins in 0x13ACE8 on the ref register with
+     * sys_timer_usleep only; it used to be rescued by another thread's HLE
+     * call, and hung once that thread had nothing left to poll. */
+    if ((num == 141 || num == 142) && PPU_GCM_PUMP_LINKED) ppu_gcm_pump();
     /* Milestone: which lv2 calls this title makes, in first-occurrence order.
      * Formatting the key each time is noise next to the profiler stamp below,
      * which resolves a host return address to a guest function. */
@@ -3055,11 +3077,19 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * A thread blocked in a syscall shows no in-flight HLE (syscalls do not go
      * through ps3_hle_call) and a stale CTR, so without this a wedged thread is
      * just "somewhere in ntdll". Cleared on every exit path by the guard. */
+    /* It also closes the PS3_FTRACE span: how long this thread sat in the
+     * syscall, and at which guest call site (lr at entry). */
     struct _ScGuard {
-        ppu_context* c;
+        ppu_context* c; uint64_t num, t0; uint32_t lr;
         ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0; }
-    } _sg{ ctx };
+                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0;
+                      if (PS3_FT_ON() && t0) {
+                          const uint64_t t1 = ps3_ft_now();
+                          if (num == 141) ps3_ft_usleep(t, lr, t0, t1);   /* sys_timer_usleep */
+                          else if (t1 - t0 >= ps3_ft_min_ns())
+                              ps3_ft_span(PS3_FT_SYSCALL, t, (uint32_t)num, lr, t0, t1);
+                      } }
+    } _sg{ ctx, num, PS3_FT_ON() ? ps3_ft_now() : 0, (uint32_t)ctx->lr };
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
