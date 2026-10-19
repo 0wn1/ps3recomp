@@ -376,6 +376,12 @@ static void upload_mip_texture(void)
  * pixels is what drives the LOD past level 0; the sampler's max LOD then pins
  * it at level 1. Layout as the textured quad: float4 pos, colour, uv. */
 #define MVTX_OFFSET (VTX_OFFSET + 0x3000u)
+/* --mip-aniso: the same quad stretched to 0.8 of the target's height, so the
+ * texture is minified ~2.5x across and magnified ~4.5x down. Isotropic
+ * filtering takes the LOD from the longer axis and still lands on level 1;
+ * anisotropic filtering (PS3_ANISO) takes several samples along it and its
+ * LOD from the shorter one, which is level 0. */
+static int s_mip_aniso;
 static void upload_mip_quad(void)
 {
     static const float v[6][12] = {
@@ -387,8 +393,11 @@ static void upload_mip_quad(void)
         { -0.02f, 0.02f,0,1,  0,1,0,1,  0,1,0,0 },
     };
     for (int i = 0; i < 6; i++)
-        for (int k = 0; k < 12; k++)
-            guest_f32(IO_ADDR + MVTX_OFFSET + (uint32_t)(i * 48 + k * 4), v[i][k]);
+        for (int k = 0; k < 12; k++) {
+            float f = v[i][k];
+            if (k == 1 && s_mip_aniso) f *= 20.0f;            /* y: +-0.02 -> +-0.4 */
+            guest_f32(IO_ADDR + MVTX_OFFSET + (uint32_t)(i * 48 + k * 4), f);
+        }
 }
 
 /* The guest-shader draw's vertex block: the same full-viewport triangle, but
@@ -1259,6 +1268,10 @@ int main(int argc, char** argv)
          * that the sampler reaches level 1. The levels are different colours,
          * so a backend that uploads only level 0 presents the wrong one. */
         else if (strcmp(argv[i], "--mip") == 0)    do_draw = 5;
+        /* --mip-aniso: --mip with the quad stretched along y, which only
+         * anisotropic filtering samples from level 0. Passes with PS3_ANISO
+         * set and must fail without it. */
+        else if (strcmp(argv[i], "--mip-aniso") == 0) { do_draw = 5; s_mip_aniso = 1; }
         /* --rtt: render into a colour surface of the guest's own and then
          * sample it, which is what a title does for every reflection, shadow
          * map and post-processing pass. Needs the guest-program path. */
@@ -1466,7 +1479,7 @@ int main(int argc, char** argv)
                  : (do_draw == 8) ? DTEX_ARGB     /* the sampled depth as a byte */
                  : (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
-                 : (do_draw == 5) ? MIP_L1_ARGB
+                 : (do_draw == 5) ? (s_mip_aniso ? MIP_L0_ARGB : MIP_L1_ARGB)
                  : (do_draw == 4) ? 0xFFFF0000u   /* near red beats far green    */
                  : (do_draw == 3) ? 0xFFFF0000u   /* blue vertices, FP swaps r/b */
                  : (do_draw == 2) ? TEX_ARGB

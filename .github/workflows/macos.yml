@@ -158,6 +158,14 @@ jobs:
           # backend that uploads level 0 and stops presents level 0's colour
           # and fails, so this cannot pass without the whole mip chain.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip
+          # PS3_ANISO: the same two levels under a quad stretched along y.
+          # Only anisotropic filtering reads level 0 there, so it must pass
+          # with PS3_ANISO and fail without it.
+          PS3_ANISO=16 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip-aniso
+          if PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip-aniso; then
+            echo "--mip-aniso passed without PS3_ANISO; the check is not checking"
+            exit 1
+          fi
           # Render-to-texture: a red triangle drawn into a colour surface of
           # the guest's own, then sampled by a full-screen quad through the
           # guest programs. The guest bytes behind that surface are green, so
