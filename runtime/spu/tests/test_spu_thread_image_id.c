@@ -10,6 +10,9 @@
  *   runtime/spu/tests/test_spu_thread_image_id.c runtime/spu/spu_lifted_thread.c -Wl,-dead_strip -pthread
  *   -o /tmp/test_spu_thread_image_id && /tmp/test_spu_thread_image_id
  */
+/* Syscall 14's classifier (#341) lives in lv2_lock_line.c, which pulls in the
+ * VM map table; nothing here issues syscall 14. */
+int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; return 0; }
 #include "../../syscalls/lv2_register.c"
 #include <assert.h>
 #include <stdio.h>
