@@ -321,6 +321,12 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
 
 /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
 const char* cellGame_get_title_id(void) { return s_title_id; }
+/* The title id when the booted title is an HDD game (CATEGORY "HG"), else NULL:
+ * its /dev_hdd0/game/<id>/ IS the booted game directory (sys_fs.c). */
+const char* cellGame_get_hdd_title_id(void)
+{
+    return s_game_type == CELL_GAME_GAMETYPE_HDD && s_title_id[0] ? s_title_id : NULL;
+}
 
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName)
