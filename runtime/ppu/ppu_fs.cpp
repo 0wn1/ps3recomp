@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <atomic>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
@@ -829,8 +830,14 @@ static void cellFsSdataOpenByFd(ppu_context* ctx)
  */
 #ifdef _WIN32
 #  define HOST_FSEEK64(f,off) _fseeki64((f), (__int64)(off), SEEK_SET)
+#  define HOST_FTELL64(f)     _ftelli64(f)
+#  define HOST_LOCKFILE(f)    _lock_file(f)
+#  define HOST_UNLOCKFILE(f)  _unlock_file(f)
 #else
 #  define HOST_FSEEK64(f,off) fseeko((f), (off_t)(off), SEEK_SET)
+#  define HOST_FTELL64(f)     ftello(f)
+#  define HOST_LOCKFILE(f)    flockfile(f)
+#  define HOST_UNLOCKFILE(f)  funlockfile(f)
 #endif
 
 static uint32_t guest_be32(uint32_t a)
@@ -862,7 +869,7 @@ static void cellFsAioRead(ppu_context* ctx)
     uint32_t buf    = guest_be32(aio + 0x10);
     uint64_t size   = guest_be64(aio + 0x18);
 
-    static int32_t s_next_id = 1;
+    static std::atomic<int32_t> s_next_id{1};
     int32_t id = s_next_id++;
     if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
 
@@ -871,10 +878,20 @@ static void cellFsAioRead(ppu_context* ctx)
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
         fs_prefault(buf, size);
-        /* AIO reads are absolute -- they do not disturb the fd's own file
-         * position, and the guest interleaves them freely across threads. */
-        if (HOST_FSEEK64(g_files[fd], offset) == 0)
-            n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+        /* AIO reads are absolute: they must not move the fd's own position,
+         * and the guest issues them from several threads at once (FIOS media
+         * threads, audio streamers) on the same fd as its plain reads. A bare
+         * seek + read on the shared FILE* did both: another thread's seek
+         * could land between the two, and the next cellFsRead continued from
+         * wherever the AIO stopped. Hold the stream lock across seek, read
+         * and the seek back (stdio's own calls take the same lock). */
+        FILE* f = g_files[fd];
+        HOST_LOCKFILE(f);
+        const int64_t pos = (int64_t)HOST_FTELL64(f);
+        if (HOST_FSEEK64(f, offset) == 0)
+            n = fread(vm_base + buf, 1, (size_t)size, f);
+        if (pos >= 0) HOST_FSEEK64(f, pos);
+        HOST_UNLOCKFILE(f);
         err = CELL_OK;
     }
     if (getenv("PS3_FSLOG"))
