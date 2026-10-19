@@ -105,8 +105,8 @@ extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" uint64_t ppu_guest_call(uint32_t opd,
                                     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                     uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
-/* Weak: builds that don't link cellGcmSys.c (test harnesses) get a null and skip. */
-extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
+/* ppu_loader.cpp: ppu_gcm_pump when cellGcmSys.c is linked, else nothing. */
+extern "C" void ppu_gcm_pump_if_linked(void);
 /* The SPURS SPU kernel spawn hook, whose real definition is per-port
  * (flow_spurs_kernel.c). This used to be a weak extern DECLARATION written at
  * block scope inside ps3_hle_call, guarded by a test of its own address -- so
@@ -226,7 +226,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */
-    if (ppu_gcm_pump) ppu_gcm_pump();
+    ppu_gcm_pump_if_linked();
 
     /* YDKJ_TUNERFIX (at the top so it wins over any registered handler): the
      * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre

@@ -3032,6 +3032,10 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" __attribute__((weak)) void ppu_gcm_pump(void);   /* cellGcmSys.c */
+/* The runtime's one weak reference to it. Under COFF every weak declaration
+ * emits its own fallback definition, so a second TU declaring it (ppu_hle.cpp
+ * did) fails to link; everything else calls this. */
+extern "C" void ppu_gcm_pump_if_linked(void) { if (ppu_gcm_pump) ppu_gcm_pump(); }
 /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
