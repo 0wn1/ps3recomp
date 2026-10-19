@@ -660,6 +660,86 @@ static void test_texture_cache(void)
     engine_down();
 }
 
+/* A 128x128 A8R8G8B8 linear texture on unit 0: 64 KB, past the size that is
+ * hashed in full every frame. */
+#define BIG_TEX_OFFSET 0x00100000u
+#define BIG_TEX_DIM    128u
+#define BIG_TEX_BYTES  (BIG_TEX_DIM * BIG_TEX_DIM * 4u)
+static void bind_big_texture(void)
+{
+    m(M_TEX_UNIT + 0x00, BIG_TEX_OFFSET);
+    m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16));
+    m(M_TEX_UNIT + 0x0C, 0x80000000u);
+    m(M_TEX_UNIT + 0x10, 0xAAE4u);
+    m(M_TEX_UNIT + 0x18, (BIG_TEX_DIM << 16) | BIG_TEX_DIM);
+    m(0x1840 /* control3: pitch */, BIG_TEX_DIM * 4u);
+}
+
+/* Draw once a frame until the cache re-decodes the texture: how many
+ * presents that took, or -1 if not within `limit`. */
+static int frames_to_notice(int limit)
+{
+    const int before = stub.n_texture_create;
+    for (int f = 0; f <= limit; f++) {
+        draw_triangle();
+        if (stub.n_texture_create != before) return f;
+        rsx_draw_engine_present();
+    }
+    return -1;
+}
+
+static void test_texture_sparse_rehash(void)
+{
+    printf("-- texture re-hash\n");
+    u8* tex = vm_base + BIG_TEX_OFFSET;
+    engine_up();
+    bind_big_texture();
+    memset(tex, 0x11, BIG_TEX_BYTES);
+    draw_triangle();
+    CHECK(stub.n_texture_create == 1, "the big texture is uploaded");
+
+    /* What the per-frame sparse check sees is noticed in the next frame:
+     * a whole rewrite, a byte inside one of the sampled 64-byte blocks (one
+     * per 2 KB), a byte of the tail. */
+    rsx_draw_engine_present();
+    memset(tex, 0x22, BIG_TEX_BYTES);
+    CHECK(frames_to_notice(0) == 0, "a rewrite of the whole texture is noticed at once");
+    rsx_draw_engine_present();
+    tex[3 * 2048 + 5] ^= 0xFF;
+    CHECK(frames_to_notice(0) == 0, "a write in a sampled block is noticed at once");
+    rsx_draw_engine_present();
+    tex[BIG_TEX_BYTES - 1] ^= 0xFF;
+    CHECK(frames_to_notice(0) == 0, "a write to the last 64 bytes is noticed at once");
+
+    /* A byte between the sampled blocks waits for the full hash, which comes
+     * 8 frames after the last one: the last full hash was the frame above,
+     * so this one is seen 7 presents later, and not before. */
+    rsx_draw_engine_present();
+    tex[3 * 2048 + 100] ^= 0xFF;
+    const int late = frames_to_notice(10);
+    CHECK(late == 7, "a write between the sampled blocks is noticed by the full hash (%d frames)", late);
+
+    /* A small texture is still hashed in full every frame. */
+    rsx_draw_engine_present();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    rsx_draw_engine_present();
+    vm_base[TEX_OFFSET + 37] ^= 0xFF;
+    CHECK(frames_to_notice(0) == 0, "a small texture is hashed in full every frame");
+    engine_down();
+
+    /* PS3RECOMP_ENG_TEXHASH_FULL=1: the full hash every frame, as before. */
+    setenv("PS3RECOMP_ENG_TEXHASH_FULL", "1", 1);
+    engine_up();
+    bind_big_texture();
+    draw_triangle();
+    rsx_draw_engine_present();
+    tex[5 * 2048 + 100] ^= 0xFF;
+    CHECK(frames_to_notice(0) == 0, "PS3RECOMP_ENG_TEXHASH_FULL=1 hashes everything every frame");
+    engine_down();
+    unsetenv("PS3RECOMP_ENG_TEXHASH_FULL");
+}
+
 /* ---- 4. the pipeline key ------------------------------------------------- */
 
 static void test_pipeline_key(void)
@@ -1480,6 +1560,7 @@ int main(void)
     test_surface_aliasing();
     test_mrt_set();
     test_texture_cache();
+    test_texture_sparse_rehash();
     test_pipeline_key();
     test_restart_expansion();
     test_indexed_draws();
