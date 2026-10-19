@@ -164,6 +164,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_commerce2 libs/network/tests/test_np_commerce2.c
           /tmp/test_np_commerce2
 
+      # cellPadSetActDirect: the small motor is on/off at full strength, and
+      # a rumble lasts until the title changes it (renewed from the pad poll).
+      - name: Run the pad rumble test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_rumble
+
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
