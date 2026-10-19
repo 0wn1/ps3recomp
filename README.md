@@ -468,7 +468,9 @@ inFAMOUS 2, Twisted Metal and SoulCalibur II HD, plus Tornado Outbreak.*
   an AIO read keeps the fd's position (*@Kurtisone*, #376).
 - `cellGameBootCheck` reports the game type from PARAM.SFO (#359), and
   `CELL_MSGDIALOG_BUTTON_NONE`/`INVALID` are no longer swapped (#360)
-  (*@n0madic*).
+  (*@n0madic*). An HDD title's `/dev_hdd0/game/<id>/` now resolves to the
+  booted game tree, which kept Simpsons Arcade reading its data once #359
+  reported it as an HDD game.
 - `PS3_LANG` picks the system language (#333), and `PS3_GAMEDATA_ROOT` moves
   saves and trophies out of the working directory (#338). The small rumble
   motor runs at full strength (#372) (*@erikomis*).
