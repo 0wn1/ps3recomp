@@ -348,7 +348,6 @@ int main(int argc, char** argv)
         }
     }
 
-<<<<<<< HEAD
     /* ---- fragment program: TEX r0, TC0 on a 3D unit ------------------------
      * A volume texture (SET_TEXTURE_FORMAT dimension 3): Texture3D in HLSL,
      * texture3d in MSL, sampled with three coordinates -- inFAMOUS 2's
@@ -380,7 +379,8 @@ int main(int argc, char** argv)
         check("expand TEX FP HLSL", g_hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 15u, true)");
         if (translate("expand TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
             check("expand TEX FP MSL", g_msl, "* 2.0");
-=======
+    }
+
     /* ---- fragment program: TEX r0, TC0 with perspective_corr --------------
      * SRC2 bit 31 scales the texcoord by 1/w. Through glslang SV_POSITION.w
      * becomes FragCoord.w, which is already 1/w, so the helper must resolve
@@ -397,7 +397,6 @@ int main(int argc, char** argv)
             check("persp TEX FP MSL", g_msl, "gl_FragCoord.w");
             check_absent("persp TEX FP MSL", g_msl, "1.0 / gl_FragCoord.w");
         }
->>>>>>> pr/329
     }
 
     /* ---- fragment program writing TWO colour targets ---------------------
