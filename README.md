@@ -357,9 +357,10 @@ Ports other people are running on ps3recomp, whose fixes come back upstream:
 - **Twisted Metal** ([@Kurtisone](https://github.com/Kurtisone)): menus on
   Linux/Vulkan, the deferred renderer's lighting and post-FX included. Most of
   v0.14.0's draw-engine and Vulkan work came out of this port.
-- **Killzone 3** ([@undecuple](https://github.com/undecuple)): reaches the
-  first level with geometry, lighting, shadows and depth of field (Windows
-  build, run under Proton). 33 of its general fixes landed in v0.15.0 (#214).
+- **Killzone 3** ([@undecuple](https://github.com/undecuple)): all nine
+  chapters load and run five minutes of scripted play, and one chapter has
+  been played by hand to its end (Windows build, run under Proton). Its
+  general fixes went upstream through #214 and the PRs that followed it.
 - *LittleBigPlanet* ([@sagemono](https://github.com/sagemono)), *Yakuza: Dead
   Souls* ([@canersaka](https://github.com/canersaka)), *God of War II HD* and
   *Ben 10 Omniverse* ([@andrebrumdev](https://github.com/andrebrumdev)), and
