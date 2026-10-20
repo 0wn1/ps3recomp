@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "ps3emu/log_first.h"
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -568,7 +569,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      * decoded a guest pointer as clip dimensions. */
     if (want_w > ENG_MAX_SURFACE_DIM || want_h > ENG_MAX_SURFACE_DIM) {
         static u32 logs = 0;
-        if (logs++ < 8)
+        if (PS3_LOG_FIRST(logs, 8))
             fprintf(stderr, "[rsx engine] rejected implausible surface 0x%X %ux%u;"
                             " keeping the %s target\n", offset, want_w, want_h,
                     slot < ENG_MAX_SURFACES ? "existing" : "absent");
@@ -596,7 +597,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->color_serial = 0;
     s->guest_dirty = 0;
     if (slot == g.n_surfaces) g.n_surfaces++;
-    { static u32 logs = 0; if (logs++ < 16)
+    { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 16))
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
                 location, offset, want_w, want_h, (int)want_fmt,
                 seed ? " (seeded from guest memory)" : ""); }
@@ -1767,7 +1768,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             }
         }
     }
-    { static u32 logs = 0; if (logs++ < 32)
+    { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 32))
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
                         " %u constants, fp %016llx -> %s\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
@@ -2049,7 +2050,7 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
     static u32 logs;
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
-    if (logs++ < 8)
+    if (PS3_LOG_FIRST(logs, 8))
         fprintf(stderr, "[rsx engine] rejected colour feedback unit %u: "
                 "target %ux%u fmt%u pitch%u, texture %ux%u fmt%02X pitch%u "
                 "dim%u levels%u cube%u color%u raster%u\n", unit, s->w, s->h, (u32)s->fmt,

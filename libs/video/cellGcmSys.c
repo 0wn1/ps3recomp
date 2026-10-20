@@ -26,6 +26,7 @@ static u32 s_gcm_context_ea = 0;
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include "ps3emu/log_first.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -253,7 +254,7 @@ static void ydkj_restore_handler_opd(u32 opd, u32 code) {
     extern u8* vm_base; if (!vm_base) return;
     if (vm_read32(opd) == 0) {
         u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
-        static int _n=0; if(_n++<6) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
+        static int _n=0; if(PS3_LOG_FIRST(_n, 6)) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
     }
 }
 static void gcm_update_handler_mask(void)
@@ -678,7 +679,7 @@ void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
 void cellGcmResetFlipStatus(void)
 {
     { static int n = 0;
-      if (getenv("FLIP_DBG") && n++ < 12)
+      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 12))
           fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
     FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
@@ -697,7 +698,7 @@ u32 cellGcmGetFlipStatus(void)
      * every wait-for-flip loop exit on its first poll, so titles ran
      * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
     { static int n = 0;
-      if (getenv("FLIP_DBG") && n++ < 24)
+      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
     return s_flip_status;
@@ -1134,7 +1135,7 @@ static void nv3089_blit(void)
                  cellGcmResolveLocated(_dl, s_gcm2d.dst_offset), dst_pitch, _dl?"LOCAL":"MAIN",
                  out_x, out_y, 10); }
         static int _w = 0;
-        if (_w++ < 4) printf("[NV3089] unsupported colour format 0x%X, blit skipped\n", f);
+        if (PS3_LOG_FIRST(_w, 4)) printf("[NV3089] unsupported colour format 0x%X, blit skipped\n", f);
         return;
     }
     int src_local = (s_nv3089.src_dma != 0xFEED0001u);
@@ -1261,7 +1262,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
          * NV308A, so seeing it identifies the object bound here. */
         if (method == 0x0300) { s_nv309e.fmt = data; s_nv309e.active = 1;
                                 s_nv309e.subch = (int)subch;
-            { static int _n = 0; if (_n++ < 4)
+            { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
                 printf("[NV309E] format=0x%08X (log2 %ux%u fmt=0x%X)%c", data,
                        1u << ((data >> 16) & 0xFF), 1u << ((data >> 24) & 0xFF),
                        data & 0xFFFF, 10); }
@@ -1284,7 +1285,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
             int local = (s_gcm2d.dst_dma != 0xFEED0001u);
             u32 base = cellGcmResolveLocated(local, s_gcm2d.dst_offset);
             { static int _it = 0;
-              if (_it++ < 6)
+              if (PS3_LOG_FIRST(_it, 6))
                   printf("[GCM2D] inline write dst=0x%08X (off=0x%X dma=0x%X pt=%u,%u pitch=%u) = 0x%08X\n",
                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
@@ -1374,7 +1375,7 @@ static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consu
 static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
 {
     static int n = 0;
-    if (n++ < 8)
+    if (PS3_LOG_FIRST(n, 8))
         fprintf(stderr, "[cellGcmSys] FIFO %s to unmapped IO 0x%08X (word 0x%08X) "
                 "-- not taken, drain stops here\n", kind, target, word);
 }
@@ -1487,7 +1488,7 @@ static u32 gcm_spu_block_for_put(u32 put)
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
     static int n = 0;
-    if (n++ < 8)
+    if (PS3_LOG_FIRST(n, 8))
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
                 why, *getoff, put);
     /* If an SPU DMA'd a pushbuffer that ends just short of `put`, that is the
@@ -1498,7 +1499,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
      * by the backend as prim=0. */
     u32 land = gcm_spu_block_for_put(put);
     if (land == 0xFFFFFFFFu) land = put;
-    else { static int b = 0; if (b++ < 8)
+    else { static int b = 0; if (PS3_LOG_FIRST(b, 8))
         fprintf(stderr, "[cellGcmSys] resync landing on SPU pushbuffer "
                 "0x%08X (put 0x%08X) instead of skipping to put\n", land, put); }
 
@@ -1520,7 +1521,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
             gcm_ref_push_at(vm_read32(dea), io);
             rescued++;
         }
-        if (rescued) { static int m = 0; if (m++ < 8)
+        if (rescued) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
             fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
                     " 0x%08X..0x%08X\n", rescued, from, land); }
     }
@@ -1534,7 +1535,7 @@ static void gcm_fifo_dump_around(u32 getoff)
      * are the one thing a run that wedged once in three can still tell us,
      * and GCM_RECDBG is far too loud to leave on for a 15-minute run. */
     static int d = 0;
-    if (d++ >= 3) return;
+    if (!PS3_LOG_FIRST(d, 3)) return;
     for (u32 t = 0; t < GCM_TRACE_N; t++) {
         u32 k = (s_tr_i + t) % GCM_TRACE_N;
         if (!s_tr_w[k]) continue;
@@ -1560,7 +1561,7 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
         s_ref_qhead++;
         static int _o = 0;
-        if (_o++ < 4) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
+        if (PS3_LOG_FIRST(_o, 4)) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
     s_ref_qtail = t + 1;
@@ -1825,7 +1826,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             static u32 last_bad; static int n;
             if (s_fifo_getoff != last_bad || n < 4) {
                 last_bad = s_fifo_getoff;
-                if (n++ < 16)
+                if (PS3_LOG_FIRST(n, 16))
                     fprintf(stderr, "[cellGcmSys] FIFO get=0x%08X has no IO "
                             "mapping -- resyncing to put=0x%08X\n",
                             s_fifo_getoff, put);
@@ -2009,7 +2010,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
-                    { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
+                    { static int sn = 0; if (getenv("GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
                     if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
@@ -2041,7 +2042,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
                     sem_blocked = 1; break;
                 }
-                { static int tn; if (tn++ < 12)
+                { static int tn; if (PS3_LOG_FIRST(tn, 12))
                     fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
                             s_sema_offset, v, blk_ms, vm_read32(la)); }
                 b_t0 = 0;
@@ -2064,7 +2065,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * blocks on. */
                 { static int sd = -1; static unsigned long s7 = 0;
                   if (sd < 0) sd = getenv("GCM_SUBCH7") ? 1 : 0;
-                  if (sd && subch == 7 && (s7++ < 16))
+                  if (sd && subch == 7 && (PS3_LOG_FIRST(s7, 16)))
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
                               m, vm_read32(dea)); }
                 if (subch == 7 && m == 0x0B00u) {
@@ -2123,7 +2124,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   { static u32 vw = 1;
                     if (vw == 1) { const char* e = getenv("GCM_VAL_WATCH"); vw = e ? (u32)strtoul(e, 0, 16) : 0; }
                     if (vw && vm_read32(dea) == vw) {
-                        static int vn; if (vn++ < 64)
+                        static int vn; if (PS3_LOG_FIRST(vn, 64))
                             printf("[valwatch] subch=%u method=0x%04X = 0x%08X get=0x%X%c", subch, m, vw, s_fifo_getoff, 10);
                     } }
                   /* ...and surface offsets (colour 0x210/0x218/0x288/0x28C, zeta 0x214) and texture 1 offset */
@@ -2193,7 +2194,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
                         const u64 ts = gcm_report_timestamp();
                         const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
-                        { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+                        { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
                         if (main_mem) {
                             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
                             const u32 rea = gcm_io2ea(off);
@@ -2202,7 +2203,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                 vm_write32(rea + 4u, (u32)ts);
                                 vm_write32(rea + 8u, val);
                                 vm_write32(rea + 12u, 0u);
-                            } else { static int un = 0; if (un++ < 4) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
+                            } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
                         } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
                             s_report_data[idx].timestamp = ts;
                             s_report_data[idx].value = val;
@@ -2215,7 +2216,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             s_fifo_getoff += 4 + count * 4;
             continue;
         }
-        { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
+        { static int _uw = 0; if (PS3_LOG_FIRST(_uw, 16) && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
@@ -2251,7 +2252,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
       if (passes && budget <= 0 && s_fifo_getoff != put) {
           if (++burned >= passes) {
               static int n = 0;
-              if (n++ < 8)
+              if (PS3_LOG_FIRST(n, 8))
                   fprintf(stderr, "[cellGcmSys] FIFO walker circling (get=0x%08X, "
                           "put=0x%08X, full budget burned x%d) -- following the "
                           "write head\n", s_fifo_getoff, put, burned);
@@ -2365,7 +2366,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff = io_begin;                          /* get */
                 put = io_begin;
                 static int n = 0;
-                if (n++ < 8)
+                if (PS3_LOG_FIRST(n, 8))
                     fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
                             "(ctx=0x%08X begin=0x%08X end=0x%08X) -- its callback "
                             "does not%c", ctx, begin, end, 10);
@@ -2445,7 +2446,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
     if (spins >= 2000) {
         static int warned = 0;
-        if (warned++ < 4)
+        if (PS3_LOG_FIRST(warned, 4))
             printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X)\n",
                    g_gcm_fifo_drained_ea, begin);
     }
@@ -2569,7 +2570,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
           }
       } }
 
-    { static int _n=0; if (getenv("FLIP_DBG") && _n++ < 20)
+    { static int _n=0; if (getenv("FLIP_DBG") && PS3_LOG_FIRST(_n, 20))
         fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
@@ -2910,7 +2911,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
     vm_write32(off_ea, 0);
     { static int _d = -1; if (_d < 0) _d = getenv("A2O_FAILDBG") ? 1 : 0;
-      if (_d) { static int _n = 0; if (_n++ < 12)
+      if (_d) { static int _n = 0; if (PS3_LOG_FIRST(_n, 12))
           fprintf(stderr, "[A2O] FAILED ea=0x%08X (not in local or IO space)%c",
                   address, 10); } }
     return CELL_GCM_ERROR_FAILURE;
@@ -3200,7 +3201,7 @@ CellGcmReportData* cellGcmGetReportDataAddress(u32 index)
  * walker fills it). Unregistered, every call returned a faked 0. */
 u32 cellGcmGetReport(u32 type, u32 index)
 {
-    { static int n = 0;
+    { static unsigned n = 0;   /* unsigned: the periodic line keeps counting, and wrapping is defined */
       if (n++ < 8 || (n % 2000) == 0) printf("[cellGcmSys] GetReport(type=%u, index=%u) -> %u%c", type, index,
                           index < CELL_GCM_MAX_REPORT_COUNT ? s_report_data[index].value : 0u, 10); }
     if (index >= CELL_GCM_MAX_REPORT_COUNT) return 0;
@@ -3342,7 +3343,7 @@ u32 cellGcmGetTiledPitchSize(u32 size)
             if (s_valid_pitches[i] >= size) { r = s_valid_pitches[i]; break; }
         }
     }
-    { static int _n=0; if (_n++<4) fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
+    { static int _n=0; if (PS3_LOG_FIRST(_n, 4)) fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
     return r;
 }
 

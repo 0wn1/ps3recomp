@@ -400,6 +400,10 @@ if(PS3RECOMP_BUILD_TESTS)
     if(UNIX)
         add_subdirectory(tests/gcm_reports)
     endif()
+    # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
+    add_executable(test_log_first tests/test_log_first.c)
+    target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_test(NAME log_first COMMAND test_log_first)
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

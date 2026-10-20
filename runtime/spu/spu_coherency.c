@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include "ps3emu/log_first.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -155,7 +156,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t c = (uintptr_t)entry->ctx;
         if (c >= lo && c < hi) {
             static int _n = 0;
-            if (_n++ < 16)
+            if (PS3_LOG_FIRST(_n, 16))
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
                         (void*)c, entry->ctx->image_id);
             *link = entry->next;

@@ -12,6 +12,7 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdlib.h>
+#include "ps3emu/log_first.h"
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -112,7 +113,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
     { extern unsigned long long ps3_qpc_us(void);
-      static int n=0; if (n++ < 60)
+      static int n=0; if (PS3_LOG_FIRST(n, 60))
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
     /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
@@ -179,7 +180,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
                       s_wo = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
         static int _n = 0;
-        if (_n++ < 8) {
+        if (PS3_LOG_FIRST(_n, 8)) {
           /* Dump the words at EVERY plausible object register, not just r29.
            * Which register holds the object is per-title -- r29 was right for
            * the title this was written for and is a spin COUNTER in Guitar
