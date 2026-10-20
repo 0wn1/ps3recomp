@@ -2903,6 +2903,36 @@ s32 cellSpursQueueClear(u64 queue_ea)
     return CELL_OK;
 }
 
+/* SDK ABI: cellSpursQueueSize(CellSpursQueue*, unsigned int* size): the number of entries in the queue.
+ *
+ * Without a handler the import was unresolved: it returned CELL_OK without writing *size, so a title that waits for a
+ * queue to drain (QueueSize, then a short sleep while the size is above zero) read stale stack and waited out its whole
+ * retry budget every frame. The occupancy is the ring's: W0 (+0x00) the pop index, W1 (+0x04) the push index, both
+ * normalised and running modulo 2*W3 (+0x0C), the same model cellSpursQueuePushBody uses. */
+s32 cellSpursQueueSize(u64 queue_ea, u64 size_ea)
+{
+    if (!queue_ea || !size_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (queue_ea & 0x7F)       return CELL_SPURS_TASK_ERROR_ALIGN;
+
+    uint32_t q   = (uint32_t)queue_ea;
+    int32_t  w0  = (int32_t)vm_read32(q + 0x00);
+    int32_t  w1  = (int32_t)vm_read32(q + 0x04);
+    int32_t  mod = (int32_t)vm_read32(q + 0x0C);
+    if (mod <= 0) mod = (int32_t)vm_read32(q + 0x14);       /* depth */
+    if (mod <= 0) return CELL_SPURS_TASK_ERROR_INVAL;
+
+    int32_t  pop  = (w0 < 0) ? ~w0 : w0;
+    int32_t  push = (w1 < 0) ? ~w1 : w1;
+    uint32_t n    = (uint32_t)((pop > push) ? push - pop + 2 * mod : push - pop);
+    vm_write32((uint32_t)size_ea, n);
+
+    static int _n = 0;
+    if (_n < 8 || (n && _n < 64))
+        printf("[cellSpurs] QueueSize(q=0x%08X) -> %u (pop=%d push=%d mod=%d)\n", q, n, pop, push, mod);
+    _n++;
+    return CELL_OK;
+}
+
 /* SDK ABI: cellSpursQueuePushBody(CellSpursQueue*, const void* buffer, bool isBlocking) */
 s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
 {
