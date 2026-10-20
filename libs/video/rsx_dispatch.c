@@ -535,7 +535,10 @@ void rsx_dsp_get_texture(const rsx_dispatch* rsx, u32 unit, rsx_dsp_texture* out
         return;
     const u32 base = M_TEX_OFFSET + unit * 0x20;
     const u32 fmt  = rsx_dsp_reg(rsx, base + 0x04);
-    out->offset    = rsx_dsp_reg(rsx, base);
+    /* The offset is 31 bits; bit 31 is not part of it (RPCS3 masks it with 0x7FFFFFFF for fragment and vertex
+     * textures). Taken whole, a main-memory texture bound at 0x82A22900 missed the IO lookup. The location comes from
+     * the format word alone. */
+    out->offset    = rsx_dsp_reg(rsx, base) & 0x7FFFFFFFu;
     out->location  = (fmt & 3) == 2 ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
     out->cubemap   = (fmt >> 2) & 1;
     out->dimension = (fmt >> 4) & 0xF;
@@ -563,7 +566,7 @@ void rsx_dsp_get_vertex_texture(const rsx_dispatch* rsx, u32 unit,
         return;
     const u32 base = M_VERTEX_TEXTURE + unit * 0x20;
     const u32 fmt  = rsx_dsp_reg(rsx, base + 0x04);
-    out->offset    = rsx_dsp_reg(rsx, base + 0x00);
+    out->offset    = rsx_dsp_reg(rsx, base + 0x00) & 0x7FFFFFFFu;   /* 31-bit offset, as above */
     out->location  = (fmt & 3) == 2 ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
     out->cubemap   = (fmt >> 2) & 1;
     out->dimension = (fmt >> 4) & 0xF;
