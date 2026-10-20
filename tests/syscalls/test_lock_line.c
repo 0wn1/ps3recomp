@@ -37,8 +37,8 @@ static void expect(const char* what, uint32_t addr, uint64_t flags, int64_t want
 int main(void)
 {
     const int64_t OK     = 0;
-    const int64_t EPERM  = (int64_t)(int32_t)CELL_EPERM;
-    const int64_t EINVAL = (int64_t)(int32_t)CELL_EINVAL;
+    const int64_t E_PERM  = (int64_t)(int32_t)CELL_EPERM;   /* not EPERM: <errno.h> makes that a macro on MinGW */
+    const int64_t E_INVAL = (int64_t)(int32_t)CELL_EINVAL;
 
     /* Reservation-capable segments (0x0/0x1/0x2/0xC/0xE). */
     expect("main low",      0x00010000u, 0x2, OK);
@@ -55,12 +55,12 @@ int main(void)
     expect("segment 1 rawspu", 0x11000000u, 0x1, OK);
 
     /* Segment 0xF: private SPU MMIO answers EPERM only for RawSPU. */
-    expect("priv spu rawspu", 0xF0000000u, 0x1, EPERM);
+    expect("priv spu rawspu", 0xF0000000u, 0x1, E_PERM);
     expect("priv spu thr",    0xF0000000u, 0x2, OK);
 
     /* Segment 0xD: the PPU stack area refuses both access kinds. */
-    expect("ppu stack thr",   0xD0000000u, 0x2, EPERM);
-    expect("ppu stack rawspu", 0xD0000000u, 0x1, EPERM);
+    expect("ppu stack thr",   0xD0000000u, 0x2, E_PERM);
+    expect("ppu stack rawspu", 0xD0000000u, 0x1, E_PERM);
 
     /* sys_vm: a covered address answers EPERM, a hole in the mapped region
      * EINVAL, and the empty region EINVAL (nothing mapped). */
@@ -68,23 +68,23 @@ int main(void)
     g_sys_vm_maps[0].addr   = 0x60000000u;
     g_sys_vm_maps[0].vsize  = 0x02000000u;   /* 32 MB */
     g_sys_vm_maps[0].psize  = 0x00010000u;
-    expect("sys_vm start",  0x60000000u, 0x2, EPERM);
-    expect("sys_vm end",    0x61FFFFFFu, 0x2, EPERM);
-    expect("sys_vm hole",   0x62000000u, 0x2, EINVAL);
+    expect("sys_vm start",  0x60000000u, 0x2, E_PERM);
+    expect("sys_vm end",    0x61FFFFFFu, 0x2, E_PERM);
+    expect("sys_vm hole",   0x62000000u, 0x2, E_INVAL);
     g_sys_vm_maps[0].active = 0;
-    expect("sys_vm empty",  0x60000000u, 0x2, EINVAL);
+    expect("sys_vm empty",  0x60000000u, 0x2, E_INVAL);
 
     /* Outside every known window: EINVAL. */
-    expect("unmapped 0x3", 0x30000000u, 0x2, EINVAL);
-    expect("unmapped 0x7", 0x70000000u, 0x2, EINVAL);
-    expect("unmapped 0xB", 0xB0000000u, 0x2, EINVAL);
+    expect("unmapped 0x3", 0x30000000u, 0x2, E_INVAL);
+    expect("unmapped 0x7", 0x70000000u, 0x2, E_INVAL);
+    expect("unmapped 0xB", 0xB0000000u, 0x2, E_INVAL);
 
     /* Flags: zero, or anything beyond the two SPU bits, is EINVAL; both
      * bits together is a valid mask. */
-    expect("flags zero",  0x11000000u, 0x0, EINVAL);
+    expect("flags zero",  0x11000000u, 0x0, E_INVAL);
     expect("flags both",  0x11000000u, 0x3, OK);
-    expect("flags bit 2", 0x11000000u, 0x4, EINVAL);
-    expect("flags high",  0x11000000u, 0x80010009ull, EINVAL);
+    expect("flags bit 2", 0x11000000u, 0x4, E_INVAL);
+    expect("flags high",  0x11000000u, 0x80010009ull, E_INVAL);
 
     if (g_fail) {
         printf("%d check(s) failed\n", g_fail);
