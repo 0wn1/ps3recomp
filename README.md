@@ -217,7 +217,7 @@ tests (`runtime/spu/tests/`: sum, shufb, DMA, brsl-return).
 
 ## Module Status
 
-HLE implementations of the PS3 system libraries, written for this project. RPCS3 is a behavioural reference, not a code source. **About 93 modules complete and 5 partial** (media decode, SPURS), in roughly 260 files and 100,000 lines under `libs/`.
+HLE implementations of the PS3 system libraries, written for this project. RPCS3 is a behavioural reference, not a code source. Most modules are complete. The ones still marked Partial are the media decoders (cellVdec, cellAdec, cellDmux, cellAtrac, cellAdecAtrac3p) and cellSpurs. [docs/MODULE_STATUS.md](docs/MODULE_STATUS.md) has one row per module and is the source for the counts.
 
 | Category | Modules | Status |
 |----------|---------|--------|
