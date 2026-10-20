@@ -2017,7 +2017,21 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         s_ft_sema_t0 = 0;
                     }
                     if (m == 0x64u)      s_sema_offset = v;
-                    else if (m == 0x6Cu) vm_write32(la, v);
+                    else if (m == 0x6Cu) {
+                        /* The RSX has fetched past a RELEASE before its
+                         * semaphore write lands, so a guest that sees the
+                         * label must also see `get` past the command. `get`
+                         * was published only at a JUMP and at the end of the
+                         * pass: Ratchet & Clank: Tools of Destruction waits
+                         * for a label, then reads `get` once and spins until
+                         * its own `put` equals it, which a snapshot from
+                         * before the RELEASE never does. GCM_GET_EQ_PUT keeps
+                         * publishing put at the end of the pass instead. */
+                        if (!gcm_get_eq_put())
+                            vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
+                        atomic_thread_fence(memory_order_release);
+                        vm_write32(la, v);
+                    }
                     else if (m == 0x68u && vm_read32(la) != v) {
             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
              * the hardware does. Off by default: a title whose label nothing
