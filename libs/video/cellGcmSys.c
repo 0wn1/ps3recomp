@@ -3024,9 +3024,14 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     }
 
     u32 auto_map_limit = s_config.localAddress ? s_config.localAddress : 0x40000000u;
-    if (address < auto_map_limit) {
+    if (address < auto_map_limit && s_gcm_initialized) {
         u32 ea_page = address & ~0xFFFFFu;
         u32 io      = gcm_io_alloc(0x100000u);
+        if (io == 0xFFFFFFFFu) {
+            printf("[cellGcmSys] AddressToOffset: no free IO page to auto-map ea 0x%08X\n", address);
+            vm_write32(off_ea, 0);
+            return CELL_GCM_ERROR_FAILURE;
+        }
         populate_offset_table(ea_page, io, 0x100000u);
         /* Record it in the mapping list too, not just the offset table.
          *
@@ -3061,33 +3066,32 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     return CELL_GCM_ERROR_FAILURE;
 }
 
-/* IO-offset space bump allocator for main-memory mappings. Starts PAST the
- * Init command-buffer region: handing out io 0 (the old s_local_mem_allocated
- * bump, which begins at 0) remapped the FIFO's own io page -- demosaic's
- * cellGcmMapMainMemory(sys heap) got offset 0, io2ea(0) then resolved into its
- * heap (all zeros) and the RSX walker consumed every frame's commands as
- * no-ops (no draws, label fence never written, guest waited forever). */
-static u32 s_io_alloc_next = 0;
+/* IO-offset space allocator for main-memory mappings. It never hands out a
+ * page that is mapped, the Init command-buffer region included: handing out io
+ * 0 (the old s_local_mem_allocated bump, which begins at 0) remapped the FIFO's
+ * own io page -- demosaic's cellGcmMapMainMemory(sys heap) got offset 0,
+ * io2ea(0) then resolved into its heap (all zeros) and the RSX walker consumed
+ * every frame's commands as no-ops (no draws, label fence never written, guest
+ * waited forever). */
+/* First fit over the IO -> EA table: the lowest run of 1MB IO pages that no
+ * mapping holds. A bump pointer kept across cellGcmInit (Init wipes the tables
+ * and claims io 0..ioSize itself) handed a later map IO pages inside the Init
+ * window: a title that maps 2MB before Init left the pointer at 0x300000, and
+ * its next map took io 0x300000 onwards, on top of the window. Command buffers
+ * in that part of its IO heap then resolved into the other mapping, the FIFO
+ * walker read zeros and resynced, and a frame's commands were lost. Searching
+ * the table cannot hand out a page that is in use.
+ * Returns 0xFFFFFFFF when no run is free. */
+#define GCM_IO_PAGES 256u   /* the RSX's 256MB IO window (cellGcmGetMaxIoMapSize) */
 static u32 gcm_io_alloc(u32 size)
 {
-    if (s_io_alloc_next == 0)
-        s_io_alloc_next = (s_config.ioSize + 0xFFFFFu) & ~0xFFFFFu;
-    if (s_io_alloc_next < 0x100000u) s_io_alloc_next = 0x100000u;
-    /* Skip pages a title mapped itself at a fixed offset. Twisted Metal maps
-     * its command rings at IO 0x0F100000 with cellGcmMapEaIoAddress; the
-     * AddressToOffset auto-maps bumped into that range mid-match, remapped the
-     * ring's pages, and the FIFO walker read every frame from the wrong memory
-     * -- the match presented black frames with no draws. */
-    const u32 pages = (size + 0xFFFFFu) >> 20;
-    for (;;) {
-        u32 p = 0, page = s_io_alloc_next >> 20;
-        while (p < pages && page + p < 65536 && s_ea_address_table[page + p] == 0xFFFF) p++;
-        if (p == pages || page + p >= 65536) break;
-        s_io_alloc_next = (page + p + 1) << 20;   /* past the taken page */
+    const u32 need = (size + 0xFFFFFu) >> 20;
+    u32 run = 0;
+    for (u32 p = 1; p < GCM_IO_PAGES && need; p++) {   /* io 0 is the FIFO's own page */
+        run = (s_ea_address_table[p] == 0xFFFF) ? run + 1 : 0;
+        if (run == need) return (p + 1 - need) << 20;
     }
-    u32 io = s_io_alloc_next;
-    s_io_alloc_next += pages << 20;
-    return io;
+    return 0xFFFFFFFFu;
 }
 
 /* NID: 0x2A6FBA9C */
@@ -3116,6 +3120,15 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
         return CELL_GCM_ERROR_INVALID_ALIGNMENT;
     }
 
+    /* Before cellGcmInit there is no IO page table to map into (the reference
+     * emulator returns NO_IO_PAGE_TABLE here too). Accepting the map only for
+     * Init to wipe it left the title holding an offset that Init then gave to
+     * its own window. */
+    if (!s_gcm_initialized) {
+        printf("[cellGcmSys] MapMainMemory REFUSED: cellGcmInit has not run (no IO page table)\n");
+        return CELL_GCM_ERROR_NO_IO_PAGE_TABLE;
+    }
+
     /* A free slot first, then the IO region: allocating the region before
      * the slot check leaked IO space on every refused call. */
     IoMapping* mapping = find_free_mapping();
@@ -3124,8 +3137,12 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
         return CELL_GCM_ERROR_FAILURE;
     }
 
-    /* Allocate a fresh IO region past the Init command-buffer window. */
     u32 io_offset = gcm_io_alloc(size);
+    if (io_offset == 0xFFFFFFFFu) {
+        printf("[cellGcmSys] MapMainMemory REFUSED: no free run of 0x%X bytes of IO space\n", size);
+        return CELL_GCM_ERROR_NO_IO_PAGE_TABLE;
+    }
+    printf("[cellGcmSys] MapMainMemory -> io 0x%08X\n", io_offset);
 
     mapping->ea     = ea;
     mapping->io     = io_offset;
