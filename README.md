@@ -238,7 +238,7 @@ HLE implementations of the PS3 system libraries, written for this project. RPCS3
 | **System** | cellRtc, cellMsgDialog, cellOskDialog, cellUserInfo, cellGameExec | ✅ Complete |
 | **Localization** | cellL10n (UTF-8/16/32/UCS-2, ISO-8859-1, generic converter) | ✅ Complete |
 | **Resolution** | cellResc (display modes, scaling, interlace, aspect ratio) | ✅ Complete |
-| **Fibers** | cellFiber (PPU fibers via Windows Fibers/ucontext) | ✅ Complete |
+| **Fibers** | cellFiber (PPU fiber scheduler via Windows Fibers/ucontext) | ✅ Complete |
 | **AV Config** | cellAvconfExt (audio output info, gamma, sound availability) | ✅ Complete |
 | **Input Util** | cellKey2char (HID scancode → Unicode, US-101 layout) | ✅ Complete |
 | **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps, FIFO walker + ring recycle), RSX command processor (NV47xx parsing, state tracking, backend callbacks), **live D3D12 backend** (executes the title's real NV4097 vertex/fragment programs — indexed draws, per-draw VP constants + textures, render-to-texture, MRT, FP predication), null backend (Win32 window) | ✅ Complete |
