@@ -2908,7 +2908,8 @@ s32 cellSpursQueueClear(u64 queue_ea)
  * Without a handler the import was unresolved: it returned CELL_OK without writing *size, so a title that waits for a
  * queue to drain (QueueSize, then a short sleep while the size is above zero) read stale stack and waited out its whole
  * retry budget every frame. The occupancy is the ring's: W0 (+0x00) the pop index, W1 (+0x04) the push index, both
- * normalised and running modulo 2*W3 (+0x0C), the same model cellSpursQueuePushBody uses. */
+ * normalised (~v marks an operation in progress) and running modulo 2*W3 (+0x0C, the depth), the same model
+ * cellSpursQueuePushBody uses. A queue with no depth was never initialised. */
 s32 cellSpursQueueSize(u64 queue_ea, u64 size_ea)
 {
     if (!queue_ea || !size_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
@@ -2918,7 +2919,6 @@ s32 cellSpursQueueSize(u64 queue_ea, u64 size_ea)
     int32_t  w0  = (int32_t)vm_read32(q + 0x00);
     int32_t  w1  = (int32_t)vm_read32(q + 0x04);
     int32_t  mod = (int32_t)vm_read32(q + 0x0C);
-    if (mod <= 0) mod = (int32_t)vm_read32(q + 0x14);       /* depth */
     if (mod <= 0) return CELL_SPURS_TASK_ERROR_INVAL;
 
     int32_t  pop  = (w0 < 0) ? ~w0 : w0;

@@ -54,19 +54,19 @@ int main(void)
     CHECK(10, 3, 8, 8, 9);         /* push wrapped past pop: 3 - 10 + 16 */
     CHECK(~5, ~9, 8, 8, 4);        /* negative (normalised) indices: ~w for w < 0 */
     CHECK(5, ~9, 8, 8, 4);         /* mixed */
-    CHECK(0, 0, 0, 8, 0);          /* W3 == 0: falls back to depth (+0x14) */
-    CHECK(10, 3, 0, 8, 9);         /* ... and wraps modulo 2*depth */
 
     /* errors, and *size untouched on them */
     vm_write32(OUT, 0x12345678u);
     assert(cellSpursQueueSize(0, OUT) == (s32)CELL_SPURS_TASK_ERROR_NULL_POINTER);
     assert(cellSpursQueueSize(Q, 0) == (s32)CELL_SPURS_TASK_ERROR_NULL_POINTER);
     assert(cellSpursQueueSize(Q + 0x10, OUT) == (s32)CELL_SPURS_TASK_ERROR_ALIGN);
-    ring(0, 0, 0, 0);              /* never initialised: neither W3 nor a depth */
+    ring(0, 0, 0, 0);              /* never initialised: no depth at +0x0C */
+    assert(cellSpursQueueSize(Q, OUT) == (s32)CELL_SPURS_TASK_ERROR_INVAL);
+    ring(0, 3, 0, 8);              /* a word at +0x14 is not a depth (it is part of the buffer EA) */
     assert(cellSpursQueueSize(Q, OUT) == (s32)CELL_SPURS_TASK_ERROR_INVAL);
     assert(vm_read32(OUT) == 0x12345678u);
 
     free(vm_base);
-    puts("PASS: cellSpursQueueSize occupancy, wrap, normalised indices, depth fallback, NULL/alignment/uninitialised errors");
+    puts("PASS: cellSpursQueueSize occupancy, wrap, normalised indices, NULL/alignment/uninitialised errors");
     return 0;
 }
