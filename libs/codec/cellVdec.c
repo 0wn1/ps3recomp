@@ -183,6 +183,22 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
     return (s32)CELL_VDEC_ERROR_BUSY;
 }
 
+/* The Ex variants take CellVdecTypeEx { s32 codecType; codecSpecificInfo* } and
+ * CellVdecResourceEx (SPURS instead of SPU-thread resources). Only the codec type
+ * is read, and it is the first word of both type structs; the attr layout is the
+ * same. God of War: Ascension's menu video player calls only these; with them
+ * unregistered QueryAttrEx failed and the menu background video never started. */
+s32 cellVdecQueryAttrEx(const CellVdecType* type, void* attr)
+{
+    return cellVdecQueryAttr(type, attr);
+}
+
+s32 cellVdecOpenEx(const CellVdecType* type, const CellVdecResource* res,
+                   const CellVdecCb* cb, CellVdecHandle* handle)
+{
+    return cellVdecOpen(type, res, cb, handle);
+}
+
 s32 cellVdecClose(CellVdecHandle handle)
 {
     printf("[cellVdec] Close(handle=%u)\n", handle);
