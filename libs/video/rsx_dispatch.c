@@ -45,6 +45,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "ps3emu/log_first.h"
 
 #define M_DMA_COLOR1            0x018C
 #define M_DMA_COLOR0            0x0194
@@ -315,7 +316,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * constants. Drop it, and say what it was. */
     if (idx >= RSX_DSP_NUM_REGS) {
         static int n = 0;
-        if (n++ < 8)
+        if (PS3_LOG_FIRST(n, 8))
             fprintf(stderr, "[rsx-dispatch] method 0x%05X (arg 0x%08X) out of range -- dropped\n",
                     method, arg);
         return;

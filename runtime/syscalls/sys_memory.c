@@ -5,6 +5,7 @@
 #include "sys_memory.h"
 #include <stdio.h>
 #include <string.h>
+#include "ps3emu/log_first.h"
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -437,7 +438,7 @@ int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
     if (addr_out != 0)
         write_be32(addr_out, addr);
 
-    { static int n = 0; if (n++ < 4)
+    { static int n = 0; if (PS3_LOG_FIRST(n, 4))
         fprintf(stderr, "[sys_memory] mmapper_allocate_memory size=0x%X -> 0x%08X\n",
                 size, addr); }
 

@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#include "ps3emu/log_first.h"
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -391,7 +392,7 @@ static int audio_backend_room(void)
     if (FAILED(hr)) {
         /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED on a default-device
          * change, sleep, ...): pace on the clock rather than spin. */
-        static int _n = 0; if (_n++ < 4)
+        static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
             fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
         return -1;
     }
@@ -1092,7 +1093,7 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     vm_write32(cfg + 24, port->buf_size);                                   /* portSize */
     vm_write32(cfg + 28, (u32)port->port_addr);                             /* portAddr */
 
-    { static int _n = 0; if (_n++ < 24)
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
         fprintf(stderr, "[cellAudio] GetPortConfig(port=%u) status=%s bufEA=0x%08X ridxEA=0x%08X\n",
                 portNum, port->running ? "RUN" : "READY",
                 (u32)port->port_addr, (u32)port->read_idx_addr); }

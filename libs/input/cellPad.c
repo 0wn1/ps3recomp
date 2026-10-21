@@ -18,6 +18,7 @@
 #include <math.h>
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+#include "ps3emu/log_first.h"
 
 /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
  * wall-clock seconds. A loaded machine runs a title at a third of its usual
@@ -1049,7 +1050,7 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
           vm_write32((unsigned long long)ea + _o, *(u32*)((char*)info + _o)); }
 
     { static int _n = 0;
-      if (_n++ < 2)
+      if (PS3_LOG_FIRST(_n, 2))
           printf("[cellPad] PeriphGetInfo(max=%u now=%u) -> STANDARD class\n",
                  info->max_connect, connected); }
     return CELL_OK;
