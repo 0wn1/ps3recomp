@@ -19,6 +19,8 @@
 uint32_t ppu_hle_inject_base;
 void vm_write32(uint32_t addr, uint32_t value) { (void)addr; (void)value; }
 void ps3_ms(const char* key) { (void)key; }
+uint32_t gcm_io_offset_to_ea(uint32_t io) { (void)io; return 0; }
+unsigned long long ps3_ms_now(void) { return 0; }
 
 static int g_failures;
 
