@@ -23,5 +23,6 @@ with tempfile.TemporaryDirectory(prefix="license-area-") as temporary:
         str(root / "libs/system/tests/test_license_area.c"),
         str(root / "libs/system/cellSysutil.c"),
         "-pthread", gc_flag, "-o", str(binary),
+        *(["-framework", "CoreFoundation"] if sys.platform == "darwin" else []),   # cellSysutil.c reads the host language
     ], check=True, timeout=60, env=env, cwd=temporary)
     subprocess.run([str(binary)], check=True, timeout=10, env=env, cwd=temporary)

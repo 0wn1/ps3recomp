@@ -1,5 +1,5 @@
 /* macOS: clang -std=gnu17 -I include libs/system/tests/test_license_area.c libs/system/cellSysutil.c
- * -Wl,-dead_strip -pthread -o /tmp/test_license_area && /tmp/test_license_area */
+ * -Wl,-dead_strip -pthread -framework CoreFoundation -o /tmp/test_license_area && /tmp/test_license_area */
 #include "../cellSysutil.h"
 #include <stdio.h>
 #include <stdlib.h>
