@@ -688,6 +688,23 @@ static void test_remap_b8_lanes(void)
     CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], 0);
 }
 
+/* X16 decodes to a one-channel R16 resource and is presented like B8: the
+ * value in R, G and B, A opaque. GoW:A's font atlas is X16 sampled through
+ * 0xAAEE (G and B sources only); with the ARGB lanes every output read the
+ * resource's empty G/B components and all text was transparent. */
+static void test_remap_x16_lanes(void)
+{
+    u8 m[4];
+    rsx_texture_component_remap(0xAAEEu, FMT_X16 | FMT_LN, m);
+    CHECK_EQ(m[A_], 0); CHECK_EQ(m[R_], 0);
+    CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0);
+
+    u8 n[4];
+    rsx_texture_component_remap(0xAAE4u, FMT_X16, n);
+    CHECK_EQ(n[A_], RSX_REMAP_ONE); CHECK_EQ(n[R_], 0);
+    CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], 0);
+}
+
 /* Compressed formats decode to RGBA, so they use the same lanes as A8R8G8B8 --
  * NOT a bent table cancelling a reversed crossbar, which is how the old bug
  * hid on DXT while breaking everything else. */
@@ -770,6 +787,7 @@ int main(void)
     test_remap_identity();
     test_remap_identity_packs_to_d3d_default();
     test_remap_b8_lanes();
+    test_remap_x16_lanes();
     test_remap_y16x16_lanes();
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();
