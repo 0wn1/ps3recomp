@@ -466,10 +466,10 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             }
             s_tot++;
             if ((s_tot & 0xFFFF) == 0) {
-                extern unsigned long long ps3_qpc_us(void);
-                unsigned long long now = ps3_qpc_us();
+                extern unsigned long long ps3_ms_now(void);   /* fixtures stub this one */
+                unsigned long long now = ps3_ms_now();
                 if (!s_t0) s_t0 = now;
-                else if (now - s_t0 >= (unsigned long long)s_is * 1000000ull) {
+                else if (now - s_t0 >= (unsigned long long)s_is * 1000ull) {
                     fprintf(stderr, "[spu-interp] %.1fM steps/s over %lds; top pages:\n",
                             s_tot / 1e6 / (double)s_is, s_is);
                     for (int r = 0; r < 6; r++) {

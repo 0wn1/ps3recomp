@@ -17,6 +17,7 @@
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
 #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
+#include <chrono>
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
@@ -187,7 +188,6 @@ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
  * what every thread is doing now (polling a pad, spinning on a lwcond, feeding
  * a decoder that never takes the data). Counts are unlocked: a lost increment
  * can't change which import is on top. */
-extern "C" unsigned long long ps3_qpc_us(void);
 static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx, long window_s)
 {
     enum { HT_MAX = 256 };
@@ -203,7 +203,8 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
         ht_tid[i] = (unsigned)ctx->thread_id;
         ht_lr[i] = (unsigned)ctx->lr;
     }
-    unsigned long long now = ps3_qpc_us();
+    unsigned long long now = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();   /* not ps3_qpc_us: fixtures link this file without cellGcmSys */
     if (!ht_t0) { ht_t0 = now; return; }
     if (now - ht_t0 < (unsigned long long)window_s * 1000000ull) return;
     ht_t0 = now;
