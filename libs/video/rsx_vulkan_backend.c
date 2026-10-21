@@ -2720,7 +2720,11 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
  * samplers s0..s3 would alias the pixel samplers' binding), colour targets
  * other than RGBA8 and RGBA16F, depth-only passes, and stencil (the depth format
  * has no stencil aspect yet, so the test is inert). */
-#define VK_ENG_MAX_PIPE   512
+/* As many as the engine keeps (ENG_MAX_PIPELINES in rsx_draw_engine.c). God of
+ * War: Ascension selects ~740 distinct fragment programs in its first level on
+ * top of the menu's; with 512 slots every later pipeline failed silently and the
+ * level drew nothing but its clears. */
+#define VK_ENG_MAX_PIPE   8192
 #define VK_ENG_TOPOLOGIES 5
 #define VK_ENG_FB_CACHE   64
 
@@ -2953,7 +2957,13 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
     u32 slot = VK_ENG_MAX_PIPE;
     for (u32 i = 0; i < VK_ENG_MAX_PIPE; i++) if (!s_epipe[i].used) { slot = i; break; }
-    if (slot == VK_ENG_MAX_PIPE) return 0;
+    if (slot == VK_ENG_MAX_PIPE) {
+        if (!(s_e2.warned & 128u)) {
+            VK_LOG("engine: pipeline table full (%u), draws will drop\n", (unsigned)VK_ENG_MAX_PIPE);
+            s_e2.warned |= 128u;
+        }
+        return 0;
+    }
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
     if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
