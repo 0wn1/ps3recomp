@@ -203,7 +203,7 @@ static int process_texture_method(rsx_state* state, u32 method, u32 data)
 
     switch (reg) {
     case 0x00: /* TEXTURE_OFFSET */
-        tex->offset = data;
+        tex->offset = data & 0x7FFFFFFFu;   /* 31-bit offset; bit 31 is not an address bit */
         break;
     case 0x04: /* TEXTURE_FORMAT */
         tex->format = data;
@@ -250,7 +250,7 @@ static int process_vertex_texture_method(rsx_state* state, u32 method, u32 data)
     rsx_texture_state* tex = &state->vertex_textures[unit];
 
     switch (reg) {
-    case 0x00: tex->offset       = data; break;
+    case 0x00: tex->offset       = data & 0x7FFFFFFFu; break;   /* 31-bit offset */
     case 0x04: tex->format       = data; break;
     case 0x08: tex->address      = data; break;
     case 0x0C: tex->control0     = data; break;
