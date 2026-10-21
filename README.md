@@ -417,6 +417,61 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Changelog
 
+### v0.17.0 — *"Thirty-Three"* (October 2026)
+
+*33 pull requests from seven contributors, merged in #413. Most of them come
+from two new God of War ports (HD and Ascension), plus Killzone 3, Twisted
+Metal and SoulCalibur II HD.*
+
+**RSX and graphics**
+- God of War HD on D3D12 (*[@rigaz29](https://github.com/rigaz29)*, new):
+  depth/stencil-only clears no longer wipe the scene (#393). Indexed strips
+  keep their winding (#391). The guest-FP pipeline cache is keyed on the code,
+  not the address, which removed a full recompile per draw for programs
+  uploaded to a ring (#392). The FP decompiler is told the draw's export width
+  (#396). A wrapped command ring no longer overwrites commands the RSX hasn't
+  read (#390). `initguid.h` is included in the right place (#389), and new
+  `FP_DUMP=<n>` (#398), `PS3_HLE_TOP=<s>` (#397) and `SPU_INTERP_STATS=<s>`
+  (#394) diagnostics.
+- God of War: Ascension (*[@MaChInEgUn3](https://github.com/MaChInEgUn3)*,
+  new): X16 textures present like B8, so the font atlas shows (#384). A
+  smaller clip on the same rows reuses the surface (#382). The Vulkan pipeline
+  table is as large as the engine's (#378).
+- Killzone 3 (*[@undecuple](https://github.com/undecuple)*): texture offsets
+  are 31 bits (#408). A texture smaller than the surface it aliases samples
+  the surface's top-left (#395). `get` is published past a semaphore RELEASE
+  before its label (#401). Main-memory maps take the first free IO pages, and
+  are refused before `cellGcmInit` (#410).
+
+**SPU, SPURS and threads**
+- The Twisted Metal bring-up runtime is on master, so that port links again
+  (*[@Kurtisone](https://github.com/Kurtisone)*, #381).
+- Taskset bitsets are updated atomically on task create and exit (#388).
+  `cellSpursQueueSize` is answered (#411), and non-joinable PPU threads free
+  their slot when they end (#409) (*@undecuple*).
+- The identical-transfer DMA halt also waits for wall time and backs off,
+  so a job polling an RSX label isn't killed (*@MaChInEgUn3*, #383).
+- `cellFiber` is the SDK's scheduler API, replacing the made-up one
+  (*[@n0madic](https://github.com/n0madic)*, #400, closes #365).
+
+**Memory, codecs and system**
+- LV2 user allocations and mapper reservations are separate domains, and
+  loaded ELF segments are never handed out
+  (*[@tekulvw](https://github.com/tekulvw)*, #296).
+- cellVdec: `QueryAttrEx`/`OpenEx` (#379), and time stamps and frame rate for
+  MPEG-2 pictures (#380). WASAPI shared mode converts the 48 kHz stream, so a
+  44.1 kHz or 5.1 device isn't silent (#385) (*@MaChInEgUn3*).
+- Log caps stop at their limit (`PS3_LOG_FIRST`) instead of wrapping and
+  printing on every call (*@n0madic*, #399, closes #364). MinGW builds the
+  tests and reads the time zone from the system (#402).
+- Lifter: jump-table bounds compares are found beyond the 30-instruction
+  window (*@undecuple*, #387). `lift_jobmods --merge-chunks` is passed through
+  (#386).
+- The project template maps the guest arena with `mmap` on POSIX, so
+  `vm_commit` can `mprotect` it
+  (*[@arnaudaprahamian](https://github.com/arnaudaprahamian)*, new, #412).
+- Docs: stale module counts removed (#405), Killzone 3 entry updated (#407).
+
 ### v0.16.0 — *"Forty-Four"* (October 2026)
 
 *44 pull requests from six contributors, merged in #377. They come from
