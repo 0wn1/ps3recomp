@@ -1222,30 +1222,35 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * count only REJECTED transfers, so once the EA check started committing
      * pages on demand the counter never advanced and a spinning job simply hung
      * the chain walker instead. Count repeats whether or not the transfer
-     * succeeds, and halt at a known pc rather than hanging silently. */
-    /* Past the limit, back off instead of halting at once: a job polling a
-     * consumer's index (an Edge-style output ring whose read pointer the RSX
-     * advances) is waiting, not wedged, and halting it throws its output
-     * away. Sleep 1 ms per repeat and halt only after SPU_DMA_REPEAT_WAIT_MS
-     * (default 2000) of no progress. Per thread: jobs run on several workers. */
+     * succeeds, and halt at a known pc rather than hanging silently.
+     * The count alone is not enough: polling a value another agent writes is
+     * also the same transfer over and over. God of War: Ascension's EDGE
+     * geometry jobs wait for ring space by re-reading an RSX label until the
+     * GPU catches up, and 256 reads take well under a millisecond, so a
+     * count-only rule halted a healthy job and wedged the frame. Halt only once
+     * the repeats have also lasted SPU_DMA_REPEAT_SECS (default 30) of wall
+     * time. Below that, back off 1 ms per repeat rather than spinning. */
     { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep;
-      static uint32_t s_limit = 0, s_wait = 0;
+      static SPU_THREAD_LOCAL unsigned long long s_since;
+      static uint32_t s_limit = 0; static unsigned long long s_secs;
+      extern unsigned long long ps3_ms_now(void);
       if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
                       s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u;
-                      e = getenv("SPU_DMA_REPEAT_WAIT_MS");
-                      s_wait = e ? (uint32_t)strtoul(e, 0, 0) : 2000u; }
+                      e = getenv("SPU_DMA_REPEAT_SECS");
+                      s_secs = e ? strtoull(e, 0, 0) : 30u; }
       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
-          if (++s_rep >= s_limit + s_wait) {
-              s_rep = 0;   /* re-arm: the chain may run this job again */
+          if (++s_rep >= s_limit && !s_since) s_since = ps3_ms_now();
+          if (s_rep >= s_limit && ps3_ms_now() - s_since >= s_secs * 1000u) {
+              s_rep = 0; s_since = 0;   /* re-arm: the chain may run this job again */
               extern void spu_halt(spu_context*);
               fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
                       "transfers to ea=0x%08X -- halting the SPU\n",
-                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit + s_wait,
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
                       (uint32_t)ea);
               fflush(stderr);
               spu_halt(spu);
           } else if (s_rep >= s_limit) Sleep(1);
-      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
+      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0; } }
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
