@@ -439,10 +439,22 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 {
     extern uint8_t* vm_base;
     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_coh_notify_write(uint32_t);
     ts_lock(); s_ts_held = 1;
     uint8_t* ts = vm_base + taskset_ea;
     uint8_t* run = ts_running(taskset_ea);
     if (done_task < 128) spu_taskset2_set_exit(taskset_ea, done_task, 1, 0);
+    /* The ready/pending/enabled bitsets share the taskset's first line with the
+     * SPU task library (GETLLAR/PUTLLC) and with cellSpursCreateTask, which
+     * update them under the lock-line lock. Update them under the same lock,
+     * then drop the reservations on the line, so neither side undoes the
+     * other's change. Tasks to start are collected here and dispatched after
+     * the lock is released (the dispatch writes guest memory itself). */
+    uint32_t start_t[128], start_elf[128], start_ctx[128];
+    size_t start_sz[128];
+    int n_start = 0;
+    spu_lockline_lock();
     if (done_task < 128) {
         uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
         ts[0x10 + done_task / 8] &= (uint8_t)~m;
@@ -468,10 +480,16 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         if (!sz) continue;
         ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
         run[t / 8] |= m;
+        start_t[n_start] = t; start_elf[n_start] = elf; start_ctx[n_start] = ctx;
+        start_sz[n_start] = sz; n_start++;
+    }
+    spu_coh_notify_write(taskset_ea);
+    spu_lockline_unlock();
+    for (int i = 0; i < n_start; i++) {
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
-                        "(after task %u exited)\n", t, taskset_ea, elf, done_task);
-        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
-        spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
+                        "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
+        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
+        spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
     }
     s_ts_held = 0; ts_unlock();
 }
