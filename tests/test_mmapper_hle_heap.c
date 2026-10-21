@@ -22,6 +22,7 @@ static void slot_lock(void) {}
 static void slot_unlock(void) {}
 /* Exact production heap definitions/functions, copied without modification by
  * the driver. Only the platform lock is stubbed for this single-thread test. */
+#include "ps3emu/log_first.h"   /* the copied heap code logs through it */
 #include <heap-under-test.inc>
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)
 static uint32_t out(void) { return vm_read32(0x10000); }
