@@ -156,7 +156,10 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 #define UAV_ZDEPTH_BASE   (SRV_DEPTH_SOURCE_BASE + MAX_SURFACES)
 /* Per-surface copy a draw samples when it reads its own render target. */
 #define SRV_FEEDBACK_BASE (UAV_ZDEPTH_BASE + MAX_SURFACES)
-#define SRV_CPU_HEAP_SLOTS (SRV_FEEDBACK_BASE + MAX_SURFACES)
+/* Top-left windows of a surface for smaller textures that alias it (see surface_window). */
+#define LD_SWIN_PER       2
+#define SRV_SURF_WIN_BASE (SRV_FEEDBACK_BASE + MAX_SURFACES)
+#define SRV_CPU_HEAP_SLOTS (SRV_SURF_WIN_BASE + MAX_SURFACES * LD_SWIN_PER)
 #define SRV_TABLE_SIZE   16
 #define SRV_RING_TABLES  4096
 
@@ -201,6 +204,10 @@ typedef struct {
     u32 w, h;
     DXGI_FORMAT fmt;
     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
+    u32 pitch;                /* guest row pitch of colour target 0 (bytes), 0 = unknown */
+    /* Top-left windows of the surface for smaller aliasing textures (see surface_window). */
+    struct { ID3D12Resource* tex; ID3D12Resource* src; u32 w, h, wgen, used; } swin[LD_SWIN_PER];
+    u32 swin_wgen;            /* bumped by every write into the surface; a window older than it is recopied */
 #if !defined(YZ_PERF_CLEAN)
     u32 resource_serial;
     u32 last_write_generation;
@@ -479,6 +486,7 @@ static void ld_surface_note_write(u32 target, u32 kind)
         return;
     surface_t* surface = &g.surfaces[target];
     const u32 generation = ++g_ld_surface_generation;
+    surface->swin_wgen++;
     surface->last_write_generation = generation;
     surface->last_write_kind = kind;
     switch (kind) {
@@ -506,7 +514,8 @@ static void ld_surface_note_write(u32 target, u32 kind)
     }
 }
 #else
-#define ld_surface_note_write(target, kind) ((void)0)
+#define ld_surface_note_write(target, kind) \
+    do { if ((target) < MAX_SURFACES) g.surfaces[(target)].swin_wgen++; } while (0)
 #endif
 
 #define LD_LAYOUT_CACHE_CAP 256u
@@ -2927,6 +2936,8 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         retire_texture(s->fb_tex);
         s->fb_tex = NULL;
     }
+    for (u32 j = 0; j < LD_SWIN_PER; j++)   /* windows are sized and typed for the old resource */
+        if (s->swin[j].tex) { retire_texture(s->swin[j].tex); s->swin[j].tex = NULL; }
     s->tex = replacement;
     s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
     s->fmt = want_fmt;
@@ -2940,6 +2951,135 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     srv_write(SRV_SURFACE_BASE + slot, s->tex);
     if (slot == g.n_surfaces) g.n_surfaces++;
     return slot;
+}
+
+/* A texture smaller than the colour surface it aliases reads the surface's memory texel for
+ * sample, i.e. the top-left tex_w x tex_h of the surface, not the whole surface scaled into it. a title's scene
+ * renders into 0x01FB0000 with SURFACE_FORMAT 0xA0B5148 (A8R8G8B8, antialias 5 = 2x2 samples), raw clip 2560x1440,
+ * pitch 10240, viewport 1280x720. rsx_dsp_get_surface multiplies the clip by the sample grid (PR #281), so
+ * the host surface is 5120x2880, but the game draws only its viewport, 2560x1440 samples, which is all the guest
+ * memory holds (pitch 10240 = 2560 x 4 bytes; tile 7 is 0xE10000 = 10240 x 1440 bytes). The downsample then binds
+ * 0x01FB0000 as a 2560x1440 A8R8G8B8 linear texture; bound to the whole 5120x2880 surface, its normalised
+ * coordinates took the scene from the top-left quarter only, and every later pass (640x360 bloom chain, final
+ * composite) showed the scene in a corner. On the RSX texel (x,y) of a linear texture is the byte at
+ * y*pitch + x*bpp, which for an equal pitch and texel size is sample (x,y) of the surface. A 2D SRV cannot select a
+ * sub-rectangle, so, the top-left w x h of the surface is copied into a w x h
+ * texture of the surface's format (kept per surface and size, recopied only after the surface was written), and
+ * clamp, filtering and texel size then see the texture the guest declared.
+ * Returns the SRV slot, or -1 to bind the whole surface as before: equal size, a texture larger than the surface,
+ * not a linear 2D texture, unknown or different texel size, or a texture pitch that differs from the surface's
+ * guest pitch (the texture then does not walk the surface's rows; the old behaviour is kept, unproven either way).
+ * LD_SWIN=0 = old behaviour. LD_ALIAS_DBG=1 logs each sub-rect mapping ([alias-subrect]). */
+static int ld_swin_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("LD_SWIN"); on = (e && e[0] == '0') ? 0 : 1;
+                  fprintf(stderr, "[swin] %s (LD_SWIN)\n", on ? "on" : "off"); }
+    return on;
+}
+/* Guest bytes per texel of a texture format (modifier bits ignored); 0 = compressed or not listed. */
+static u32 ld_tex_texel_bytes(u32 format)
+{
+    switch (format & TEX_FMT_BASE_MASK) {
+    case RSX_TEX_FMT_B8: return 1u;
+    case RSX_TEX_FMT_A1R5G5B5: case RSX_TEX_FMT_A4R4G4B4: case RSX_TEX_FMT_R5G6B5: case RSX_TEX_FMT_G8B8: return 2u;
+    case RSX_TEX_FMT_A8R8G8B8: case RSX_TEX_FMT_DEPTH24_D8: case RSX_TEX_FMT_X32_FLOAT: case RSX_TEX_FMT_Y16X16_FLOAT:
+        return 4u;
+    case RSX_TEX_FMT_W16Z16Y16X16_FLOAT: return 8u;
+    case RSX_TEX_FMT_W32Z32Y32X32_FLOAT: return 16u;
+    default: return 0u;
+    }
+}
+static u64 g_ld_swin_copies;
+static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
+{
+    surface_t* s = &g.surfaces[si];
+    const u32 w = t->width, h = t->height;
+    if (!ld_swin_on() || !s->tex || !w || !h) return -1;
+    if (w == s->w && h == s->h) return -1;           /* exact-size alias: the whole surface, unchanged */
+    if (w > s->w || h > s->h) return -1;
+    const u32 sb = s->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;   /* the surface formats live-draw creates */
+    const u32 tb = ld_tex_texel_bytes(t->format);
+    if (t->dimension != 2u || t->cubemap || !(t->format & TEX_FMT_LINEAR) || !s->pitch ||
+        t->pitch != s->pitch || tb != sb) {
+        if (dbg) {
+            static u32 n_keep;
+            if (n_keep++ < 24)
+                fprintf(stderr, "[alias-subrect] keep whole surface: tex %u:0x%08X fmt=0x%02X %ux%u pitch=%u "
+                        "(%u B/texel) vs surface[%u] %ux%u pitch=%u (%u B/texel)\n", t->location, t->offset,
+                        t->format, w, h, t->pitch, tb, si, s->w, s->h, s->pitch, sb);
+        }
+        return -1;
+    }
+    static u32 use_clock;
+    u32 k = LD_SWIN_PER;
+    for (u32 j = 0; j < LD_SWIN_PER; j++)
+        if (s->swin[j].tex && s->swin[j].src == s->tex && s->swin[j].w == w && s->swin[j].h == h) { k = j; break; }
+    if (k == LD_SWIN_PER) {
+        k = 0;
+        for (u32 j = 1; j < LD_SWIN_PER; j++)
+            if (!s->swin[j].tex || (s->swin[k].tex && s->swin[j].used < s->swin[k].used)) k = j;
+        if (s->swin[k].tex) retire_texture(s->swin[k].tex);   /* the open command list may still read it */
+        s->swin[k].tex = NULL;
+        D3D12_RESOURCE_DESC rd;
+        s->tex->lpVtbl->GetDesc(s->tex, &rd);              /* the surface's format and sample count */
+        rd.Width = w; rd.Height = h; rd.Alignment = 0;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        ID3D12Resource* wt = NULL;
+        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL, &IID_ID3D12Resource, (void**)&wt))) {
+            static u32 n_fail;
+            if (n_fail++ < 8)
+                fprintf(stderr, "[swin] create failed %u:0x%X %ux%u: whole surface bound\n", s->location, s->offset,
+                        w, h);
+            return -1;
+        }
+        s->swin[k].tex = wt; s->swin[k].src = s->tex; s->swin[k].w = w; s->swin[k].h = h;
+        s->swin[k].wgen = s->swin_wgen - 1u;
+        srv_write(SRV_SURF_WIN_BASE + si * LD_SWIN_PER + k, wt);
+        static u32 n_log;
+        if (n_log++ < 16)
+            fprintf(stderr, "[swin] %u:0x%X surface %ux%u pitch=%u -> window %ux%u (slot %u.%u)\n",
+                    s->location, s->offset, s->w, s->h, s->pitch, w, h, si, k);
+    }
+    if (dbg) {
+        static u32 n_hit;
+        if (n_hit++ < 24)
+            fprintf(stderr, "[alias-subrect] tex %u:0x%08X fmt=0x%02X %ux%u pitch=%u -> surface[%u] %ux%u "
+                    "texels [0,%u)x[0,%u) (window %u)\n", t->location, t->offset, t->format, w, h, t->pitch, si,
+                    s->w, s->h, w, h, k);
+    }
+    s->swin[k].used = ++use_clock;
+    if (s->swin[k].wgen != s->swin_wgen) {
+        D3D12_RESOURCE_BARRIER b[2] = {0};
+        b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[0].Transition.pResource = s->tex;
+        b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[1].Transition.pResource = s->swin[k].tex;
+        b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+        D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+        dst.pResource = s->swin[k].tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource = s->tex;         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_BOX box = { 0, 0, 0, w, h, 1 };
+        g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &box);
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
+        s->swin[k].wgen = s->swin_wgen;
+        if ((++g_ld_swin_copies & 0x3FFFu) == 1u)
+            fprintf(stderr, "[swin] copies=%llu frame=%u\n", (unsigned long long)g_ld_swin_copies, g_ld_frames);
+    }
+    return (int)(SRV_SURF_WIN_BASE + si * LD_SWIN_PER + k);
 }
 
 /* A draw that samples its own render target. RSX reads and writes the same
@@ -3477,11 +3617,13 @@ static u32 current_surface(void)
 {
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
-    return surface_get(sf.color_location[0], sf.color_offset[0],
-                       sf.clip_w, sf.clip_h,
-                       sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
-                           ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                           : DXGI_FORMAT_R8G8B8A8_UNORM);
+    const u32 slot = surface_get(sf.color_location[0], sf.color_offset[0],
+                                 sf.clip_w, sf.clip_h,
+                                 sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+                                     ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                     : DXGI_FORMAT_R8G8B8A8_UNORM);
+    if (slot != LD_INVALID_SURFACE) g.surfaces[slot].pitch = sf.color_pitch[0];
+    return slot;
 }
 
 /* On RSX each zeta (depth) address is distinct memory. The offline renderer's
@@ -7442,6 +7584,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                             sampled, g.surfaces[sampled].location,
                             g.surfaces[sampled].offset,
                             g.surfaces[sampled].w, g.surfaces[sampled].h);
+            }
+            {   /* a smaller texture reads the surface's top-left samples, texel for sample */
+                const int sw = surface_window((u32)sampled, &t, alias_dbg);
+                if (sw >= 0) { slots[u] = (u32)sw; g_ld_bind_surf++; continue; }
             }
             slots[u] = SRV_SURFACE_BASE + sampled;
             g_ld_bind_surf++;
