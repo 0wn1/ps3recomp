@@ -168,12 +168,28 @@ static void* ppu_host_thread_proc(void* param)
     table_lock();
     info->exit_status = (int64_t)info->ctx.gpr[3];
 
-    if (info->state == PPU_THREAD_STATE_DETACHED) {
-        /* Detached threads self-clean */
+    /* A thread nobody can join (created without SYS_PPU_THREAD_CREATE_JOINABLE, or detached)
+     * frees its slot here, its last use of `info`. The sync objects go first, under the table lock: once the slot is
+     * FREE a new sys_ppu_thread_create may reuse it and create its own. Joinable threads stay FINISHED for the join. */
+    if (!info->joinable) {
+#ifdef _WIN32
+        if (info->finish_event) CloseHandle(info->finish_event);
+        if (info->host_thread) CloseHandle(info->host_thread);
+        info->finish_event = NULL;
+        info->host_thread = NULL;
+#else
+        pthread_mutex_destroy(&info->finish_mutex);
+        pthread_cond_destroy(&info->finish_cond);
+#endif
         info->state = PPU_THREAD_STATE_FREE;
-    } else {
-        info->state = PPU_THREAD_STATE_FINISHED;
+        table_unlock();
+#ifdef _WIN32
+        return 0;
+#else
+        return NULL;
+#endif
     }
+    info->state = PPU_THREAD_STATE_FINISHED;
     table_unlock();
 
     /* Signal anyone waiting for join */
@@ -332,7 +348,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     uint64_t arg          = LV2_ARG_U64(ctx, 2);
     int32_t  priority     = LV2_ARG_S32(ctx, 3);
     uint32_t stack_size   = LV2_ARG_U32(ctx, 4);
-    /* uint64_t flags     = LV2_ARG_U64(ctx, 5); */
+    uint64_t flags        = LV2_ARG_U64(ctx, 5);
     uint32_t name_addr    = LV2_ARG_PTR(ctx, 6);
 
     if (stack_size == 0) stack_size = VM_PPU_STACK_SIZE;
@@ -369,7 +385,10 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 
     t->state      = PPU_THREAD_STATE_RUNNING;
     t->priority   = priority;
-    t->joinable   = 1;
+    /* SYS_PPU_THREAD_CREATE_JOINABLE is bit 0 of the flags. If every thread were joinable, a thread created without
+     * the flag (nobody will ever join it) would stay FINISHED after its exit and keep its slot, and a title that
+     * starts a short-lived worker per task would see CELL_EAGAIN once 63 of them had run. */
+    t->joinable   = (flags & 1u) ? 1 : 0;
     t->stack_addr = stack_addr;
     t->stack_size = stack_size;
     t->entry_addr = entry;
@@ -409,9 +428,9 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
+    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX\n",
             (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
-            stack_size, priority);
+            stack_size, priority, (unsigned long long)flags);
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null
      * the worker dispatches its job on a null object -> construction never runs. */
@@ -501,6 +520,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
+    if (!t->joinable) pthread_detach(t->host_thread);   /* nobody pthread_joins it */
 #endif
 
     table_unlock();
@@ -523,11 +543,11 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     ppu_thread_info* t = find_thread(tid);
     if (t) {
         t->exit_status = (int64_t)status;
-        if (t->state == PPU_THREAD_STATE_DETACHED) {
-            t->state = PPU_THREAD_STATE_FREE;
-        } else {
+        /* A non-joinable host thread frees its slot in ppu_host_thread_proc, right after the
+         * unwind below (freeing it here let a new thread take the slot while this one still ran its epilogue).
+         * The main thread (slot 0) has no such epilogue and is marked FINISHED as before. */
+        if (t->joinable || t == &g_ppu_threads[0])
             t->state = PPU_THREAD_STATE_FINISHED;
-        }
 
 #ifdef _WIN32
         SetEvent(t->finish_event);
