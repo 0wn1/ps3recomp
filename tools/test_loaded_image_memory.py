@@ -41,7 +41,7 @@ def main():
         empty.write_bytes(image([]))
         obj = tmp / 'memory.o'
         subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1',
-                        '-ffunction-sections', '-fdata-sections', '-c',
+                        '-ffunction-sections', '-fdata-sections', '-I' + str(ROOT / 'include'), '-c',
                         str(ROOT / 'runtime/syscalls/sys_memory.c'), '-o', str(obj)],
                        check=True, timeout=60)
         flags = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-ldl']
