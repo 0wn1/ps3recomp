@@ -176,8 +176,14 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 |---|---|
 | **Complete** | 91 |
 | Partial | 6 |
-| Not Started | ~3 |
-| **Total** | **~100** |
+| Stubbed | 0 |
+| Not Started | 0 |
+| **Total** | **97** |
+
+Counts are the module rows above (the ones with a Category column) whose Status
+column holds each value. Recount one status with
+`grep -c '^| [^|]* | [^|]* | Partial |' docs/MODULE_STATUS.md`; for Complete use
+`\*\*Complete\*\*` in place of `Partial`.
 
 ## Next Priorities
 
