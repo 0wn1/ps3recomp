@@ -5,7 +5,7 @@
 #include "sys_memory.h"
 #include <stdio.h>
 #include <string.h>
-#include "ps3emu/log_first.h"
+#include "../../include/ps3emu/log_first.h"   /* relative: tools/test_*memory*.py compile this file alone */
 
 /* ---------------------------------------------------------------------------
  * Globals
