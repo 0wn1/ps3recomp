@@ -19,6 +19,7 @@ HARNESS = r'''
 #include <cstring>
 #include <cstdlib>
 #include "win32_compat.h"
+#include "ps3emu/log_first.h"
 
 alignas(8) static uint8_t memory[512];
 static uint8_t* vm_base = memory;
@@ -108,7 +109,8 @@ def main():
         exe = Path(tmp) / 'spinlock'
         cpp.write_text(code)
         subprocess.run([cxx, '-std=c++17', '-O2', '-pthread',
-                        '-I', str(ROOT / 'runtime/platform'), str(cpp),
+                        '-I', str(ROOT / 'runtime/platform'),
+                        '-I', str(ROOT / 'include'), str(cpp),
                         '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True, timeout=10)
 

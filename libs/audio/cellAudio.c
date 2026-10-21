@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#include "ps3emu/log_first.h"
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -282,10 +283,21 @@ static int audio_backend_init(void)
     REFERENCE_TIME buf_duration = 200000; /* 20ms in 100ns units */
     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
+    /* Shared mode only takes the device's own mix format unless the stream
+     * asks the audio engine to convert: on a device not running 48 kHz stereo
+     * float (a 44.1 kHz or 5.1 output) Initialize failed with
+     * AUDCLNT_E_UNSUPPORTED_FORMAT and every title ran silent. */
+#ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+#define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM      0x80000000
+#endif
+#ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+#define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
+#endif
+    const DWORD convert = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
     hr = s_wasapi_client->lpVtbl->Initialize(
         s_wasapi_client,
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
         buf_duration, 0, &wfx, NULL);
 
     if (FAILED(hr)) {
@@ -293,7 +305,7 @@ static int audio_backend_init(void)
         hr = s_wasapi_client->lpVtbl->Initialize(
             s_wasapi_client,
             AUDCLNT_SHAREMODE_SHARED,
-            0, buf_duration, 0, &wfx, NULL);
+            convert, buf_duration, 0, &wfx, NULL);
         if (FAILED(hr)) {
             printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
             s_wasapi_client->lpVtbl->Release(s_wasapi_client);
@@ -380,7 +392,7 @@ static int audio_backend_room(void)
     if (FAILED(hr)) {
         /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED on a default-device
          * change, sleep, ...): pace on the clock rather than spin. */
-        static int _n = 0; if (_n++ < 4)
+        static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
             fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
         return -1;
     }
@@ -802,12 +814,12 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     u32 buf_samples = (u32)(nblk * CELL_AUDIO_BLOCK_SAMPLES * nch);
     port->buf_size = buf_samples * (u32)sizeof(float);
 
-    /* Keep audio outside sys_memory (0x40000000..0x50000000), the HLE heap
-     * (0x50000000..0x58000000), and sys_vm (0x60000000..0x70000000).
-     * Reserve two 1-MB pages per port so reopening reuses its own storage. */
-    u32 guest_buf = 0x58000000u + (u32)found * 0x200000u;
+    /* Each port reuses its own two pages in the runtime-owned audio window. */
+    _Static_assert(CELL_AUDIO_PORT_MAX * VM_AUDIO_PORT_SIZE <= VM_AUDIO_SIZE,
+                   "Audio port storage exceeds its reserved VM window");
+    u32 guest_buf = VM_AUDIO_BASE + (u32)found * VM_AUDIO_PORT_SIZE;
     u32 guest_ridx = guest_buf + 0x100000u;
-    if (vm_commit(guest_buf, 0x200000u) != CELL_OK) {
+    if (vm_commit(guest_buf, VM_AUDIO_PORT_SIZE) != CELL_OK) {
         port->in_use = 0;
         mutex_unlock(&s_audio_mutex);
         return CELL_AUDIO_ERROR_AUDIOSYSTEM;
@@ -1081,7 +1093,7 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     vm_write32(cfg + 24, port->buf_size);                                   /* portSize */
     vm_write32(cfg + 28, (u32)port->port_addr);                             /* portAddr */
 
-    { static int _n = 0; if (_n++ < 24)
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
         fprintf(stderr, "[cellAudio] GetPortConfig(port=%u) status=%s bufEA=0x%08X ridxEA=0x%08X\n",
                 portNum, port->running ? "RUN" : "READY",
                 (u32)port->port_addr, (u32)port->read_idx_addr); }

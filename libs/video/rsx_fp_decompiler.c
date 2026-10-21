@@ -13,6 +13,7 @@
 #include "rsx_fp_decompiler.h"
 #include <stdio.h>
 #include <string.h>
+#include "ps3emu/log_first.h"
 
 /* ---- DWORD 0 (OPDEST) --------------------------------------------------- */
 #define FP_END              (1u << 0)
@@ -640,7 +641,7 @@ static int rsx_fp_decompile_internal(
              shadow[u].linear > 1 || shadow[u].unnormalized > 1 ||
              (tex_sep_mask & (1u << u)))) {
             static u32 n_layout_errors;
-            if (n_layout_errors++ < 32)
+            if (PS3_LOG_FIRST(n_layout_errors, 32))
                 fprintf(stderr, "[RSX fp] unsupported depth comparison layout on texture unit %u\n", u);
             return -1;
         }
@@ -739,7 +740,7 @@ static int rsx_fp_decompile_internal(
             (opcode == OP_TXB || opcode == OP_TXL || opcode == OP_TXD ||
              opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
             static u32 n_fetch_errors;
-            if (n_fetch_errors++ < 32)
+            if (PS3_LOG_FIRST(n_fetch_errors, 32))
                 fprintf(stderr, "[RSX fp] unsupported depth comparison fetch on texture unit %u\n", tex_unit);
             return -1;
         }
@@ -872,7 +873,7 @@ static int rsx_fp_decompile_internal(
         if (gamma_masks && gamma_masks[tex_unit] && !(w0 & (1u << 21)) &&
             (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
             static u32 reported;
-            if (reported++ < 32)
+            if (PS3_LOG_FIRST(reported, 32))
                 fprintf(stderr, "[RSX fp] gamma fetch opcode %u unsupported on unit %u\n", opcode, tex_unit);
             return -1;
         }
@@ -1074,7 +1075,7 @@ static int rsx_fp_decompile_internal(
         } else if (((w0 & (1u << 21)) || (expand_masks && expand_masks[tex_unit])) &&
                    (opcode == OP_TXD || opcode == OP_TEXBEM || opcode == OP_TXPBEM)) {
             static u32 reported;
-            if (reported++ < 32)
+            if (PS3_LOG_FIRST(reported, 32))
                 fprintf(stderr, "[RSX fp] sign-expand fetch opcode %u unsupported on unit %u (read unexpanded)\n",
                         opcode, tex_unit);
         }
@@ -1207,7 +1208,7 @@ static int rsx_fp_decompile_internal(
     const int depth_export = ctrl != RSX_FP_CTRL_AUTO && (ctrl & 0xEu) != 0u;
     if (dbg_here) {
         static u32 reported;
-        if (reported++ < 8)
+        if (PS3_LOG_FIRST(reported, 8))
             fprintf(stderr, "[RSX fp] RSX_FP_DEBUG %016llx: %s after instruction %ld%s\n",
                     (unsigned long long)dbg_hash, dbg_reg, dbg_n,
                     dbg_done ? "" : " not reached (program is shorter)");
@@ -1593,7 +1594,7 @@ int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_ou
     }
     { static int dbg = -1;
       if (dbg < 0) { const char* e = getenv("FP_KDBG"); dbg = e ? atoi(e) : 0; }
-      if (dbg) { static int m = 0; if (m++ < 3) {
+      if (dbg) { static int m = 0; if (PS3_LOG_FIRST(m, 3)) {
         fprintf(stderr, "[FPK] %d consts%c", n, 10);
         for (int _q = 0; _q < n; _q++)
             fprintf(stderr, "   k[%2d] = (%g %g %g %g)%c", _q, out[_q*4+0],

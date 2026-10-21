@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "ps3emu/log_first.h"
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -547,9 +548,16 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
 
 /* The colour target for this (location, offset), created or reallocated when
  * the size or format moved. Returns a slot index, or ENG_INVALID.
- * rsx_live_draw.c's surface_get (2605-2690). */
+ * rsx_live_draw.c's surface_get (2605-2690).
+ *
+ * A smaller clip on the same rows is the same memory, not a new surface: with
+ * the same format and pitch, RSX draws into the top-left of what is already
+ * there. God of War: Ascension renders its scene into a 1280x720 target, then
+ * runs a 640x360 pass at the same address and pitch and copies the full
+ * 1280x720 out for its SPU anti-aliasing; recreating the target at 640x360
+ * lost the scene and left that quarter of the frame black. */
 static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
-                          rsx_be_format want_fmt)
+                          rsx_be_format want_fmt, u32 pitch)
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
@@ -557,8 +565,10 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     u32 slot = ENG_MAX_SURFACES;
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
-            if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
-                g.surfaces[i].fmt == want_fmt)
+            const eng_surface* s = &g.surfaces[i];
+            if (s->fmt == want_fmt &&
+                ((s->w == want_w && s->h == want_h) ||
+                 (pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h)))
                 return i;
             slot = i;
             break;
@@ -568,7 +578,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      * decoded a guest pointer as clip dimensions. */
     if (want_w > ENG_MAX_SURFACE_DIM || want_h > ENG_MAX_SURFACE_DIM) {
         static u32 logs = 0;
-        if (logs++ < 8)
+        if (PS3_LOG_FIRST(logs, 8))
             fprintf(stderr, "[rsx engine] rejected implausible surface 0x%X %ux%u;"
                             " keeping the %s target\n", offset, want_w, want_h,
                     slot < ENG_MAX_SURFACES ? "existing" : "absent");
@@ -596,7 +606,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->color_serial = 0;
     s->guest_dirty = 0;
     if (slot == g.n_surfaces) g.n_surfaces++;
-    { static u32 logs = 0; if (logs++ < 16)
+    { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 16))
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
                 location, offset, want_w, want_h, (int)want_fmt,
                 seed ? " (seeded from guest memory)" : ""); }
@@ -618,7 +628,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
     const rsx_be_format fmt = eng_surface_format(sf.color_format);
     const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
-                                      sf.clip_w, sf.clip_h, fmt);
+                                      sf.clip_w, sf.clip_h, fmt, sf.color_pitch[sel]);
     if (first == ENG_INVALID) return 0;
     g.surfaces[first].pitch = sf.color_pitch[sel];
     slots[0] = first;
@@ -630,9 +640,12 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     };
     for (u32 i = 0; i < 3; i++) {
         if (sf.color_target < mrt_from[i]) break;
+        /* At A's size, which may be larger than the clip (see above): the
+         * framebuffer takes A's extent, and every attachment must cover it. */
         const u32 slot = eng_surface_get(sf.color_location[i + 1],
                                          sf.color_offset[i + 1],
-                                         sf.clip_w, sf.clip_h, fmt);
+                                         g.surfaces[first].w, g.surfaces[first].h, fmt,
+                                         sf.color_pitch[i + 1]);
         if (slot == ENG_INVALID) break;
         g.surfaces[slot].pitch = sf.color_pitch[i + 1];
         /* A set naming one buffer twice would attach the same target twice,
@@ -1767,7 +1780,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             }
         }
     }
-    { static u32 logs = 0; if (logs++ < 32)
+    { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 32))
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
                         " %u constants, fp %016llx -> %s\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
@@ -2049,7 +2062,7 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
     static u32 logs;
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
-    if (logs++ < 8)
+    if (PS3_LOG_FIRST(logs, 8))
         fprintf(stderr, "[rsx engine] rejected colour feedback unit %u: "
                 "target %ux%u fmt%u pitch%u, texture %ux%u fmt%02X pitch%u "
                 "dim%u levels%u cube%u color%u raster%u\n", unit, s->w, s->h, (u32)s->fmt,

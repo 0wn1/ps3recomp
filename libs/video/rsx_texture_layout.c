@@ -324,13 +324,16 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
      * and the sampler presents them as {G,R,G,R}. B8 decodes to a one-channel
      * resource whose byte is presented as R, G and B with an opaque A, which
      * is what the D3D12 live engine's CPU decode builds (decode_texel); read
-     * through lanes_argb its B source would be component 2, always zero. */
+     * through lanes_argb its B source would be component 2, always zero.
+     * X16 is one 16-bit channel decoded to R16 and is presented the same way:
+     * God of War: Ascension samples its X16 font atlas through crossbar 0xAAEE
+     * (every output from G or B), which read zeros -- all menu text invisible. */
     static const u8 lanes_argb[4] = {3, 0, 1, 2};
     static const u8 lanes_g8b8[4] = {1, 0, 1, 0};
     static const u8 lanes_b8[4]   = {RSX_REMAP_ONE, 0, 0, 0};
     const u32 base = rsx_fmt & 0x9Fu;
     const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
-                      : (base == 0x81u) ? lanes_b8 : lanes_argb;
+                      : (base == 0x81u || base == 0x94u) ? lanes_b8 : lanes_argb;
 
     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
 
