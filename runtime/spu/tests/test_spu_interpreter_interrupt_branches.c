@@ -93,6 +93,7 @@ uint32_t g_barrier_sync_watch;
 uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
 void ydkj_wake_all_event_flags(void) { abort(); }
+void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
 void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d) {
     (void)c; (void)a; (void)b; (void)d; abort();
 }
