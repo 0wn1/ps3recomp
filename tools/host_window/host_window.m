@@ -347,8 +347,18 @@ static void stats_tick(void)
 
 static void child_exited(void)
 {
+    /* DISPATCH_PROC_EXIT can fire a moment before the child becomes
+     * reapable, so a WNOHANG reap may see nothing and this handler never
+     * runs again: the host then stayed up with its window open after the
+     * game had gone. The child has exited (an exec does not raise EXIT),
+     * so a blocking reap returns at once. */
     int st = 0;
-    if (waitpid(g.child, &st, WNOHANG) != g.child) return;
+    pid_t r;
+    do r = waitpid(g.child, &st, 0); while (r < 0 && errno == EINTR);
+    if (r != g.child) {                     /* already reaped elsewhere: still done */
+        fprintf(stderr, "[host window] pid %d gone (%s)\n", g.child, strerror(errno));
+        exit(g.closing ? 0 : 1);
+    }
     int code = WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : 1;
     fprintf(stderr, "[host window] pid %d %s %d\n", g.child,
             WIFSIGNALED(st) ? "killed by signal" : "exited with", WIFSIGNALED(st) ? WTERMSIG(st) : code);
@@ -371,6 +381,10 @@ static void begin_close(const char* why)
         if (g.child == pid) {
             fprintf(stderr, "[host window] pid %d still running; SIGKILL\n", pid);
             kill(pid, SIGKILL);
+            /* Last resort if the exit notification never reaps it. */
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                if (g.child == pid) child_exited();
+            });
         }
     });
 }
