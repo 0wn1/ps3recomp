@@ -8,6 +8,8 @@
  */
 #include "../rsx_metal_backend.m"
 #include <assert.h>
+#include <pthread.h>
+#include <stdio.h>
 #include <unistd.h>
 
 float cellAvconfExt_display_gamma(void) { return 1.0f; }
@@ -18,6 +20,52 @@ static NSUInteger pool_count(void)
     const NSUInteger n = [s_eng_stage_pool count];
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
     return n;
+}
+
+/* The FIFO walker records from a PPU host thread: a plain pthread with no
+ * autorelease pool. With the pool full of buffers too small for an arena,
+ * every recording allocates one and every completion drops one, and a
+ * dropped arena must be freed while that thread is still running, not kept
+ * by an autoreleased reference only the thread's exit releases. Weak
+ * references see which arenas are still alive; the thread counts before it
+ * returns, because its exit would free them anyway. */
+enum { WALKER_COMMITS = 64 };
+static __weak id<MTLBuffer> s_walker_arena[WALKER_COMMITS];
+static int s_walker_made, s_walker_live;
+static uint64_t s_walker_grew;
+
+static int walker_live(void)
+{
+    int n = 0;
+    for (int i = 0; i < WALKER_COMMITS; i++) if (s_walker_arena[i]) n++;
+    return n;
+}
+
+static void* pool_less_walker(void* arg)
+{
+    (void)arg;
+    /* Replace the pool's buffers in one step, so a completion still landing
+     * from the main thread's commit cannot slip a large one back in. */
+    pthread_mutex_lock(&s_eng_stage_pool_lock);
+    [s_eng_stage_pool removeAllObjects];
+    for (int i = 0; i < ENG_STAGE_POOL_KEEP; i++)
+        [s_eng_stage_pool addObject:[s_dev newBufferWithLength:1u << 16
+                                                       options:MTLResourceStorageModeShared]];
+    pthread_mutex_unlock(&s_eng_stage_pool_lock);
+    const uint64_t size0 = [s_dev currentAllocatedSize];
+    for (int i = 0; i < WALKER_COMMITS; i++) {
+        u32 off = 0;
+        if (!eng_stage_reserve(1u << 20, &off)) break;
+        s_walker_arena[i] = s_eng_stage_buf;
+        if ([s_eng_stage_buf length] > (1u << 16)) s_walker_made++;   /* not a pooled one */
+        eng_encode_and_commit(nil);   /* waits for the GPU; drops the arena */
+    }
+    /* Completion handlers run on Metal's thread: let the last ones land. */
+    for (int spin = 0; spin < 200 && walker_live() > 0; spin++) usleep(10000);
+    s_walker_live = walker_live();
+    const uint64_t size1 = [s_dev currentAllocatedSize];
+    s_walker_grew = size1 > size0 ? size1 - size0 : 0;
+    return NULL;
 }
 
 int main(void)
@@ -63,6 +111,21 @@ int main(void)
             eng_stage_buffer_release([s_dev newBufferWithLength:4096
                                                         options:MTLResourceStorageModeShared]);
         assert(pool_count() == ENG_STAGE_POOL_KEEP);
+
+        /* Arenas the full pool drops on a pool-less walker thread are freed. */
+        eng_encode_and_commit(nil);   /* the walker starts with an empty arena */
+        assert(!s_eng_stage_buf && !s_eng_stage_used);
+        pthread_t walker;
+        assert(pthread_create(&walker, NULL, pool_less_walker, NULL) == 0);
+        pthread_join(walker, NULL);
+        fprintf(stderr, "pool-less walker: %d arenas recorded, %d still live, "
+                        "device allocation grew %llu KB (while the thread ran)\n",
+                s_walker_made, s_walker_live, (unsigned long long)(s_walker_grew >> 10));
+        assert(s_walker_made == WALKER_COMMITS);   /* every recording allocated */
+        if (s_walker_live != 0) {
+            fprintf(stderr, "FAIL: dropped arenas from a pool-less thread were kept alive\n");
+            return 1;
+        }
 
         eng_shutdown(NULL);
         assert(!s_eng_stage_buf && !s_eng_stage && pool_count() == 0);
