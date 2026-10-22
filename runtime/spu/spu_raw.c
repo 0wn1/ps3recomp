@@ -293,22 +293,31 @@ static void* raw_spu_thread(void* arg) { raw_spu_run((raw_spu*)arg); return NULL
 static void raw_spu_start(raw_spu* s)
 {
     uint32_t n = (uint32_t)(s - s_spu);
+    /* An imported image belongs to the one start that follows the import.
+     * These used to stay set, so every later raw SPU skipped its own lookup
+     * and ran the first one's program: Resistance's second raw SPU started
+     * image 2 instead of its own and stopped after four instructions. */
+    spu_lifted_entry_fn entry = s_pending_entry;
+    int image_id = s_pending_image_id;
+    uint32_t elf_entry = s_pending_elf_entry;
+    s_pending_entry = NULL;
+    const int loaded = s->get_runs > 0;   /* a program was streamed in */
     /* No image was imported: the PPU streamed the program in by proxy DMA.
      * Ports register each image's executable segment too (build_spu_workloads
      * .text fingerprint), so one of the GET runs matches it. */
-    for (int r = 0; !s_pending_entry && r < s->get_runs; r++) {
+    for (int r = 0; !entry && r < s->get_runs; r++) {
         uint64_t fp = spu_workload_fingerprint(vm_base + s->base + s->get_lo[r],
                                                s->get_hi[r] - s->get_lo[r]);
-        s_pending_entry = spu_workload_find_img(fp, &s_pending_image_id);
+        entry = spu_workload_find_img(fp, &image_id);
         fprintf(stderr, "[spu-raw] spu%u proxy-loaded LS 0x%05X..0x%05X fp=0x%016llX npc=0x%05X -> %s\n",
                 n, s->get_lo[r], s->get_hi[r], (unsigned long long)fp,
                 be32_load(s->base + SPU_RAW_NPC) & ~3u,
-                s_pending_entry ? "lifted entry registered" : "no match");
+                entry ? "lifted entry registered" : "no match");
         /* SPU_RAW_DUMP_DIR=<dir>: write an unmatched run out as
          * rawspu_<fp>_<lo>.bin -- the bytes exactly as they sit in local store
          * at <lo>, which is the base to lift them at. */
         { const char* dir = getenv("SPU_RAW_DUMP_DIR");
-          if (dir && *dir && !s_pending_entry) {
+          if (dir && *dir && !entry) {
               char path[512];
               snprintf(path, sizeof path, "%s/rawspu_%016llX_%05X.bin", dir,
                        (unsigned long long)fp, s->get_lo[r]);
@@ -321,7 +330,13 @@ static void raw_spu_start(raw_spu* s)
           } }
     }
     s->get_runs = 0;
-    if (!s_pending_entry) {
+    /* Restarted with nothing new loaded (a stop-and-signal serviced by the
+     * PPU): the program it already had. */
+    if (!entry && !loaded && s->entry && s->ctx) {
+        entry = s->entry;
+        image_id = s->ctx->image_id;
+    }
+    if (!entry) {
         fprintf(stderr, "[spu-raw] spu%u run requested but no lifted image is "
                         "registered -- the SPU cannot run. Lift the image and "
                         "register it (see a port's src/spu_images.c).\n", n);
@@ -339,12 +354,12 @@ static void raw_spu_start(raw_spu* s)
     /* THE point of this whole file: local store is the guest window, not a copy.
      * The PPU keeps writing command buffers into it while the SPU runs. */
     s->ctx->ls       = vm_base + s->base;
-    s->ctx->image_id = s_pending_image_id;
-    s->entry         = s_pending_entry;
+    s->ctx->image_id = image_id;
+    s->entry         = entry;
     s->ctx->gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;      /* SPU ABI stack top */
 
     uint32_t npc = be32_load(s->base + SPU_RAW_NPC) & ~3u;
-    s->ctx->pc = npc ? npc : s_pending_elf_entry;
+    s->ctx->pc = npc ? npc : elf_entry;
 
     g_spu_force_ch_block = 1;   /* an empty RdInMbox must park, not fabricate 0 */
 
