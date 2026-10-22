@@ -4461,11 +4461,10 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                     # lwzx; add; mtctr; bctr`). A loop around the dispatch in a
                     # function with high register pressure does this; the reload
                     # read as a non-TOC definition, the dispatcher was dropped
-                    # and its bctr lifted to an unresolved indirect call (a
-                    # retail title's func_0149F9D8: 32-case table, case 1 at
-                    # 0x149FD74 unresolved, the main thread then ran on with an
-                    # uninitialised object). Follow the slot to the nearest
-                    # preceding store of it, and that register to its TOC load.
+                    # and its bctr lifted to an unresolved indirect call, so no
+                    # case of the switch ever ran. Follow the slot to the
+                    # nearest preceding store of it, and that register to its
+                    # TOC load.
                     _slot, _at = mem_disp(a[1]), w.addr
                     _src = None
                     for w2 in reversed([x for x in win_cand if x.addr < _at]):
