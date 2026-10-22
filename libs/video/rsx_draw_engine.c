@@ -114,9 +114,9 @@ typedef struct {
     int guest_dirty;       /* written since guest memory last got a copy     */
     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
     u32 used_w, used_h;    /* the clip that write went through              */
-    u32 argb;              /* depth_as_argb of the depth at argb_serial, or 0 */
-    u32 argb_w, argb_h;
-    u64 argb_serial;
+    u32 conv;              /* depth_as_color of the depth at conv_serial, or 0 */
+    u32 conv_w, conv_h, conv_fmt;
+    u64 conv_serial;
 } eng_zdepth;
 
 typedef struct {
@@ -878,8 +878,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
 
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
-    if (z->argb) g.be->texture_release(g.be->user, z->argb);
-    z->argb = 0;
+    if (z->conv) g.be->texture_release(g.be->user, z->conv);
+    z->conv = 0;
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
@@ -911,8 +911,8 @@ static u32 eng_zdepth_snapshot(u32 slot)
 }
 
 /* PS3RECOMP_ENG_DEPTH_VIA_GUEST=1 (read at engine init): a depth target read
- * as A8R8G8B8 goes through guest memory even when the backend can convert it
- * itself (eng_zdepth_argb). */
+ * as A8R8G8B8 or DEPTH16 goes through guest memory even when the backend can
+ * convert it itself (eng_zdepth_as_color). */
 static int s_depth_via_guest;
 
 /* A Z24S8 depth target read as a linear A8R8G8B8 texture of its own pitch:
@@ -926,32 +926,38 @@ static int s_depth_via_guest;
  * other reader). That holds for the zeta still bound too: a title may read
  * its depth with depth writes off and the zeta left in place, and the
  * conversion, in command order, takes the depth as the draws so far left it,
- * which is what the store reads back. Returns the view, or 0 for the store
- * through guest memory. */
-static u32 eng_zdepth_argb(u32 slot, const rsx_dsp_texture* t)
+ * which is what the store reads back.
+ * A Z16 depth target read as a linear DEPTH16 texture of its own pitch, a
+ * shadow map, takes the same way: without it every read of a freshly
+ * rendered shadow map is a wait for the GPU plus a decode and an upload of
+ * up to 2 MB. Returns the view, or 0 for the store through guest memory. */
+static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
 {
     eng_zdepth* z = &g.zdepths[slot];
     const u32 base_fmt = t->format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
-    if (s_depth_via_guest || !g.be->depth_as_argb || !g.be->surface_view ||
-        !z->handle || z->zfmt == 1u /* Z16 */ ||
-        base_fmt != RSX_TEX_FMT_A8R8G8B8 || !(t->format & RSX_TEX_FMT_LINEAR) ||
-        rsx_texture_argb_is_rgba() || t->cubemap || t->dimension == 3 || t->mipmaps > 1)
+    const int z16 = z->zfmt == 1u;      /* SURFACE_FORMAT Z16 */
+    const int bytes = base_fmt == RSX_TEX_FMT_A8R8G8B8 && !z16 && !rsx_texture_argb_is_rgba();
+    const int d16 = base_fmt == RSX_TEX_FMT_DEPTH16 && z16;
+    if (s_depth_via_guest || !g.be->depth_as_color || !g.be->surface_view ||
+        !z->handle || !(bytes || d16) || !(t->format & RSX_TEX_FMT_LINEAR) ||
+        t->cubemap || t->dimension == 3 || t->mipmaps > 1)
         return 0;
     const u32 used_w = z->used_w < z->w ? z->used_w : z->w;
     const u32 used_h = z->used_h < z->h ? z->used_h : z->h;
     if (!t->width || !t->height || t->width > used_w || t->height > used_h ||
         t->pitch != z->pitch)
         return 0;
-    if (!z->argb || z->argb_serial != z->depth_serial ||
-        z->argb_w != t->width || z->argb_h != t->height) {
-        const u32 tex = g.be->depth_as_argb(g.be->user, z->handle, t->width, t->height);
+    if (!z->conv || z->conv_serial != z->depth_serial || z->conv_fmt != base_fmt ||
+        z->conv_w != t->width || z->conv_h != t->height) {
+        const u32 tex = g.be->depth_as_color(g.be->user, z->handle, t->width, t->height,
+                                             base_fmt);
         if (!tex) return 0;
-        if (z->argb) g.be->texture_release(g.be->user, z->argb);
-        z->argb = tex;
-        z->argb_w = t->width; z->argb_h = t->height;
-        z->argb_serial = z->depth_serial;
+        if (z->conv) g.be->texture_release(g.be->user, z->conv);
+        z->conv = tex;
+        z->conv_w = t->width; z->conv_h = t->height; z->conv_fmt = base_fmt;
+        z->conv_serial = z->depth_serial;
     }
-    return g.be->surface_view(g.be->user, z->argb, t->remap & 0xFFFFu, t->format);
+    return g.be->surface_view(g.be->user, z->conv, t->remap & 0xFFFFu, t->format);
 }
 
 /* ---- textures ------------------------------------------------------------ */
@@ -1336,7 +1342,10 @@ static int eng_zdepth_to_guest(u32 slot)
             if (!(d > 0.0f)) d = 0.0f;
             if (d > 1.0f) d = 1.0f;
             if (bpp == 2u) {
-                const u32 v = (u32)(d * 65535.0f + 0.5f);
+                /* Exactly round(d * 0xFFFF), as depth_as_color takes it: in
+                 * float the product rounds first and a value within 0.002 of
+                 * a half could go the other way. */
+                const u32 v = (u32)((double)d * 65535.0 + 0.5);
                 dst[0] = (u8)(v >> 8); dst[1] = (u8)v;
             } else {
                 /* Float32 rounding at this magnitude can turn depth 1 into
@@ -2169,8 +2178,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                 if (snap) { textures[u] = snap; continue; }
             }
-            const u32 argb = eng_zdepth_argb((u32)zsrc, &t);
-            if (argb) { textures[u] = argb; continue; }
+            const u32 conv = eng_zdepth_as_color((u32)zsrc, &t);
+            if (conv) { textures[u] = conv; continue; }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
@@ -2975,7 +2984,7 @@ void rsx_draw_engine_shutdown(void)
         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
     }
     for (u32 i = 0; i < g.n_zdepths; i++) {
-        if (g.zdepths[i].argb) g.be->texture_release(g.be->user, g.zdepths[i].argb);
+        if (g.zdepths[i].conv) g.be->texture_release(g.be->user, g.zdepths[i].conv);
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
     }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
