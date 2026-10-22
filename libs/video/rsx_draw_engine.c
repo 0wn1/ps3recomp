@@ -921,16 +921,19 @@ static int s_depth_via_guest;
  * and decodes and uploads the texture again, every time the depth changed:
  * at several reads a frame that is most of the FIFO thread. The backend
  * converts it on the GPU instead, in command order, into the texels the
- * decode would give, and
- * the unit samples a view of that with its own crossbar. Guest memory is left
- * as it was (guest_dirty stays set for any other reader). Returns the view, or
- * 0 for the store through guest memory. */
-static u32 eng_zdepth_argb(u32 slot, u32 current_zslot, const rsx_dsp_texture* t)
+ * decode would give, and the unit samples a view of that with its own
+ * crossbar. Guest memory is left as it was (guest_dirty stays set for any
+ * other reader). That holds for the zeta still bound too: a title may read
+ * its depth with depth writes off and the zeta left in place, and the
+ * conversion, in command order, takes the depth as the draws so far left it,
+ * which is what the store reads back. Returns the view, or 0 for the store
+ * through guest memory. */
+static u32 eng_zdepth_argb(u32 slot, const rsx_dsp_texture* t)
 {
     eng_zdepth* z = &g.zdepths[slot];
     const u32 base_fmt = t->format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
     if (s_depth_via_guest || !g.be->depth_as_argb || !g.be->surface_view ||
-        slot == current_zslot || !z->handle || z->zfmt == 1u /* Z16 */ ||
+        !z->handle || z->zfmt == 1u /* Z16 */ ||
         base_fmt != RSX_TEX_FMT_A8R8G8B8 || !(t->format & RSX_TEX_FMT_LINEAR) ||
         rsx_texture_argb_is_rgba() || t->cubemap || t->dimension == 3 || t->mipmaps > 1)
         return 0;
@@ -2166,7 +2169,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                 if (snap) { textures[u] = snap; continue; }
             }
-            const u32 argb = eng_zdepth_argb((u32)zsrc, current_zslot, &t);
+            const u32 argb = eng_zdepth_argb((u32)zsrc, &t);
             if (argb) { textures[u] = argb; continue; }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,

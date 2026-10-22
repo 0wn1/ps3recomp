@@ -1443,8 +1443,9 @@ static u32 stub_depth_as_argb(void* u, u32 d, u32 w, u32 h)
 }
 
 /* A Z24S8 pass at ZETA_OFFSET (256 x 256, pitch 1024), then the zeta moved
- * away and the unit set to read it as a linear 4x4 A8R8G8B8 of `pitch`. */
-static void depth_pass_then_read(u32 pitch)
+ * away (or, with `keep_zeta`, left bound with depth writes off) and the unit
+ * set to read it as a linear 4x4 A8R8G8B8 of `pitch`. */
+static void depth_pass_then_read_ex(u32 pitch, int keep_zeta)
 {
     m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
     m(M_SURFACE_FORMAT, 8u | (2u << 5));
@@ -1455,13 +1456,15 @@ static void depth_pass_then_read(u32 pitch)
     m(M_DEPTH_WRITE, 1u);
     m(M_TEX_UNIT + 0x0C, 0u);                  /* the pass samples nothing */
     draw_triangle();
-    m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
+    if (!keep_zeta) m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
     m(M_COLOR_MASK, 0x01010101u);
     m(M_DEPTH_TEST, 0u);
     m(M_DEPTH_WRITE, 0u);
     bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
     m(0x1840 /* control3: pitch */, pitch);
 }
+
+static void depth_pass_then_read(u32 pitch) { depth_pass_then_read_ex(pitch, 0); }
 
 static void test_depth_read_as_argb_on_gpu(void)
 {
@@ -1499,11 +1502,23 @@ static void test_depth_read_as_argb_on_gpu(void)
           "a texture of another pitch goes through guest memory (%d calls, %d readbacks)",
           g_argb_calls, stub.n_depth_readback);
 
+    /* The zeta still bound, depth writes off: converted all the same, and
+     * kept while no draw writes depth. */
+    depth_pass_then_read_ex(256u * 4u, 1);
+    draw_triangle();
+    const u32 bound = stub.bound_tex[0];
+    CHECK(g_argb_calls == 3 && stub.n_depth_readback == 1 && bound,
+          "the bound zeta is converted too, not read back (%d calls, %d readbacks)",
+          g_argb_calls, stub.n_depth_readback);
+    draw_triangle();
+    CHECK(g_argb_calls == 3 && stub.bound_tex[0] == bound,
+          "and reused while no draw wrote depth (%d calls)", g_argb_calls);
+
     /* A backend that cannot: guest memory as before. */
     g_argb_fail = 1;
     depth_pass_then_read(256u * 4u);
     draw_triangle();
-    CHECK(g_argb_calls == 3 && stub.n_depth_readback == 2 &&
+    CHECK(g_argb_calls == 4 && stub.n_depth_readback == 2 &&
           stub.bound_tex[0] == stub.last_created_texture &&
           z[0] == 0x80 && z[1] == 0x00 && z[2] == 0x00 && z[3] == 0x00,
           "refused: depth 0.5 stored as Z24S8 and decoded (%d readbacks, %02X %02X %02X %02X)",

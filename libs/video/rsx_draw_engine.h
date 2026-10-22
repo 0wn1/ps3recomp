@@ -251,8 +251,10 @@ typedef struct rsx_draw_backend {
      * Z24S8 and decoded, gives -- R = depth bits 15..8, G = bits 7..0, B = 0
      * (the stencil byte), A = bits 23..16, with depth * 0xFFFFFF rounded as
      * eng_zdepth_to_guest rounds it. Made in command order, like
-     * depth_snapshot, so no wait; the engine owns the handle. 0 when the
-     * backend cannot; NULL keeps the store through guest memory. */
+     * depth_snapshot, so no wait, and from the depth the draws so far left,
+     * which may be the target the current pass still attaches; the engine
+     * owns the handle. 0 when the backend cannot; NULL keeps the store
+     * through guest memory. */
     u32  (*depth_as_argb)(void* user, u32 depth, u32 w, u32 h);
 } rsx_draw_backend;
 
