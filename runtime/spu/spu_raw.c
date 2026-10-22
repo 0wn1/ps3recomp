@@ -257,6 +257,20 @@ static void raw_spu_run(raw_spu* s)
 
     int halted = spu_run_with_halt(s->entry, c);
 
+    /* Stopped from outside (SPU_RunCntl = 0, see raw_spu_stop): no stop
+     * code, no stop-and-signal interrupt -- just a stopped SPU. */
+    if (c->stop_request) {
+        c->status = SPU_STATUS_STOPPED;
+        publish(s);
+        fprintf(stderr, "[spu-raw] spu%u stopped by RunCntl at pc=0x%05X\n",
+                (unsigned)(s - s_spu), (unsigned)(c->pc & SPU_LS_MASK));
+        fflush(stderr);
+        spu_coh_unregister(c);
+        spu_mfc_release(c);
+        RAW_XCHG(&s->started, 0);
+        return;
+    }
+
     /* A raw SPU that returns has executed `stop`. Report it the way hardware
      * does -- run bit clear, stop bit set, stop code in the high half -- so the
      * PPU's status poll sees a real termination instead of a stuck 'running'. */
@@ -282,6 +296,37 @@ static void raw_spu_run(raw_spu* s)
             (unsigned)c->ch_out_intr_mbox.count, c->ch_out_intr_mbox.value,
             (unsigned)c->ch_in_mbox.count);
     fflush(stderr);
+}
+
+/* SPU_RunCntl = 0 on a running SPU. Hardware stops the core and the run bit
+ * clears, so the store returns once the SPU is stopped. Here the host thread
+ * must actually leave: the PPU's next steps are to stream a new program into
+ * local store and write RunCntl = 1, and a thread still parked in a channel
+ * wait would otherwise sleep through that, ignore the start ("already up")
+ * and later resume its OLD register state over the freshly loaded image.
+ * Resistance: Fall of Man does exactly this to raw SPU 1 on every checkpoint
+ * reload. */
+static void raw_spu_stop(raw_spu* s)
+{
+    spu_context* c = s->ctx;
+    if (!c) return;
+    if (!s->started) { c->status = SPU_STATUS_STOPPED; return; }
+    c->stop_request = 1;
+    spu_ch_wake(c);
+    for (int i = 0; i < 20000 && s->started; i++) {   /* up to ~4 s */
+        spu_ch_wake(c);
+#ifdef _WIN32
+        Sleep(1);
+#else
+        { struct timespec ts = {0, 200 * 1000}; nanosleep(&ts, 0); }
+#endif
+    }
+    if (s->started)
+        fprintf(stderr, "[spu-raw] spu%u did not stop on RunCntl = 0 (pc=0x%05X): "
+                        "it is not reaching a channel operation\n",
+                (unsigned)(s - s_spu), (unsigned)(c->pc & SPU_LS_MASK));
+    else
+        c->status = SPU_STATUS_STOPPED;
 }
 
 #ifdef _WIN32
@@ -343,7 +388,12 @@ static void raw_spu_start(raw_spu* s)
         fflush(stderr);
         return;
     }
-    if (RAW_CAS(&s->started, 1, 0) != 0) return;  /* already up */
+    if (RAW_CAS(&s->started, 1, 0) != 0) {        /* already up */
+        fprintf(stderr, "[spu-raw] spu%u run requested while it is still running: "
+                        "ignored\n", n);
+        fflush(stderr);
+        return;
+    }
 
     if (!s->ctx) {
         s->ctx = (spu_context*)malloc(sizeof(spu_context));
@@ -411,7 +461,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
     switch (off) {
     case SPU_RAW_RUNCNTL:
         if (val == RUNCNTL_RUN) raw_spu_start(s);
-        else if (s->ctx)        s->ctx->status = SPU_STATUS_STOPPED;
+        else                    raw_spu_stop(s);
         break;
 
     case SPU_RAW_IN_MBOX:
