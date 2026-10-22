@@ -127,9 +127,13 @@ jobs:
       # exec brings up) attaches again.
       - name: Run the Metal host-surface test
         run: |
+          # The translator is C++17 (ps3types.h); a .cpp on a plain clang line
+          # is compiled as C++98, so it is built on its own line.
+          clang++ -std=c++17 -I include -I libs/video -c libs/video/rsx_shader_msl.cpp \
+            -o /tmp/rsx_shader_msl.o
           clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_host_surface.m \
             libs/video/rsx_texture_layout.c libs/video/rsx_vertex_fetch.c libs/video/rsx_vp_decompiler.c \
-            libs/video/rsx_fp_decompiler.c libs/video/rsx_shader_msl.cpp -lc++ -Wl,-dead_strip \
+            libs/video/rsx_fp_decompiler.c /tmp/rsx_shader_msl.o -lc++ -Wl,-dead_strip \
             -framework Metal -framework Cocoa -framework QuartzCore -framework IOSurface \
             -o /tmp/test_metal_host_surface
           /tmp/test_metal_host_surface
