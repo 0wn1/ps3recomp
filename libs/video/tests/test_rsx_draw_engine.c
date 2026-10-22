@@ -71,6 +71,7 @@ typedef struct {
     int n_texture_create, n_texture_release, n_texture_upload;
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
+    u32 snapshot_w, snapshot_h;        /* the last depth snapshot request */
     int n_pipeline_create;
     rsx_be_render_state pipeline_rs;   /* the last pipeline's render state */
     int n_draw, n_clear_color, n_clear_ds, n_present;
@@ -163,7 +164,7 @@ static u32 stub_depth_create(void* u, u32 w, u32 h)
 { (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
 
 static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
-{ (void)u; (void)d; (void)w; (void)h; stub.n_depth_snapshot++; return stub_handle(); }
+{ (void)u; (void)d; stub.snapshot_w = w; stub.snapshot_h = h; stub.n_depth_snapshot++; return stub_handle(); }
 
 static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                 const rsx_be_render_state* rs,
