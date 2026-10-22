@@ -1431,6 +1431,86 @@ static void test_depth_read_as_color(void)
     engine_down();
 }
 
+/* depth_as_argb: the zeta's bytes made on the GPU, no store to guest memory. */
+static int g_argb_calls, g_argb_fail;
+static u32 g_argb_w, g_argb_h;
+static u32 stub_depth_as_argb(void* u, u32 d, u32 w, u32 h)
+{
+    (void)u; (void)d;
+    g_argb_calls++;
+    g_argb_w = w; g_argb_h = h;
+    return g_argb_fail ? 0 : stub_handle();
+}
+
+/* A Z24S8 pass at ZETA_OFFSET (256 x 256, pitch 1024), then the zeta moved
+ * away and the unit set to read it as a linear 4x4 A8R8G8B8 of `pitch`. */
+static void depth_pass_then_read(u32 pitch)
+{
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    m(M_TEX_UNIT + 0x0C, 0u);                  /* the pass samples nothing */
+    draw_triangle();
+    m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    m(0x1840 /* control3: pitch */, pitch);
+}
+
+static void test_depth_read_as_argb_on_gpu(void)
+{
+    printf("-- zeta read as A8R8G8B8, converted by the backend\n");
+    engine_up();
+    rsx_draw_backend be = g_stub_backend;
+    be.depth_as_argb = stub_depth_as_argb;
+    rsx_draw_engine_set_backend(&be);
+    g_argb_calls = 0; g_argb_fail = 0;
+    u8* z = vm_base + GUEST_LOCAL_EA + ZETA_OFFSET;
+    memset(z, 0x5A, 16);
+
+    depth_pass_then_read(256u * 4u);
+    const int uploads = stub.n_texture_create;
+    draw_triangle();
+    const u32 first = stub.bound_tex[0];
+    CHECK(g_argb_calls == 1 && g_argb_w == 4 && g_argb_h == 4 && first,
+          "the backend made the 4x4 texture (%d calls, %ux%u)", g_argb_calls, g_argb_w, g_argb_h);
+    CHECK(stub.n_depth_readback == 0 && stub.n_texture_create == uploads && z[0] == 0x5A,
+          "nothing was read back, stored or uploaded (%d readbacks)", stub.n_depth_readback);
+
+    draw_triangle();
+    CHECK(g_argb_calls == 1 && stub.bound_tex[0] == first,
+          "no depth write since: the same texture (%d calls)", g_argb_calls);
+
+    depth_pass_then_read(256u * 4u);
+    draw_triangle();
+    CHECK(g_argb_calls == 2 && stub.bound_tex[0] != first && !stub.alive[first],
+          "a new depth write: a new texture, the old one released (%d calls)", g_argb_calls);
+
+    /* Another pitch is not the zeta's layout: guest memory as before. */
+    depth_pass_then_read(512u * 4u);
+    draw_triangle();
+    CHECK(g_argb_calls == 2 && stub.n_depth_readback == 1,
+          "a texture of another pitch goes through guest memory (%d calls, %d readbacks)",
+          g_argb_calls, stub.n_depth_readback);
+
+    /* A backend that cannot: guest memory as before. */
+    g_argb_fail = 1;
+    depth_pass_then_read(256u * 4u);
+    draw_triangle();
+    CHECK(g_argb_calls == 3 && stub.n_depth_readback == 2 &&
+          stub.bound_tex[0] == stub.last_created_texture &&
+          z[0] == 0x80 && z[1] == 0x00 && z[2] == 0x00 && z[3] == 0x00,
+          "refused: depth 0.5 stored as Z24S8 and decoded (%d readbacks, %02X %02X %02X %02X)",
+          stub.n_depth_readback, z[0], z[1], z[2], z[3]);
+    engine_down();
+}
+
 static void test_color_read_as_float(void)
 {
     printf("-- colour target read as X32_FLOAT\n");
@@ -1624,6 +1704,7 @@ int main(void)
     test_depth_clear_value();
     test_antialiased_surface();
     test_depth_read_as_color();
+    test_depth_read_as_argb_on_gpu();
     test_color_read_as_float();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();

@@ -114,6 +114,9 @@ typedef struct {
     int guest_dirty;       /* written since guest memory last got a copy     */
     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
     u32 used_w, used_h;    /* the clip that write went through              */
+    u32 argb;              /* depth_as_argb of the depth at argb_serial, or 0 */
+    u32 argb_w, argb_h;
+    u64 argb_serial;
 } eng_zdepth;
 
 typedef struct {
@@ -875,6 +878,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
 
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
+    if (z->argb) g.be->texture_release(g.be->user, z->argb);
+    z->argb = 0;
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
@@ -903,6 +908,47 @@ static u32 eng_zdepth_snapshot(u32 slot)
     z->snapshot = tex;
     z->snapshot_valid = 1;
     return tex;
+}
+
+/* PS3RECOMP_ENG_DEPTH_VIA_GUEST=1 (read at engine init): a depth target read
+ * as A8R8G8B8 goes through guest memory even when the backend can convert it
+ * itself (eng_zdepth_argb). */
+static int s_depth_via_guest;
+
+/* A Z24S8 depth target read as a linear A8R8G8B8 texture of its own pitch:
+ * a deferred renderer rebuilding depth from the bytes. Storing it into guest
+ * memory for that (eng_zdepth_to_guest) waits for the GPU, converts on the CPU
+ * and decodes and uploads the texture again, every time the depth changed:
+ * at several reads a frame that is most of the FIFO thread. The backend
+ * converts it on the GPU instead, in command order, into the texels the
+ * decode would give, and
+ * the unit samples a view of that with its own crossbar. Guest memory is left
+ * as it was (guest_dirty stays set for any other reader). Returns the view, or
+ * 0 for the store through guest memory. */
+static u32 eng_zdepth_argb(u32 slot, u32 current_zslot, const rsx_dsp_texture* t)
+{
+    eng_zdepth* z = &g.zdepths[slot];
+    const u32 base_fmt = t->format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
+    if (s_depth_via_guest || !g.be->depth_as_argb || !g.be->surface_view ||
+        slot == current_zslot || !z->handle || z->zfmt == 1u /* Z16 */ ||
+        base_fmt != RSX_TEX_FMT_A8R8G8B8 || !(t->format & RSX_TEX_FMT_LINEAR) ||
+        rsx_texture_argb_is_rgba() || t->cubemap || t->dimension == 3 || t->mipmaps > 1)
+        return 0;
+    const u32 used_w = z->used_w < z->w ? z->used_w : z->w;
+    const u32 used_h = z->used_h < z->h ? z->used_h : z->h;
+    if (!t->width || !t->height || t->width > used_w || t->height > used_h ||
+        t->pitch != z->pitch)
+        return 0;
+    if (!z->argb || z->argb_serial != z->depth_serial ||
+        z->argb_w != t->width || z->argb_h != t->height) {
+        const u32 tex = g.be->depth_as_argb(g.be->user, z->handle, t->width, t->height);
+        if (!tex) return 0;
+        if (z->argb) g.be->texture_release(g.be->user, z->argb);
+        z->argb = tex;
+        z->argb_w = t->width; z->argb_h = t->height;
+        z->argb_serial = z->depth_serial;
+    }
+    return g.be->surface_view(g.be->user, z->argb, t->remap & 0xFFFFu, t->format);
 }
 
 /* ---- textures ------------------------------------------------------------ */
@@ -2120,6 +2166,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                 if (snap) { textures[u] = snap; continue; }
             }
+            const u32 argb = eng_zdepth_argb((u32)zsrc, current_zslot, &t);
+            if (argb) { textures[u] = argb; continue; }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
@@ -2883,6 +2931,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
     g.height = height ? height : 720;
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
+    { const char* e = getenv("PS3RECOMP_ENG_DEPTH_VIA_GUEST");
+      s_depth_via_guest = e && *e && strcmp(e, "0") != 0; }
     g.vp_cb = (u8*)calloc(1, ENG_VP_CB_BYTES);
     if (!g.vp_cb) return -1;
     if (g.be->init && g.be->init(g.be->user, g.width, g.height) != 0) {
@@ -2921,8 +2971,10 @@ void rsx_draw_engine_shutdown(void)
         if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
     }
-    for (u32 i = 0; i < g.n_zdepths; i++)
+    for (u32 i = 0; i < g.n_zdepths; i++) {
+        if (g.zdepths[i].argb) g.be->texture_release(g.be->user, g.zdepths[i].argb);
         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
+    }
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);
