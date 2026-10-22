@@ -28,7 +28,6 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel);   /* spu_channels.c */
 /* What the runtime would provide. */
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
-void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
 PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*))
 { (void)nid; (void)name; (void)fn; }
