@@ -89,14 +89,18 @@ set_tests_properties(sync_stress PROPERTIES
     TIMEOUT 120
 )
 # The same suite with MUTEX_WATCH=1, which turns an infinite sys_mutex_lock
-# into 5 s timed slices that report the owner (POSIX; Windows ignores it).
-# The diagnostic must not cost the lock any of its guarantees.
-add_test(NAME sync_stress_mutex_watch COMMAND sync_stress)
-set_tests_properties(sync_stress_mutex_watch PROPERTIES
-    LABELS "stress;runtime;sync"
-    TIMEOUT 120
-    ENVIRONMENT "MUTEX_WATCH=1"
-)
+# into 5 s timed slices that report the owner, and with MUTEX_WATCH=2, which
+# keeps the blocking lock and has a reporter thread name long waiters (POSIX;
+# Windows ignores both). The diagnostic must not cost the lock any of its
+# guarantees.
+foreach(watch 1 2)
+    add_test(NAME sync_stress_mutex_watch${watch} COMMAND sync_stress)
+    set_tests_properties(sync_stress_mutex_watch${watch} PROPERTIES
+        LABELS "stress;runtime;sync"
+        TIMEOUT 120
+        ENVIRONMENT "MUTEX_WATCH=${watch}"
+    )
+endforeach()
 
 # The focused condition tests use Win32 host threads. POSIX execution also
 # needs the waitable-handle implementation supplied by the native host port.
