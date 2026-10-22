@@ -132,6 +132,9 @@ int main(void)
 /* The rest of the runtime the channel layer links against; none of it is on
  * the paths exercised here. */
 unsigned long long ps3_ms_now(void) { return 0; }
+/* spu_workload.c retains the LV2 runner's publication call at link time;
+ * the raw SPUs here never go through an LV2 SPU thread. */
+void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
 uint32_t g_barrier_sync_watch;
 uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
