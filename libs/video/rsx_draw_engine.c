@@ -100,6 +100,7 @@ typedef struct {
     u32 feedback;          /* last immutable own-target copy, engine-owned */
     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
     int guest_dirty;        /* rendered since guest memory last got a copy   */
+    u32 last_use;           /* g.frames when last bound, sampled or presented */
 } eng_surface;
 
 typedef struct {
@@ -117,6 +118,7 @@ typedef struct {
     u32 conv;              /* depth_as_color of the depth at conv_serial, or 0 */
     u32 conv_w, conv_h, conv_fmt;
     u64 conv_serial;
+    u32 last_use;          /* g.frames when last bound or sampled             */
 } eng_zdepth;
 
 typedef struct {
@@ -549,6 +551,33 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
     return g.tex_staging;
 }
 
+/* The surface and zeta tables keep every target a title has rendered to, and
+ * nothing used to take an entry out. A title that runs through enough scenes
+ * fills both 64-entry tables, and a target created after that got no slot: a
+ * shadow map was rendered nowhere and read back as zeros from guest memory, so
+ * every shadow it casts was lost. A full table now gives up the entry used
+ * longest ago, if that was before the previous frame; anything this frame or
+ * the last one used stays, and with nothing older the table is too small for
+ * the frame and the caller gets no slot, as before. What an evicted target
+ * held and guest memory never got is gone, as it is for any address the
+ * engine never saw. Returns the slot, or ENG_INVALID. */
+#define ENG_EVICT_MIN_AGE 2u
+static u32 eng_oldest_slot(const char* what, const u32* last_use, size_t stride, u32 n, u32 keep)
+{
+    u32 best = ENG_INVALID, best_use = 0;
+    for (u32 i = 0; i < n; i++) {
+        const u32 use = *(const u32*)((const u8*)last_use + i * stride);
+        if (i == keep || g.frames - use < ENG_EVICT_MIN_AGE) continue;
+        if (best == ENG_INVALID || use < best_use) { best = i; best_use = use; }
+    }
+    static u32 evict_logs = 0, full_logs = 0;
+    if (best != ENG_INVALID ? PS3_LOG_FIRST(evict_logs, 4) : PS3_LOG_FIRST(full_logs, 8))
+        fprintf(stderr, "[rsx engine] %s table full: %s\n", what,
+                best == ENG_INVALID ? "every entry was used this frame or the last, none evicted"
+                                    : "evicting the least recently used");
+    return best;
+}
+
 /* The colour target for this (location, offset), created or reallocated when
  * the size or format moved. Returns a slot index, or ENG_INVALID.
  * rsx_live_draw.c's surface_get (2605-2690).
@@ -571,8 +600,10 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
             const eng_surface* s = &g.surfaces[i];
             if (s->fmt == want_fmt &&
                 ((s->w == want_w && s->h == want_h) ||
-                 (pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h)))
+                 (pitch && s->pitch == pitch && s->w >= want_w && s->h >= want_h))) {
+                g.surfaces[i].last_use = g.frames;
                 return i;
+            }
             slot = i;
             break;
         }
@@ -587,9 +618,16 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                     slot < ENG_MAX_SURFACES ? "existing" : "absent");
         return slot < ENG_MAX_SURFACES ? slot : ENG_INVALID;
     }
+    int evicted = 0;
     if (slot == ENG_MAX_SURFACES) {
-        if (g.n_surfaces >= ENG_MAX_SURFACES) return ENG_INVALID;
-        slot = g.n_surfaces;
+        if (g.n_surfaces < ENG_MAX_SURFACES) {
+            slot = g.n_surfaces;
+        } else {
+            slot = eng_oldest_slot("surface", &g.surfaces[0].last_use, sizeof(eng_surface),
+                                   g.n_surfaces, g.last_present_surface);
+            if (slot == ENG_INVALID) return ENG_INVALID;
+            evicted = 1;
+        }
     }
 
     u32 seed_row = 0;
@@ -598,7 +636,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
                                                  want_w, want_h, seed, seed_row);
     if (!handle)
-        return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
+        return (!evicted && slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
 
     eng_surface* s = &g.surfaces[slot];
     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
@@ -608,6 +646,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->handle = handle;
     s->color_serial = 0;
     s->guest_dirty = 0;
+    s->last_use = g.frames;
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 16))
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
@@ -860,25 +899,33 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     for (u32 i = 0; i < g.n_zdepths; i++) {
         eng_zdepth* z = &g.zdepths[i];
         if (z->location == location && z->offset == offset) {
-            if (z->w >= want_w && z->h >= want_h) return i;
+            if (z->w >= want_w && z->h >= want_h) { z->last_use = g.frames; return i; }
             slot = i;
             if (want_w < z->w) want_w = z->w;
             if (want_h < z->h) want_h = z->h;
             break;
         }
     }
+    int evicted = 0;
     if (slot == ENG_MAX_ZDEPTHS) {
-        if (g.n_zdepths >= ENG_MAX_ZDEPTHS) return ENG_INVALID;
-        slot = g.n_zdepths;
+        if (g.n_zdepths < ENG_MAX_ZDEPTHS) {
+            slot = g.n_zdepths;
+        } else {
+            slot = eng_oldest_slot("zeta", &g.zdepths[0].last_use, sizeof(eng_zdepth),
+                                   g.n_zdepths, ENG_INVALID);
+            if (slot == ENG_INVALID) return ENG_INVALID;
+            evicted = 1;
+        }
     }
 
     const u32 handle = g.be->depth_target_create(g.be->user, want_w, want_h);
     if (!handle)
-        return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
+        return (!evicted && slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
 
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
     if (z->conv) g.be->texture_release(g.be->user, z->conv);
+    if (z->snapshot) g.be->texture_release(g.be->user, z->snapshot);
     z->conv = 0;
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
@@ -889,6 +936,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->snapshot_valid = 0;
     z->depth_serial = 0;
     z->guest_dirty = 0;
+    z->last_use = g.frames;
     if (slot == g.n_zdepths) g.n_zdepths++;
     return slot;
 }
@@ -2152,6 +2200,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 g.surfaces[i].offset != t.offset)
                 continue;
             surface_at = (int)i;
+            g.surfaces[i].last_use = g.frames;
             /* A current attachment requires an ordered immutable copy; it
              * cannot be sampled directly while the host pass writes it. */
             for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
@@ -2167,8 +2216,10 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             const eng_zdepth* z = &g.zdepths[i];
             if (z->location != t.location || z->offset != t.offset || !z->depth_serial)
                 continue;
-            if (surface_at < 0 || z->depth_serial > g.surfaces[surface_at].color_serial)
+            if (surface_at < 0 || z->depth_serial > g.surfaces[surface_at].color_serial) {
                 zsrc = (int)i;
+                g.zdepths[i].last_use = g.frames;
+            }
             break;
         }
         if (zsrc >= 0) {
@@ -2236,6 +2287,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             for (u32 i = 0; i < g.n_zdepths; i++)
                 if (g.zdepths[i].location == t.location &&
                     g.zdepths[i].offset == t.offset && current_zslot != i) {
+                    g.zdepths[i].last_use = g.frames;
                     const u32 snap = eng_zdepth_snapshot(i);
                     if (snap) textures[u] = snap;
                     break;
@@ -2881,6 +2933,7 @@ static void eng_present(u32 buffer_id)
     if (!g.ready) return;
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
+    g.surfaces[target].last_use = g.frames;
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
         u32 current = eng_current_surface();
         fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u\n",

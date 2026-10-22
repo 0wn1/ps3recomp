@@ -1583,6 +1583,92 @@ static void test_z16_read_as_depth16_on_gpu(void)
     engine_down();
 }
 
+/* A depth-writing draw through a 256x256 Z24S8 zeta at `offset`; returns the
+ * depth target it was given, or 0. */
+static u32 depth_draw_at(u32 offset)
+{
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, offset);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    m(M_TEX_UNIT + 0x0C, 0u);
+    stub.bound_depth = 0;
+    draw_triangle();
+    return stub.bound_depth;
+}
+
+/* The zeta and surface tables used to keep every target forever: once 64
+ * addresses had been rendered to, a new one got no slot, and a level loaded
+ * after enough cutscenes rendered its shadow maps nowhere. A full table now
+ * gives up the entry used longest ago, but never one used this frame or the
+ * last, and a texture read counts as a use. */
+static void test_full_tables_evict_the_oldest(void)
+{
+    printf("-- full surface and zeta tables evict the least recently used\n");
+    engine_up();
+#define ZETA_AT(k) (0x00100000u + (u32)(k) * 0x1000u)
+    u32 h[64];
+    for (u32 k = 0; k < 64; k++) h[k] = depth_draw_at(ZETA_AT(k));
+    CHECK(h[0] && h[63], "64 zetas got depth targets");
+    rsx_draw_engine_present();
+    rsx_draw_engine_present();
+
+    /* Zeta 1 is read as a texture this frame, through zeta 63. */
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_AT(1));
+    m(0x1840 /* control3: pitch */, 256u * 4u);
+    draw_triangle();
+
+    int creates = stub.n_depth_create;
+    const u32 n64 = depth_draw_at(ZETA_AT(64));
+    CHECK(n64 && stub.n_depth_create == creates + 1 && !stub.alive[h[0]],
+          "a 65th zeta takes the oldest one's slot (%d creates, zeta 0 %s)",
+          stub.n_depth_create - creates, stub.alive[h[0]] ? "alive" : "released");
+    const u32 n65 = depth_draw_at(ZETA_AT(65));
+    CHECK(n65 && stub.alive[h[1]] && !stub.alive[h[2]] && stub.alive[h[63]],
+          "the next skips the zeta read this frame and the one bound (1 %d, 2 %d, 63 %d)",
+          stub.alive[h[1]], stub.alive[h[2]], stub.alive[h[63]]);
+
+    /* Zetas 3..62 are the only old ones left; after them nothing is evicted. */
+    u32 made = 0;
+    for (u32 k = 66; k < 66 + 61; k++) {
+        creates = stub.n_depth_create;
+        depth_draw_at(ZETA_AT(k));
+        if (stub.n_depth_create == creates + 1) made++;
+    }
+    CHECK(made == 60 && stub.alive[h[1]] && stub.alive[h[63]] && stub.alive[n64],
+          "60 more evict zetas 3..62, then a full table of this frame's zetas refuses (%u)", made);
+#undef ZETA_AT
+
+    /* Colour surfaces: the same rule, and the presented one stays. */
+    const u32 base_color = stub.bound_rt[0];
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_CONTEXT_DMA_ZETA, 0u);
+    u32 c[64];
+    for (u32 k = 0; k < 63; k++) {
+        m(M_COLOR_A_OFFSET, 0x00200000u + k * 0x10000u);
+        draw_triangle();
+        c[k] = stub.bound_rt[0];
+    }
+    rsx_draw_engine_present();
+    rsx_draw_engine_present();
+    creates = stub.n_color_create;
+    m(M_COLOR_A_OFFSET, 0x00200000u + 63u * 0x10000u);
+    draw_triangle();
+    CHECK(stub.n_color_create == creates + 1 && !stub.alive[base_color] &&
+          stub.alive[c[62]] && stub.alive[c[0]],
+          "a 65th surface takes the oldest one's slot, not the presented one's (%d creates)",
+          stub.n_color_create - creates);
+    engine_down();
+}
+
 static void test_color_read_as_float(void)
 {
     printf("-- colour target read as X32_FLOAT\n");
@@ -1778,6 +1864,7 @@ int main(void)
     test_depth_read_as_color();
     test_depth_read_as_argb_on_gpu();
     test_z16_read_as_depth16_on_gpu();
+    test_full_tables_evict_the_oldest();
     test_color_read_as_float();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
