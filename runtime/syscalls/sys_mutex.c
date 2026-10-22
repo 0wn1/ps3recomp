@@ -8,6 +8,7 @@
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   /* getenv */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -217,7 +218,25 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         }
     }
 #else
-    if (timeout_us == 0) {
+    static int s_watch = -1;
+    if (s_watch < 0) s_watch = getenv("MUTEX_WATCH") ? 1 : 0;
+    if (timeout_us == 0 && s_watch) {
+        /* MUTEX_WATCH=1: an infinite lock waits in 5 s slices and says who it
+         * is waiting on, so a guest deadlock names its two threads. */
+        unsigned waited = 0;
+        for (;;) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 5;
+            if (pthread_mutex_timedlock(&m->mtx, &ts) == 0) break;
+            waited += 5;
+            fprintf(stderr, "[mutex] tid=%llu waiting %us on mutex %u '%.8s' "
+                    "owner tid=%llu count=%u lr=0x%08X\n",
+                    (unsigned long long)caller_tid, waited, mutex_id, m->name,
+                    (unsigned long long)m->owner_tid, (unsigned)m->lock_count,
+                    (uint32_t)ctx->lr);
+        }
+    } else if (timeout_us == 0) {
         pthread_mutex_lock(&m->mtx);
     } else {
         struct timespec ts;
