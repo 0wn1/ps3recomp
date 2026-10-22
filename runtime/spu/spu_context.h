@@ -294,6 +294,14 @@ typedef struct spu_context {
         int verify_state, source_index;
     } resident_code[4];
 
+    /* Dispatch cache (spu_lifted_lookup, spu_channels.c). dcache_id names this
+     * context's current lifetime: 0 after spu_context_init (or a zeroed
+     * allocation) until its first cached dispatch, so a context reset at the
+     * same address never meets an earlier lifetime's entries. dcache_residency
+     * is bumped on every change to resident_code, dropping the cached
+     * resolutions of this context. */
+    uint32_t dcache_id, dcache_residency;
+
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
      * for co-resident tasks. A taskset may hold several tasks that all lift at the
      * SAME LS base (the shared task-code region at LS 0x3000+), so an LS address
