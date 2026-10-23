@@ -21,9 +21,19 @@
  * Environment:
  *   PS3_TITLE              window title (default: HOST_WINDOW_TITLE, built in)
  *   PS3RECOMP_METAL_FPS=1  FPS in the title and [RSX FPS] lines, as the backend's
- *                          own window does; guest FPS comes from the game
+ *                          own window does; guest FPS comes from the game.
+ *                          A line ends in hidden=1 while the window is off
+ *                          screen (below)
  *   PS3RECOMP_HOST_STATS=1 once a second: publish->screen latency, frames
  *                          copied/dropped, and this process's CPU time
+ *
+ * Off screen: macOS shows nothing of a window that is not on screen: another
+ * app or Space in front (a full-screen window has a Space of its own, so
+ * bringing any other app to the front hides it), minimized, or fully covered.
+ * Presents go on and are dropped unseen, so the display rate reads 0 while the
+ * guest's goes on, which in a log looks like a frozen picture. The window logs
+ * when it leaves the screen and when it is back, and shows the newest frame as
+ * soon as it is back.
  *
  * If the bootstrap service cannot be registered the program is exec'd
  * directly and opens its own window, as it would without this launcher.
@@ -73,6 +83,8 @@ static struct {
     NSString*            title;
     int                  present_busy;
     uint64_t             shown_seq;
+    int                  off_screen;       /* see "Off screen" above */
+    double               off_since;
     /* the game */
     pid_t                child;
     int                  closing;
@@ -290,6 +302,23 @@ static void try_present(void)
     }
 }
 
+/* The window's occlusion changed: on screen or not (see "Off screen" at the
+ * top). Logged both ways, so a run of display=0 reads as what it is. */
+static void note_on_screen(int on, double now)
+{
+    const int off = !on;
+    if (off == g.off_screen) return;
+    g.off_screen = off;
+    if (!on) {
+        g.off_since = now;
+        fprintf(stderr, "[host window] window off screen (another app or Space in front, minimized or "
+                        "covered): its frames are not shown until it is back\n");
+        return;
+    }
+    fprintf(stderr, "[host window] window on screen again after %.1f s\n", now - g.off_since);
+    try_present();
+}
+
 /* Black until the game's first frame, rather than whatever the drawable held. */
 static void present_black(void)
 {
@@ -325,8 +354,9 @@ static void stats_tick(void)
         g.window.title = [NSString stringWithFormat:
             @"%@ | display %.1f FPS | guest %.1f FPS | %.1f ms avg / %.1f p95 / %.1f max | age %.1f s",
             g.title, r.display_fps, r.guest_fps, r.average_ms, r.p95_ms, r.worst_ms, r.age_seconds];
-        fprintf(stderr, "[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f\n",
-                r.display_fps, r.guest_fps, r.average_ms, r.p95_ms, r.worst_ms, r.age_seconds);
+        fprintf(stderr, "[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f%s\n",
+                r.display_fps, r.guest_fps, r.average_ms, r.p95_ms, r.worst_ms, r.age_seconds,
+                g.off_screen ? " hidden=1" : "");
     }
     if (g.stats_on) {
         struct rusage ru;
@@ -421,6 +451,11 @@ static pid_t spawn_child(char** argv)
 @interface HostWindowDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @end
 @implementation HostWindowDelegate
+- (void)windowDidChangeOcclusionState:(NSNotification*)note
+{
+    (void)note;
+    note_on_screen((g.window.occlusionState & NSWindowOcclusionStateVisible) != 0, CACurrentMediaTime());
+}
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)app
 {
     (void)app;

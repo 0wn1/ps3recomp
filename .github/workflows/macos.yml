@@ -138,6 +138,16 @@ jobs:
             -o /tmp/test_metal_host_surface
           /tmp/test_metal_host_surface
 
+      # The host window off screen: it logs leaving and coming back, its
+      # [RSX FPS] lines say hidden=1 meanwhile, and coming back shows the
+      # newest frame the game published while it was away.
+      - name: Run the host window off-screen test
+        run: |
+          clang -fobjc-arc -I libs/video tools/host_window/test_host_window_offscreen.m \
+            -framework AppKit -framework Metal -framework QuartzCore -framework IOSurface \
+            -o /tmp/test_host_window_offscreen
+          /tmp/test_host_window_offscreen
+
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
