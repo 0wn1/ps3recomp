@@ -306,13 +306,24 @@ static void raw_spu_start(raw_spu* s)
      * Ports register each image's executable segment too (build_spu_workloads
      * .text fingerprint), so one of the GET runs matches it. */
     for (int r = 0; !entry && r < s->get_runs; r++) {
-        uint64_t fp = spu_workload_fingerprint(vm_base + s->base + s->get_lo[r],
-                                               s->get_hi[r] - s->get_lo[r]);
+        const uint8_t* run = vm_base + s->base + s->get_lo[r];
+        const uint32_t run_len = s->get_hi[r] - s->get_lo[r];
+        uint64_t fp = spu_workload_fingerprint(run, run_len);
+        uint64_t masked_fp = 0;
         entry = spu_workload_find_img(fp, &image_id);
-        fprintf(stderr, "[spu-raw] spu%u proxy-loaded LS 0x%05X..0x%05X fp=0x%016llX npc=0x%05X -> %s\n",
+        /* A program that carries a parameter block the PPU fills in before
+         * every load (pointers, per-level values) never fingerprints the same
+         * twice; it is registered with that area masked out. */
+        if (!entry)
+            entry = spu_workload_find_img_masked(run, run_len, &masked_fp, &image_id);
+        char how[64] = "";
+        if (entry && masked_fp)
+            snprintf(how, sizeof how, " (fp=0x%016llX with its parameter area zeroed)",
+                     (unsigned long long)masked_fp);
+        fprintf(stderr, "[spu-raw] spu%u proxy-loaded LS 0x%05X..0x%05X fp=0x%016llX npc=0x%05X -> %s%s\n",
                 n, s->get_lo[r], s->get_hi[r], (unsigned long long)fp,
                 be32_load(s->base + SPU_RAW_NPC) & ~3u,
-                entry ? "lifted entry registered" : "no match");
+                entry ? "lifted entry registered" : "no match", how);
         /* SPU_RAW_DUMP_DIR=<dir>: write an unmatched run out as
          * rawspu_<fp>_<lo>.bin -- the bytes exactly as they sit in local store
          * at <lo>, which is the base to lift them at. */
