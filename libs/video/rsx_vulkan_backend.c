@@ -455,6 +455,7 @@ static void vk_eng_flush(void);
 static int vk_eb_active(void);       /* batching decided on and on */
 static u32 vk_eb_max(void);
 static void vk_eb_recorded(void);   /* one more command in the open batch */
+static void vk_eb_release(void);    /* engine shutdown: rings and pool */
 static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src, size_t tight,
                         u32 rows, u32 row_bytes);   /* -2: not batched, do it the old way */
 
@@ -2281,6 +2282,7 @@ static void vk_eng_shutdown(void* user)
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
     vk_eng_snapshot_pool_drain();
+    vk_eb_release();
 }
 
 static void vk_eng_submit_and_wait(void* user, u32 reason)
@@ -2581,6 +2583,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
 #define VK_SNAP_POOL 8
 static struct { vk_image im; VkFormat fmt; u32 w, h; } s_snap_pool[VK_SNAP_POOL];
 static u32 s_snap_pool_n;
+static vk_buffer s_snap_st;         /* depth snapshot bounce buffer (vk_eng_depth_snapshot) */
 
 static void vk_eng_snapshot_recycle(vk_eng_obj* o)
 {
@@ -2599,6 +2602,7 @@ static void vk_eng_snapshot_pool_drain(void)
 {
     for (u32 i = 0; i < s_snap_pool_n; i++) vk_destroy_image(&s_snap_pool[i].im);
     s_snap_pool_n = 0;
+    vk_destroy_buffer(&s_snap_st);
 }
 
 static u32 vk_eng_color_snapshot(void* user, u32 surface)
@@ -2695,7 +2699,6 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
      * copies join the open batch instead of a submission of their own; the
      * draws that sample the snapshot come after them in the same buffer, and
      * each batched draw starts with a full memory barrier. */
-    static vk_buffer s_snap_st;
     const VkDeviceSize need = (VkDeviceSize)w * h * 4u;
     if (s_snap_st.size < need) {
         vk_destroy_buffer(&s_snap_st);                   /* flushes a pending batch first */
@@ -3429,6 +3432,20 @@ static int vk_eb_on(void)
     VK_LOG("draw batching: on (up to %u draws per submission)\n", s_eb.max_draws);
     s_eb.on = 1;
     return 1;
+}
+
+/* The rings and the pool live until the engine shuts down; a later vk_eb_on
+ * decides again. Also frees what a failed vk_eb_on had already created. */
+static void vk_eb_release(void)
+{
+    if (s_eb_pending) vk_eng_flush();
+    vk_destroy_buffer(&s_eb.vb);
+    vk_destroy_buffer(&s_eb.ib);
+    vk_destroy_buffer(&s_eb.ub);
+    vk_destroy_buffer(&s_eb.sb);
+    if (s_eb.pool) pvkDestroyDescriptorPool(s_vk.device, s_eb.pool, NULL);
+    memset(&s_eb, 0, sizeof s_eb);
+    s_eb.on = -1;
 }
 
 static int vk_eb_active(void) { return s_eb.on == 1; }
