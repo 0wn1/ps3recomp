@@ -19,6 +19,10 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (vo
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void sys_event_queue_cancel_by_id(uint32_t id) { (void)id; }
 void sys_event_queue_uncancel_by_id(uint32_t id) { (void)id; }
+/* The lifted-job runner references the lv2 publication service even when
+ * this test only drives misses. A miss must never create a live context. */
+void spu_thread_publish_ctx(uint32_t tid, void* ctx)
+{ (void)tid; (void)ctx; abort(); }
 /* cellSpurs-side hooks the runtime units reference; a miss never reaches them. */
 uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 unsigned long long ps3_ms_now(void) { return 0; }
