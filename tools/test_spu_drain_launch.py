@@ -19,6 +19,24 @@ args = parser.parse_args()
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
 source = (SPU / 'spu_drain.c').read_text()
+# CI has already configured its compiler matrix before discovering this suite.
+# Honor explicit overrides, then use that configured compiler rather than `cc`
+# (which would silently run GCC in both Linux matrix entries).
+cc = os.environ.get('CC')
+cache = ROOT / 'build/CMakeCache.txt'
+if not cc and cache.is_file():
+    match = re.search(r'^CMAKE_C_COMPILER:[^=]+=([^\r\n]+)$', cache.read_text(), re.M)
+    if match:
+        configured = match[1]
+        # clang-cl uses MSVC driver flags; clang shares its backend/target and
+        # accepts the portable flags used by this standalone fixture.
+        if Path(configured).stem.lower() == 'clang-cl':
+            configured = str(Path(configured).with_name('clang' + Path(configured).suffix))
+        cc = configured
+if not cc:
+    cc = shutil.which('clang') if os.name == 'nt' else 'cc'
+assert cc, 'a C compiler is required'
+print('drain preservation compiler:', cc, flush=True)
 
 
 def depth_history(result):
@@ -40,8 +58,6 @@ with tempfile.TemporaryDirectory(prefix='spu-drain-launch-') as td:
                  '-I' + str(ROOT / 'runtime/platform')]
         if sanitize:
             flags += ['-fsanitize=undefined', '-fno-sanitize-recover=all']
-        cc = os.environ.get('CC') or (shutil.which('clang') if os.name == 'nt' else 'cc')
-        assert cc, 'a C compiler is required'
         command = [cc, *flags, str(SPU / 'tests/test_spu_drain_launch.c'), str(path),
                    *[str(SPU / (unit + '.c')) for unit in UNITS],
                    str(ROOT / 'runtime/platform/win32_compat.c'),
