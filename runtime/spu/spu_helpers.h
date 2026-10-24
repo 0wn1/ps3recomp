@@ -512,6 +512,52 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
  * default QNaN 0x7FF8000000000000.
  * --------------------------------------------------------------------------------------- */
 
+/* MSVC has no __int128 (CI builds Windows with clang-cl, which does): the
+ * exact-float helpers below run the same math on an explicit hi/lo pair. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+typedef struct { uint64_t hi, lo; } spu__u128;
+static inline spu__u128 spu__u128_from64(uint64_t v) { spu__u128 r; r.hi = 0; r.lo = v; return r; }
+static inline spu__u128 spu__u128_shl(spu__u128 v, int n) {   /* n < 128; results here stay < 2^127 */
+    if (n >= 64) { v.hi = v.lo << (n - 64); v.lo = 0; }
+    else if (n > 0) { v.hi = (v.hi << n) | (v.lo >> (64 - n)); v.lo <<= n; }
+    return v;
+}
+static inline spu__u128 spu__u128_add(spu__u128 a, spu__u128 b) {
+    const uint64_t old = a.lo; a.hi += b.hi; a.lo += b.lo; if (a.lo < old) a.hi++; return a;
+}
+static inline spu__u128 spu__u128_sub(spu__u128 a, spu__u128 b) {   /* a >= b */
+    const uint64_t old = a.lo; a.hi -= b.hi; a.lo -= b.lo; if (a.lo > old) a.hi--; return a;
+}
+static inline int spu__u128_eq(spu__u128 a, spu__u128 b) { return a.hi == b.hi && a.lo == b.lo; }
+static inline int spu__u128_gt(spu__u128 a, spu__u128 b) { return a.hi > b.hi || (a.hi == b.hi && a.lo > b.lo); }
+static inline int spu__u128_top(spu__u128 v) {                  /* floor(log2(v)), v != 0 */
+    unsigned long i;
+    if (v.hi) { _BitScanReverse64(&i, v.hi); return 64 + (int)i; }
+    _BitScanReverse64(&i, v.lo); return (int)i;
+}
+/* (uint32_t)(sig >> (top - 23)) for top >= 23, else (uint32_t)(sig << (23 - top)) */
+static inline uint32_t spu__u128_frac24(spu__u128 v, int top) {
+    if (top >= 23) {
+        const int n = top - 23;             /* 0..103; true result < 2^24 */
+        if (n >= 64) return (uint32_t)(v.hi >> (n - 64));
+        if (n == 0) return (uint32_t)v.lo;
+        return (uint32_t)((v.hi << (64 - n)) | (v.lo >> n));
+    }
+    return (uint32_t)(v.lo << (23 - top));  /* top < 23 -> hi == 0 */
+}
+static inline uint32_t spu__sf_pack128(uint32_t sign, spu__u128 sig, int e2) {
+    const int top = spu__u128_top(sig);     /* sig in [2^top, 2^(top+1)) */
+    const int biased = top + e2 + 127;
+    if (biased > 255) return sign | 0x7FFFFFFFu;
+    if (biased < 1)   return 0;
+    return sign | ((uint32_t)biased << 23) | (spu__u128_frac24(sig, top) & 0x7FFFFFu);
+}
+/* 64-bit-value entry point: sig < 2^64 (products and integer conversions). */
+static inline uint32_t spu__sf_pack(uint32_t sign, uint64_t sig, int e2) {
+    return spu__sf_pack128(sign, spu__u128_from64(sig), e2);
+}
+#else
 /* Exact value sign * sig * 2^e2 (sig > 0) as an SPU single: keep the top 24 bits of sig
  * (truncation), then saturate above Smax / flush below Smin. */
 static inline uint32_t spu__sf_pack(uint32_t sign, unsigned __int128 sig, int e2) {
@@ -523,6 +569,7 @@ static inline uint32_t spu__sf_pack(uint32_t sign, unsigned __int128 sig, int e2
     const uint32_t m24 = top >= 23 ? (uint32_t)(sig >> (top - 23)) : (uint32_t)(sig << (23 - top));
     return sign | ((uint32_t)biased << 23) | (m24 & 0x7FFFFFu);
 }
+#endif
 /* An SPU single as sig * 2^e2 with a 24-bit sig; returns 0 for zero (biased exponent 0). */
 static inline int spu__sf_split(uint32_t x, uint32_t* sig, int* e2) {
     const uint32_t be = (x >> 23) & 0xFFu;
@@ -532,6 +579,22 @@ static inline int spu__sf_split(uint32_t x, uint32_t* sig, int* e2) {
     return 1;
 }
 /* Exact sum of two signed terms s1*m1*2^e1 + s2*m2*2^e2 (m1, m2 < 2^48, both nonzero), truncated. */
+#if defined(_MSC_VER)
+static inline uint32_t spu__sf_sum(uint32_t s1, uint64_t m1, int e1, uint32_t s2, uint64_t m2, int e2) {
+    if (e1 < e2) { uint32_t ts = s1; s1 = s2; s2 = ts; uint64_t tm = m1; m1 = m2; m2 = tm; int te = e1; e1 = e2; e2 = te; }
+    const int d = e1 - e2;                                 /* term 1 has the higher exponent */
+    if (d > 79) {                                          /* term 2 < 2^(e1-31): below term 1's last bit */
+        if (s1 == s2) return spu__sf_pack128(s1, spu__u128_from64(m1), e1);
+        spu__u128 v = spu__u128_shl(spu__u128_from64(m1), 1); v.lo -= 1;   /* 2*m1 >= 2: no borrow */
+        return spu__sf_pack128(s1, v, e1 - 1);
+    }
+    const spu__u128 a = spu__u128_shl(spu__u128_from64(m1), d), b = spu__u128_from64(m2);
+    if (s1 == s2) return spu__sf_pack128(s1, spu__u128_add(a, b), e2);
+    if (spu__u128_eq(a, b)) return 0;
+    return spu__u128_gt(a, b) ? spu__sf_pack128(s1, spu__u128_sub(a, b), e2)
+                              : spu__sf_pack128(s2, spu__u128_sub(b, a), e2);
+}
+#else
 static inline uint32_t spu__sf_sum(uint32_t s1, uint64_t m1, int e1, uint32_t s2, uint64_t m2, int e2) {
     if (e1 < e2) { uint32_t ts = s1; s1 = s2; s2 = ts; uint64_t tm = m1; m1 = m2; m2 = tm; int te = e1; e1 = e2; e2 = te; }
     const int d = e1 - e2;                                 /* term 1 has the higher exponent */
@@ -544,6 +607,7 @@ static inline uint32_t spu__sf_sum(uint32_t s1, uint64_t m1, int e1, uint32_t s2
     if (a == b) return 0;
     return a > b ? spu__sf_pack(s1, a - b, e2) : spu__sf_pack(s2, b - a, e2);
 }
+#endif
 static inline uint32_t spu__fa_lane(uint32_t x, uint32_t y) {
     uint32_t mx, my; int ex, ey;
     const int nx = spu__sf_split(x, &mx, &ex), ny = spu__sf_split(y, &my, &ey);

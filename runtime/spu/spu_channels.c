@@ -988,7 +988,7 @@ void spu_ch_wake(spu_context* ctx)
  * two waits is a busy span, tagged with the lifted image and the SPURS workload
  * id the kernel keeps at LS 0x1DC (SpursKernelContext.wklCurrentId) when it
  * goes idle. Waits shorter than PS3_FTRACE_MIN_US do not split a busy span. */
-static __thread uint64_t t_ft_busy0;
+static SPU_TLS uint64_t t_ft_busy0;
 
 static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
 {

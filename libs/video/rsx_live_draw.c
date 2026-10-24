@@ -85,7 +85,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <stdio.h>
 #include <stdlib.h>
 
-#if defined(YZ_PERF_CLEAN)
+#if defined(YZ_PERF_CLEAN) || defined(_MSC_VER)
 #define LD_DIAG_ENABLED(name) 0
 #else
 /* Cached per call site: several of these sit on per-draw paths. */
