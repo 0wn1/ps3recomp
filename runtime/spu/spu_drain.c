@@ -431,6 +431,8 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         ctx->irq_frame = &f;
                     }
                     if (setjmp(f.env) == 0) {
+                        extern void spu_jmp_no_unwind(void*);   /* spu_channels.c */
+                        spu_jmp_no_unwind(f.env);
                         vf(ctx);
                     } else {
                         /* iret fired deeper: registers restored, pc = srr0 */

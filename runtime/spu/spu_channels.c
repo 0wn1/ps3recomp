@@ -112,6 +112,25 @@ void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc
 static SPU_TLS jmp_buf s_spu_halt_env;
 static SPU_TLS int     s_spu_halt_armed = 0;
 
+/* Call right after a setjmp returned 0. On 64-bit Windows longjmp unwinds every
+ * host frame between it and its setjmp (RtlUnwindEx, a function-table lookup
+ * and a virtual unwind per frame), several microseconds per jump; with the
+ * buffer's Frame zeroed it restores the registers directly. These jumps --
+ * a halt back to spu_run_with_halt, an iret back to the drain loop that took
+ * the interrupt -- only cross C frames of this runtime and of lifted code,
+ * which have no destructors or __finally blocks to run. SPU_LONGJMP_UNWIND=1
+ * keeps the unwinding jump. */
+void spu_jmp_no_unwind(void* env)
+{
+#if defined(_WIN64) && defined(_MSC_VER)
+    static int s_unwind = -1;
+    if (s_unwind < 0) s_unwind = getenv("SPU_LONGJMP_UNWIND") ? 1 : 0;
+    if (!s_unwind) ((_JUMP_BUFFER*)env)->Frame = 0;
+#else
+    (void)env;
+#endif
+}
+
 /* A non-local return replaces the old host call chain without changing
  * any architectural registers, local store, or pending guest work. */
 void spu_restart_dispatch(spu_context* ctx)
@@ -256,6 +275,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         SPU_DRAIN(ctx);
         break;
     default:
+        spu_jmp_no_unwind(s_spu_halt_env);
         /* SPU_DRAIN trampoline model: the top-level entry runs until its first
          * cross-function tail transfer, which sets g_spu_trampoline_fn and
          * returns; the drain loop re-enters each queued target until the SPU
