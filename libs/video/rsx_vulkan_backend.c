@@ -2819,6 +2819,7 @@ static struct {
     u32          scratch_w, scratch_h;
     u32          pipeline;
     u32          vs_bytes, ps_bytes;
+    u8*          ucpu;                /* the constants, in the shared UBO's layout */
     u32          tex[RSX_BE_MAX_TEXTURES];
     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES];
     u32          tex_mask;
@@ -3188,29 +3189,39 @@ static void vk_eng2_shutdown(void* user)
     if (s_e2.split_pipe_layout) pvkDestroyPipelineLayout(s_vk.device, s_e2.split_pipe_layout, NULL);
     if (s_e2.split_pool)        pvkDestroyDescriptorPool(s_vk.device, s_e2.split_pool, NULL);
     if (s_e2.split_layout)      pvkDestroyDescriptorSetLayout(s_vk.device, s_e2.split_layout, NULL);
+    free(s_e2.ucpu);
     memset(&s_e2, 0, sizeof s_e2);
     for (u32 i = 0; i < s_esamp_count; i++) pvkDestroySampler(s_vk.device, s_esamp[i].s, NULL);
     s_esamp_count = 0;
 }
 
-/* Constants go straight into the shared UBO: vertex at 0, pixel at ps_off.
- * Every operation is waited on, so overwriting per draw is safe. */
+/* Constants are kept in ordinary memory laid out like the shared UBO (vertex
+ * at 0, pixel at ps_off) and copied to the GPU per draw: into the draw's ring
+ * slice when batched, into the shared UBO otherwise (every such draw is waited
+ * on, so overwriting it is safe). Writing them straight into the UBO meant a
+ * batched draw read them back out of it, and that memory is host-coherent,
+ * i.e. write-combined and uncached on most drivers. */
+static u8* vk_eng_ucpu(void)
+{
+    if (!s_e2.ucpu && s_g.ubo.size) s_e2.ucpu = (u8*)calloc(1, (size_t)s_g.ubo.size);
+    return s_e2.ucpu;
+}
 static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
-    if (!s_g.on || !data) { s_e2.vs_bytes = 0; return; }
+    if (!s_g.on || !data || !vk_eng_ucpu()) { s_e2.vs_bytes = 0; return; }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
-    memcpy(s_g.ubo.ptr, data, bytes);
+    memcpy(s_e2.ucpu, data, bytes);
     s_e2.vs_bytes = bytes;
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
-    if (!s_g.on || !data) { s_e2.ps_bytes = 0; return; }
+    if (!s_g.on || !data || !vk_eng_ucpu()) { s_e2.ps_bytes = 0; return; }
     const u32 cap = (u32)(s_g.ubo.size - s_g.ps_off);
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 4u)) { VK_LOG("engine: PS constants truncated\n"); s_e2.warned |= 4u; } }
-    memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, data, bytes);
+    memcpy(s_e2.ucpu + s_g.ps_off, data, bytes);
     s_e2.ps_bytes = bytes;
 }
 static void vk_eng_bind_textures(void* user, const u32* textures,
@@ -3620,8 +3631,8 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
                 if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) == VK_SUCCESS) {
                     s_eb.sets++;
                     s_eb.vb_head = vh; s_eb.ib_head = ih; s_eb.ub_head = uh;
-                    memcpy((u8*)s_eb.ub.ptr + uvs, s_g.ubo.ptr, vsb);
-                    memcpy((u8*)s_eb.ub.ptr + ups, (const u8*)s_g.ubo.ptr + s_g.ps_off, psb);
+                    memcpy((u8*)s_eb.ub.ptr + uvs, vk_eng_ucpu(), vsb);
+                    memcpy((u8*)s_eb.ub.ptr + ups, vk_eng_ucpu() + s_g.ps_off, psb);
                     if (!vk_eng_write_descriptors_to(P, set, s_eb.ub.buf, uvs, ups)) return;
                     break;
                 }
@@ -3649,6 +3660,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
             memcpy(s_e2.indices.ptr, indices, (size_t)ibytes);
         }
         vbuf = s_vk.vertices.buf; ibuf = s_e2.indices.buf; voff = ioff = 0;
+        if (!vk_eng_ucpu()) return;
+        memcpy(s_g.ubo.ptr, s_e2.ucpu, vsb);
+        memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, s_e2.ucpu + s_g.ps_off, psb);
         set = vk_eng_write_descriptors(P);
         if (!set) return;
         if (vk_begin()) return;
