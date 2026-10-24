@@ -6,6 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "spu_lockstep.h"
 #include <setjmp.h>
 /* setjmp/longjmp also save and restore the signal mask on POSIX: one
  * sigprocmask system call per halt, stack reset or task resume. These frames
@@ -97,7 +98,8 @@ SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn,
 {
     recent->pc[recent->n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
-    spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    if (spu_stack_reset_needed(ctx))
+        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     if (!spu_task_launch_diagnostics() && !g_pm_flow_ctx &&
         (!ctx->steps || (ctx->pc & SPU_LS_MASK))) {
         ctx->steps++;
@@ -110,6 +112,20 @@ SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn,
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
     spu_task_launch_check_inline(ctx, fn, &t_recent);
+}
+
+SPU_DRAIN_INLINE void spu_drain_hop_inline(spu_context* ctx,
+    void (*fn)(spu_context*), spu_recent_history* recent)
+{
+    /* Read the live gate each hop. -1 still takes the original initialization
+     * path; a callee can enable lockstep before the next checkpoint. */
+    if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx);
+    spu_task_launch_check_inline(ctx, (void*)fn, recent);
+}
+
+void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*))
+{
+    spu_drain_hop_inline(ctx, fn, &t_recent);
 }
 
 static void spu_task_launch_slow(spu_context* ctx)
@@ -385,13 +401,14 @@ void (*spu_take_interrupt(spu_context* ctx,
 }
 
 /* See the declaration in spu_context.h. */
-void spu_depth_guard(spu_context* ctx)
+uint32_t g_spu_depth_guard_limit;
+SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
 {
-    static uint32_t s_max = 0;
-    if (!s_max) {
+    if (!g_spu_depth_guard_limit) {
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
-        s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+        g_spu_depth_guard_limit = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
     }
+    const uint32_t s_max = g_spu_depth_guard_limit;
 
     /* Ring of recent drain sites. When the depth trips, the useful question is
      * not "where are we" but "what cycle got us here" -- one pc names a point,
@@ -453,7 +470,7 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
-    spu_depth_guard(ctx);
+    spu_depth_guard_check(ctx);
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
      * after the handler's first host function returns -- the handler keeps
      * running as trampolines of this loop -- until its iret fires or the
@@ -475,8 +492,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
-            yz_lockstep_tick(ctx);
-            spu_task_launch_check_inline(ctx, (void*)fn, recent);
+            spu_drain_hop_inline(ctx, fn, recent);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
