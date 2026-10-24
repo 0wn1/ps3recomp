@@ -61,7 +61,8 @@ extern void spu_halt(spu_context*);
  * ended where it should not have (spurs_policy.c, [pm-end]). */
 /* One thread-local object: every Darwin TLV access is a call, and this runs
  * on every drain transfer. */
-static _Thread_local struct { uint32_t pc[32]; uint32_t n; } t_recent;
+typedef struct spu_recent_history { uint32_t pc[32]; uint32_t n; } spu_recent_history;
+static _Thread_local spu_recent_history t_recent;
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 {
     unsigned n = t_recent.n < 32 ? t_recent.n : 32, k = n < max ? n : max;
@@ -71,8 +72,10 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 
 #if defined(_MSC_VER)
 #define SPU_DRAIN_COLD __declspec(noinline)
+#define SPU_DRAIN_INLINE static __forceinline
 #else
 #define SPU_DRAIN_COLD __attribute__((noinline, cold))
+#define SPU_DRAIN_INLINE static inline __attribute__((always_inline))
 #endif
 static SPU_DRAIN_COLD void spu_task_launch_slow(spu_context* ctx);
 
@@ -86,12 +89,13 @@ static int spu_task_launch_diagnostics(void)
     return s_on;
 }
 
-/* Runs on every drain transfer. The common case -- no diagnostics, not a
- * branch to LS 0 -- stays here; everything else is out of line so this
- * function needs no frame of its own. */
-void spu_task_launch_check(spu_context* ctx, void* fn)
+/* A drain may resolve the history TLS address once for its owning frame.
+ * Keep checkpoint order: stack reset can unwind before steps increment, and
+ * guest calls can change PM-flow, PC and steps before the next hop. */
+SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn,
+                                                  spu_recent_history* recent)
 {
-    t_recent.pc[t_recent.n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    recent->pc[recent->n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     if (!spu_task_launch_diagnostics() && !g_pm_flow_ctx &&
@@ -100,6 +104,12 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
         return;
     }
     spu_task_launch_slow(ctx);
+}
+
+/* Preserve the public checkpoint for generated and independent callers. */
+void spu_task_launch_check(spu_context* ctx, void* fn)
+{
+    spu_task_launch_check_inline(ctx, fn, &t_recent);
 }
 
 static void spu_task_launch_slow(spu_context* ctx)
@@ -450,6 +460,9 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
+    /* Nested contexts/drains share this thread's cursor. Only its address is
+     * stable across guest calls and IRQ longjmps, never the stored contents. */
+    spu_recent_history* const recent = &t_recent;
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
@@ -463,7 +476,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             yz_lockstep_tick(ctx);
-            spu_task_launch_check(ctx, (void*)fn);
+            spu_task_launch_check_inline(ctx, (void*)fn, recent);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
