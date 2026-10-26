@@ -417,9 +417,9 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Changelog
 
-### v0.18.0 — *"One Hundred Fifty-Three"* (October 2026)
+### v0.18.0 — *"One Hundred Fifty-Five"* (October 2026)
 
-*153 pull requests from ten contributors, merged in #594. The biggest batch so
+*155 pull requests, 152 of them from ten contributors, merged in #594. The biggest batch so
 far, and a different shape from the last few: less of it comes from one port
 and more of it is platform work that every port gets. D3D12 and Metal both
 grow a real pipeline cache, raw SPUs run on macOS and Linux, the SPU helpers
@@ -447,9 +447,7 @@ the hot loops are now all behind gates.*
 - **Vulkan**: per-target colour mask and blend enable for MRT sets (#516);
   `VK_DRAW_BATCH=1` records engine draws, snapshots, uploads and clears into a
   single submission (*[@MaChInEgUn3](https://github.com/MaChInEgUn3)*, #532),
-  with readback staging reused and changed textures refreshed in place (#552);
-  each draw gets its own vertices, indices, constants and descriptor set
-  (*[@Kurtisone](https://github.com/Kurtisone)*, #536).
+  with readback staging reused and changed textures refreshed in place (#552).
 - **Draw engine**: a scissored `CLEAR_SURFACE` clears only the scissor (#560),
   user clip planes are honoured (#537), and so is the polygon offset (#562). A
   depth read as a texture converts on the GPU, with eviction from full
@@ -625,6 +623,13 @@ the hot loops are now all behind gates.*
 - `runtime/spu/tests/test_spu_int_neon.c` and `test_spu_float_neon.c` run on
   the macOS arm64 job. The integer one had never been compiled by any
   workflow on any platform; neither had been built for NEON on an arm64 host.
+
+**Known issue**
+- You Don't Know Jack can hang at boot in a SPURS `EventFlagWait` that no
+  workload ever sets. The race is on v0.17.0 too (1 run in 4), but this
+  release hits it far more often (4 in 4 on the regression gate). It climbs
+  across several merges rather than coming from one PR, and is being chased
+  separately.
 
 ### v0.17.0 — *"Thirty-Three"* (October 2026)
 
