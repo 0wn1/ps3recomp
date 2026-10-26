@@ -28,6 +28,15 @@ extern "C" {
 #  define SPU_ALIGN16 __attribute__((aligned(16)))
 #endif
 
+/* Out-of-line debug probes: keep them out of the hot path. MSVC C has no
+ * __attribute__ spelling (CI covers Windows with clang-cl, which accepts
+ * both), so the MSVC dialect is __declspec(noinline) and drops `cold`. */
+#if defined(_MSC_VER)
+#  define SPU_NOINLINE_COLD __declspec(noinline)
+#else
+#  define SPU_NOINLINE_COLD __attribute__((noinline, cold))
+#endif
+
 /* Local store size: 256 KB */
 #define SPU_LS_SIZE         (256 * 1024)
 #define SPU_LS_MASK         (SPU_LS_SIZE - 1)
@@ -499,7 +508,7 @@ SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
 SPU_GATE int g_wws_read_probe = 0;
-static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
+static SPU_NOINLINE_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
     /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
@@ -563,7 +572,7 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     return v;
 }
 
-static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, u128 val)
+static SPU_NOINLINE_COLD void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, u128 val)
 {
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode) {
         extern int g_wws_code_probe;   /* defined in spu_channels.c, capped */
@@ -594,7 +603,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* 
 }
 /* SPU_SMC_WATCH, out of line: g_spu_smc_watch is -1 until read, then 0/1. */
 extern int g_spu_smc_watch;
-static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
+static SPU_NOINLINE_COLD void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
 {
     if (g_spu_smc_watch < 0) g_spu_smc_watch = getenv("SPU_SMC_WATCH") ? 1 : 0;
     /* SPU_SMC_WATCH=<img>: self-modification detector. Log any store whose
