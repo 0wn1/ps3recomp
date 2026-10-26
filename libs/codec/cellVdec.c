@@ -84,18 +84,27 @@ typedef struct {
 
 static VdecSlot s_vdec[MAX_VDEC];
 
+/* The handle the guest sees is the slot index plus one, never 0: some
+ * titles treat a 0 handle as "no decoder open".
+ * Killzone 2's movie player keeps the handle as its "decoder open" flag and
+ * never submits an AU while it is 0, so slot 0's old handle 0 stalled its
+ * intro movie. VDEC_SLOT_OF maps 0 and any other handle out of range to
+ * MAX_VDEC, which every entry point rejects with CELL_VDEC_ERROR_ARG. */
+#define VDEC_HANDLE_OF(slot) ((CellVdecHandle)((u32)(slot) + 1u))
+#define VDEC_SLOT_OF(h)      (((u32)(h) - 1u) < MAX_VDEC ? (u32)(h) - 1u : (u32)MAX_VDEC)
+
 /* Deliver a vdec message to the guest callback (handle, msgType, msgData,
  * cbArg). It is a guest OPD, so it goes through g_ps3_guest_caller; this used
  * to call it as a host function pointer, which crashes the first time a
  * title's callback is reached.
  * ponytail: synchronous on the caller's thread, like adec_notify; give it a
  * decoder thread if a title's callback ever blocks on the DecodeAu caller. */
-static void vdec_notify(CellVdecHandle handle, u32 msg_type, s32 msg_data)
+static void vdec_notify(u32 slot, u32 msg_type, s32 msg_data)
 {
-    if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return;
-    const VdecSlot* v = &s_vdec[handle];
+    if (slot >= MAX_VDEC || !s_vdec[slot].in_use) return;
+    const VdecSlot* v = &s_vdec[slot];
     if (!v->cbFunc || !g_ps3_guest_caller) return;
-    g_ps3_guest_caller(v->cbFunc, (u64)handle, (u64)msg_type,
+    g_ps3_guest_caller(v->cbFunc, (u64)VDEC_HANDLE_OF(slot), (u64)msg_type,
                        (u64)(s64)msg_data, (u64)v->cbArg, 0, 0, 0, 0);
 }
 
@@ -154,14 +163,14 @@ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
 /* PICOUT for each picture the last decoder call queued. The count is taken
  * under the lock; the callbacks run outside it, because a title's PICOUT
  * handler may call GetPicItem/GetPicture right away. */
-static void vdec_notify_new_pics(CellVdecHandle handle)
+static void vdec_notify_new_pics(u32 slot)
 {
     VDEC_LOCK();
-    u32 n = s_vdec[handle].newPics;
-    s_vdec[handle].newPics = 0;
+    u32 n = s_vdec[slot].newPics;
+    s_vdec[slot].newPics = 0;
     VDEC_UNLOCK();
     while (n--)
-        vdec_notify(handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
+        vdec_notify(slot, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
 }
 
 /* Idle drain. libavcodec holds back the pictures a B-frame stream may still
@@ -202,7 +211,8 @@ static void* vdec_idle_thread(void* arg)
                 v->idleDrained = 1;
                 vdec_ff_drain(v->ff, vdec_on_picture, v);
                 printf("[cellVdec] handle %u idle %llu ms: drained to %u of %u pictures\n",
-                       h, (unsigned long long)idle_ms, v->picsDecoded, v->auCount);
+                       (u32)VDEC_HANDLE_OF(h), (unsigned long long)idle_ms,
+                       v->picsDecoded, v->auCount);
                 drained = 1;
             }
             VDEC_UNLOCK();
@@ -283,8 +293,8 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
             s_vdec[i].cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
             s_vdec[i].ff = vdec_ff_open(codec_type);
             VDEC_UNLOCK();
-            vm_write32((u32)(uintptr_t)handle, (u32)i);
-            printf("[cellVdec] Open -> handle=%u\n", i);
+            vm_write32((u32)(uintptr_t)handle, (u32)VDEC_HANDLE_OF(i));
+            printf("[cellVdec] Open -> handle=%u\n", (u32)VDEC_HANDLE_OF(i));
             if (s_vdec[i].ff) {
                 printf("[cellVdec] decoding with libavcodec\n");
                 vdec_idle_thread_start();
@@ -314,6 +324,7 @@ s32 cellVdecOpenEx(const CellVdecType* type, const CellVdecResource* res,
 s32 cellVdecClose(CellVdecHandle handle)
 {
     printf("[cellVdec] Close(handle=%u)\n", handle);
+    handle = VDEC_SLOT_OF(handle);
 
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
         return (s32)CELL_VDEC_ERROR_ARG;
@@ -332,6 +343,7 @@ s32 cellVdecClose(CellVdecHandle handle)
 s32 cellVdecStartSeq(CellVdecHandle handle)
 {
     printf("[cellVdec] StartSeq(handle=%u)\n", handle);
+    handle = VDEC_SLOT_OF(handle);
 
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
         return (s32)CELL_VDEC_ERROR_ARG;
@@ -355,6 +367,7 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
 s32 cellVdecEndSeq(CellVdecHandle handle)
 {
     printf("[cellVdec] EndSeq(handle=%u)\n", handle);
+    handle = VDEC_SLOT_OF(handle);
 
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
         return (s32)CELL_VDEC_ERROR_ARG;
@@ -379,6 +392,7 @@ s32 cellVdecEndSeq(CellVdecHandle handle)
 s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auInfo)
 {
     (void)mode;
+    handle = VDEC_SLOT_OF(handle);
 
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
         return (s32)CELL_VDEC_ERROR_ARG;
@@ -405,7 +419,7 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
       if (s_log < 0) s_log = (getenv("VDEC_TRACE") || ps3_log_verbose()) ? 1 : 0;
       if (s_log)
           printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
-                 handle, au.startAddr, au.size,
+                 (u32)VDEC_HANDLE_OF(handle), au.startAddr, au.size,
                  (unsigned long long)au.pts); }
 
     if (v->ff) {
@@ -537,6 +551,7 @@ static void vdec_write_pic_type(CellVdecHandle handle, const VdecPic* q)
  * consuming it; cellVdecGetPicture is what takes it off the queue. */
 s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
 {
+    handle = VDEC_SLOT_OF(handle);
     u32 out = (u32)(uintptr_t)picItem;
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !out)
         return (s32)CELL_VDEC_ERROR_ARG;
@@ -593,6 +608,7 @@ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alph
 
 s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
 {
+    handle = VDEC_SLOT_OF(handle);
     u32 fmt_ea = (u32)(uintptr_t)format, dst = (u32)(uintptr_t)outBuff;
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !fmt_ea)
         return (s32)CELL_VDEC_ERROR_ARG;
@@ -645,6 +661,7 @@ s32 cellVdecGetPictureExt(CellVdecHandle handle, const void* format,
                           void* outBuff, u32 arg4)
 {
     (void)arg4;
+    handle = VDEC_SLOT_OF(handle);
     u32 fmt_ea = (u32)(uintptr_t)format, dst = (u32)(uintptr_t)outBuff;
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !s_vdec[handle].ff)
         return CELL_OK;
@@ -661,6 +678,7 @@ s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode)
 {
     printf("[cellVdec] SetFrameRate(handle=%u, code=%u)\n",
            handle, frameRateCode);
+    handle = VDEC_SLOT_OF(handle);
 
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
         return (s32)CELL_VDEC_ERROR_ARG;
