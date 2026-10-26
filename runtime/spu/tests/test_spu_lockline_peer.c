@@ -302,7 +302,10 @@ static int llar_completes_under_held_lock(uint32_t ea)
         return -1;
     }
     while (!atomic_load(&g_llar_entered)) YieldProcessor();
-    for (int i = 0; i < 2000 && !atomic_load(&g_llar_done); i++) Sleep(1);
+    /* About 2 s either way. Windows rounds Sleep(1) up to its ~15.6 ms timer
+     * tick, so 2000 x Sleep(1) was ~31 s per expected-blocking case there and
+     * the harness's 30 s timeout killed a passing run. */
+    for (int i = 0; i < 200 && !atomic_load(&g_llar_done); i++) Sleep(10);
     int done = atomic_load(&g_llar_done);
     spu_lockline_unlock();
     pthread_join(t, NULL);
