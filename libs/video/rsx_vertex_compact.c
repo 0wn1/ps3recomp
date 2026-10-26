@@ -362,8 +362,8 @@ int rsx_vertex_fetch_many(
         const u32 first = fetch->stable_first;
         const u32 span = fetch->stable_last - first;
         const u32 fstride = fetch->stride;
-        const int plain = fetch->desc.frequency <= 1;
         const u32 modulo = (plan->divider_mask >> attr) & 1u;
+        const int plain = rsx_vertex_freq_plain(fetch->desc.frequency, modulo);
         const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
         switch (type) {
         case RSX_VTX_TYPE_FLOAT:
