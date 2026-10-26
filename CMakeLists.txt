@@ -426,6 +426,11 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
 
     endif()
+    add_executable(test_rsx_present_policy tests/test_rsx_present_policy.c)
+    target_include_directories(test_rsx_present_policy PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
