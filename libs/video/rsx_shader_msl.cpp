@@ -115,8 +115,20 @@ bool msl_keep_fast()
     return keep_fast != 0;
 }
 
+/* PS3RECOMP_MSL_INVARIANT=0: a vertex program's position is not marked
+ * [[invariant]] (see spirv_to_msl). */
+bool msl_invariant()
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_MSL_INVARIANT");
+        on = !(e && *e && atoi(e) == 0);
+    }
+    return on != 0;
+}
+
 /* SPIR-V -> MSL into `out`. Returns false with the reason in `log`. */
-bool spirv_to_msl(const std::vector<unsigned int>& spirv, char* out, u32 out_size,
+bool spirv_to_msl(const std::vector<unsigned int>& spirv, bool vertex, char* out, u32 out_size,
                   char* log, u32 log_size)
 {
     spvc_context ctx = nullptr;
@@ -169,6 +181,24 @@ bool spirv_to_msl(const std::vector<unsigned int>& spirv, char* out, u32 out_siz
         if (!msl_keep_fast())
             for (size_t at = 0; (at = text.find("fast::", at)) != std::string::npos; at += 9)
                 text.replace(at, 6, "precise::");
+        /* An invariant position. Titles draw the same geometry twice with
+         * two different vertex programs, the second pass testing EQUAL
+         * against the first one's depth: Resistance: Fall of Man's foliage
+         * writes depth through an alpha-tested program, then colour through
+         * one that also lights, with SET_DEPTH_FUNC EQUAL. The RSX executes
+         * the position arithmetic instruction by instruction, so both
+         * programs land on the same depth. The Metal compiler optimises each
+         * program on its own (fusing a multiply and an add into one FMA in
+         * one and not the other), the depths can differ in the last bit, and
+         * the EQUAL pass then leaves holes. [[invariant]] (with
+         * MTLCompileOptions' preserveInvariance, which the backend sets)
+         * makes the compiler compute the position the same way in every
+         * program that computes it the same way. PS3RECOMP_MSL_INVARIANT=0
+         * turns it off (msl_invariant). */
+        if (vertex && msl_invariant()) {
+            const size_t at = text.find("[[position]]");
+            if (at != std::string::npos) text.replace(at, 12, "[[position, invariant]]");
+        }
         if (text.size() + 1 > out_size) {
             put_log(log, log_size, "MSL output buffer too small", nullptr);
             goto done;
@@ -220,11 +250,14 @@ const std::string& cache_dir(Cache& c)
     return c.dir;
 }
 
-/* The stage, the fast-math setting, then the HLSL text. */
+/* The stage, then every switch that changes the generated MSL, then the HLSL
+ * text. A switch missing here serves one setting's output under another, and
+ * PS3RECOMP_MSL_CACHE outlives the process, so it would survive a restart. */
 std::string cache_key(const char* hlsl, int stage)
 {
     std::string key(1, (char)('0' + stage));
     key += msl_keep_fast() ? 'f' : 'p';
+    key += msl_invariant() ? 'i' : 'n';
     key += hlsl;
     return key;
 }
