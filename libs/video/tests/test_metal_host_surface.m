@@ -35,6 +35,7 @@ int  cellGcmOffsetIsDisplay(u32 off) { (void)off; return 1; }
 /* The vtable path is linked in; no draw reaches guest memory here. */
 u32  cellGcmResolveLocated(int location, u32 offset) { (void)location; return offset; }
 u32  cellGcmResolveOffset(u32 offset) { return offset; }
+void ps3_host_quit(const char* why) { (void)why; }   /* Cmd+Q in the backend (cellSysutil.c) */
 u8*  vm_base;
 
 /* ---- the launcher fixture ------------------------------------------------ */
