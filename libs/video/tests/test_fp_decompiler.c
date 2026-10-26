@@ -520,6 +520,29 @@ int main(void)
         check_absent("persp_off_no_helper", hlsl, "_rsx_inv_w");
     }
 
+    /* WPOS follows the SET_SHADER_WINDOW convention through fp_alpha.y/.z in a
+     * buffered program; an unbuffered one has no fp_alpha and reads the host
+     * position as before. A program that does not read WPOS gets no helper. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(0) | END); /* MOV r0, WPOS */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check("wpos_buffered_read",   hlsl, "_rsx_wpos(input.position)");
+        check("wpos_buffered_helper", hlsl,
+              "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
+              "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z, (p).z, (p).w)");
+        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
+        check("wpos_unbuffered_identity", hlsl, "#define _rsx_wpos(p) (p)\n");
+
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV r0, COL0 */
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_absent("wpos_no_read_no_helper", hlsl, "_rsx_wpos");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
