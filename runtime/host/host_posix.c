@@ -1462,7 +1462,7 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--clip-keep") == 0) do_draw = 17;
     }
 #if !defined(__APPLE__)
-    if (do_draw == 15 || do_draw == 16 || do_draw == 17) {
+    if (do_draw == 15) {
         printf("[host] --border: the %s backend does not honour SET_TEXTURE_BORDER_COLOR yet; skipped\n",
                HOST_BACKEND_NAME);
         return 0;
