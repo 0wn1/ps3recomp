@@ -136,6 +136,14 @@ void spu_direct_init(void)
     g_spu_direct = on;
 }
 
+static void spu_job_ls0_note(const spu_context* ctx)
+{
+    static int _n = 0;
+    if (PS3_LOG_FIRST(_n, 8))
+        fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
+                ctx->image_id);
+}
+
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
     spu_task_launch_check_inline(ctx, fn, &t_recent);
@@ -178,10 +186,7 @@ static void spu_task_launch_slow(spu_context* ctx)
 
     if (!s_no_ls0 && ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
         !ctx->policy_mode && ctx->image_id > 0) {
-        static int _n = 0;
-        if (PS3_LOG_FIRST(_n, 8))
-            fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
-                    ctx->image_id);
+        spu_job_ls0_note(ctx);
         if (s_et >= 0 && ctx->image_id == s_et) {
             fprintf(stderr, "[spu-exit] img=%d last PCs:", ctx->image_id);
             for (int i = 32; i >= 1; i--)
@@ -495,10 +500,14 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
                         " -- lifted call recursion, halting the SPU\n",
                 ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->host_depth);
-        fprintf(stderr, "[spu-depth] recent drain sites (oldest first):");
-        uint32_t start = (s_n > RING) ? (s_n - RING) : 0;
-        for (uint32_t k = start; k < s_n; k++)
-            fprintf(stderr, " %05X", s_ring[k % RING]);
+        /* When the depth trips, the useful question is not "where are we"
+         * but "what cycle got us here" -- one pc names a point, a ring names
+         * the loop. The hop ring is this thread's own. */
+        uint32_t r[32];
+        const unsigned n = spu_recent_pcs(r, 32);
+        fprintf(stderr, "[spu-depth] recent hops (oldest first):");
+        for (unsigned k = 0; k < n; k++)
+            fprintf(stderr, " %05X", r[k]);
         fprintf(stderr, "\n");
         fflush(stderr);
     }
@@ -531,6 +540,48 @@ int spu_tailret_enabled(void)
  * reaches return_pc; only a pc with no lifted code behind it is unwound. */
 typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
+
+/* The hooks every trampoline hop runs, with their common case inline. Each
+ * SPU thread takes millions of hops a second, and per hop they were three
+ * calls into two files that nearly always returned at once: about a fifth of
+ * an SPU thread's time in God of War HD gameplay. The full checks still run
+ * when one of their switches is set, and the lockstep and stack-reset hooks
+ * whenever those are in use. */
+static int s_hop_full = -1;   /* a switch spu_task_launch_check reads is set */
+static __attribute__((noinline)) int spu_hop_full_read(void)
+{
+    s_hop_full = (getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
+                  getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN")) ? 1 : 0;
+    return s_hop_full;
+}
+
+static inline void spu_hop(spu_context* ctx, void (*fn)(spu_context*))
+{
+    extern unsigned g_spu_stack_reset_count;   /* spu_channels.c */
+    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+    if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx);
+    if (__builtin_expect(s_hop_full != 0, 0) && (s_hop_full > 0 || spu_hop_full_read())) {
+        spu_task_launch_check(ctx, (void*)fn);
+        return;
+    }
+    /* What spu_task_launch_check does with every switch off. */
+    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+    t_recent[t_recent_n++ & 31] = pc;
+    if (g_spu_stack_reset_count)
+        spu_check_stack_reset(ctx, fn);
+    if (ctx->steps++ && pc == 0 && !ctx->policy_mode && ctx->image_id > 0) {
+        spu_job_ls0_note(ctx);
+        spu_halt(ctx);
+        return;
+    }
+    if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
+        g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
+}
+
+void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*))
+{
+    spu_hop(ctx, fn);
+}
 
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
