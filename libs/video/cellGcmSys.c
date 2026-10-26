@@ -2253,12 +2253,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * headers, and each NOP went through the whole decode below. The RSX
          * does nothing for them, so the run is passed over at once, up to
          * `put` or the end of this 1 MB IO page (the next word may map
-         * elsewhere). */
+         * elsewhere). Each NOP still spends a word of this tick's budget: the
+         * skip is a faster decode, not a bigger tick, and VF5 depends on the
+         * walker yielding at the cap (it lost 7 milestones when a whole run
+         * cost one word). */
         if (!w && !wdiag) {
             const u32 page_end = (s_fifo_getoff | 0xFFFFFu) + 1u;
             const u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
             u32 off = s_fifo_getoff + 4u, nea = ea + 4u;
-            while (off < lim && !vm_read32(nea)) { off += 4u; nea += 4u; }
+            while (off < lim && budget > 0 && !vm_read32(nea)) { off += 4u; nea += 4u; budget--; }
             if (s_fifo_getoff < put) s_last_ring_off = off;
             s_fifo_getoff = off;
             continue;
