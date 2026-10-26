@@ -419,6 +419,12 @@ typedef struct spu_context {
      * the channel layer does, at every rdch/rchcnt and inside its blocking
      * waits, and halts the SPU there (spu_halt). Cleared by spu_context_init. */
     volatile int stop_request;
+
+    /* Nonzero while this context is in spu_coherency.c's list of reservation
+     * holders, so its GETLLAR can skip the lock-line lock (see
+     * spu_coh_reserve_fast). Written under that lock, read by the context's
+     * own thread. */
+    int coh_listed;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
