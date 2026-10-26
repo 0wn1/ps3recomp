@@ -1668,7 +1668,7 @@ static void test_antialiased_wpos(void)
         /* SQUARE_ROTATED_4 has SQUARE_CENTERED_4's 2x2 grid, and its pipeline. */
         const int built = cases[i].aa == 5 ? 0 : 1;
         CHECK(stub.n_pipeline_create == before + built && stub.n_draw &&
-              strstr(g_wpos_ps, "(input.position)."),
+              strstr(g_wpos_ps, "_rsx_wpos(input.position)"),
               "antialias %u: the WPOS program draws (%d new pipeline)", cases[i].aa, built);
         if (cases[i].line)
             CHECK(strstr(g_wpos_ps, cases[i].line) != NULL,

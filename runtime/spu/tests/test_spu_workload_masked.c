@@ -23,6 +23,9 @@ uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskid, g_ydkj_real_taskset_ea;
 unsigned long long ps3_ms_now(void) { return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_coh_unregister(spu_context* c) { (void)c; }
+void spu_coh_watch_add(spu_coh_watch* w, uint32_t ea, void (*wake)(void*), void* opaque)
+{ (void)w; (void)ea; (void)wake; (void)opaque; }
+void spu_coh_watch_remove(spu_coh_watch* w) { (void)w; }
 void spu_lockline_lock(void) { }
 void spu_lockline_unlock(void) { }
 void spu_mfc_release(spu_context* c) { (void)c; }

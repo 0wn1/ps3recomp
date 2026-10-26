@@ -36,6 +36,11 @@ void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why;
 void rsx_state_init(rsx_state* state) { (void)state; }
 int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
 int  rsx_draw_engine_enabled(void) { return 0; }
+/* The walker hands vertex-program runs here (#554) and asks for a vtable
+ * backend (#466); this fixture has neither. */
+int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{ (void)state; (void)method; (void)src; (void)count; return 0; }
+rsx_backend* rsx_get_backend(void) { return NULL; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }

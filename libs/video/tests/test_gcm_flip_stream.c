@@ -236,8 +236,11 @@ int main(void)
     vm_write32(ctx + 8, cur5 + 12);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(cur5) + 12);
     cellGcm_rsx_process_fifo();
-    check(g_n_zs_state == 2 && g_zs_state[0] == 0 && g_zs_state[1] == 0xFFFFFF00u,
-          "the method state sees 0, then the flip's 0xFFFFFF00");
+    /* With the draw engine up and no vtable backend, #466 hands rsx_state
+     * only methods with outside effects, so the stream's 0 may not reach it;
+     * the flip's reset always does, and is the last word. */
+    check(g_n_zs_state >= 1 && g_zs_state[g_n_zs_state - 1] == 0xFFFFFF00u,
+          "the method state ends on the flip's 0xFFFFFF00");
     check(g_n_zs_engine >= 1 && g_zs_engine[g_n_zs_engine - 1] == 0xFFFFFF00u,
           "the draw engine gets the flip's 0xFFFFFF00 too");
     g_engine_on = 0;

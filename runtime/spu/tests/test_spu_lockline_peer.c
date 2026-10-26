@@ -621,9 +621,9 @@ static void test_ack_keeps_a_concurrent_raise(void)
 }
 
 
-/* Hold the reservation-writer lock while a real MFC producer starts. Its
- * event update must wait: otherwise a peer's LR read/modify/write can overwrite
- * the DMA notification. Atomic fixture flags synchronize the host threads. */
+/* Hold the reservation-writer lock while a real MFC producer starts, and raise
+ * a peer's LR meanwhile: the DMA notification must survive it. Atomic fixture
+ * flags synchronize the host threads. */
 static atomic_int g_raise_entered, g_raise_done;
 static unsigned g_raise_mode;
 static void* raise_thread(void* ignored)
@@ -657,9 +657,9 @@ static void test_producer_keeps_peer_event(unsigned bit)
     }
     while (!atomic_load(&g_raise_entered)) YieldProcessor();
     Sleep(10);
-    TEST("MFC producer serializes with concurrent reservation writer");
-    CHECK(atomic_load(&g_raise_done) == 0);
-    CHECK_EQ_U32(g_a.event_status, 0);
+    /* #418 had the producer wait for this lock; since #492 every event_status
+     * write is an atomic OR/AND, so it need not, and may already be done. What
+     * must hold either way is checked below: neither bit is lost. */
     spu_coh_notify_write(LINE_A);
     spu_lockline_unlock();
     pthread_join(t, NULL);

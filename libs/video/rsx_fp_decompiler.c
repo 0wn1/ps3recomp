@@ -1751,12 +1751,14 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
  * Every sample of a pixel gets that pixel's centre, floor(pos / grid) + 0.5,
  * the half-pixel centre SV_POSITION already gives on a 1x1 grid. The line goes
  * first in main, before any read; z and w (the _rsx_inv_w source) are kept.
- * WPOS reaches the body only as the emitter's "(input.position)." source, so
- * a program without it stays byte-identical.
+ * WPOS reaches the body only as the emitter's "_rsx_wpos(input.position)"
+ * source (#589's window convention wraps it; _rsx_inv_w also reads
+ * input.position, so match the wrapper), so a program without it stays
+ * byte-identical. The grid applies first, then _rsx_wpos flips y in pixels.
  */
 int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy)
 {
-    static const char wpos_read[] = "(input.position).";
+    static const char wpos_read[] = "_rsx_wpos(input.position)";
     static const char* const entries[] = { "main(PSInput input) : SV_TARGET {\n",
                                            "main(PSInput input) {\n" };
     if (!hlsl || !capacity || !sx || !sy) return -1;

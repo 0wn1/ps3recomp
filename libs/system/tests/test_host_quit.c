@@ -18,6 +18,7 @@ uint8_t* vm_base;
 uint32_t ppu_vm_size;
 void np_psnr_pump(void) {}
 void cellMsgDialog_tick(void) {}
+void ps3_np_eula_tick(void) {}
 
 static volatile int s_busy = 1;       /* a save is being written */
 static volatile int s_busy_cleared;   /* ...and it has finished */
