@@ -1930,6 +1930,21 @@ void cellGcm_rsx_process_fifo(void)
     }
 }
 
+/* The methods rsx_process_method acts on beyond its own rsx_state: the notify
+ * and semaphore DMA contexts, the notify write, the back-end label offset and
+ * label writes, and SET_REFERENCE (g_rsx_last_reference). Everything else only
+ * updates state for a vtable backend. */
+static int gcm_legacy_method_has_effect(u32 m)
+{
+    switch (m) {
+    case 0x0050u: case 0x0104u: case 0x0180u: case 0x01A4u:
+    case 0x1D6Cu: case 0x1D70u: case 0x1D74u:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
 static int gcm_get_eq_put(void)
 {
@@ -1954,10 +1969,17 @@ static int gcm_word_diag(void)
 
 /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
  * plus the methods whose answer the walker writes itself. */
-static void gcm_3d_method(rsx_state* st, u32 m, u32 v)
+static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
 {
     extern u32 g_rsx_last_reference;
-    rsx_process_method(st, m, v);
+    /* #466: rsx_state feeds only the legacy vtable backend. With the draw
+     * engine up and no vtable registered, the state it builds is never read,
+     * so only the methods with effects outside it are worth handing over.
+     * The gate lives here rather than at the call sites because #554 funnelled
+     * every 3D method through this function -- there are two callers, and a
+     * gate at one of them only would be a silent half-measure. */
+    if (legacy_state_live || gcm_legacy_method_has_effect(m))
+        rsx_process_method(st, m, v);
     /* NV406E_SET_REFERENCE: queue the fence value for PACED
      * publication (gcm_ref_publish below) instead of letting a
      * later fence in the same batch overwrite it. */
@@ -2021,6 +2043,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
     const int wdiag = gcm_word_diag();
+    /* rsx_state feeds only the legacy vtable backend. With the draw engine
+     * up and no vtable registered, the state it builds is never read, and the
+     * only methods worth handing it are the ones with effects outside it
+     * (gcm_legacy_method_has_effect). RSX_TRACE still sees every method. */
+    static int s_rsx_trace = -1;
+    if (s_rsx_trace < 0) s_rsx_trace = getenv("RSX_TRACE") ? 1 : 0;
+    const int legacy_state_live = rsx_get_backend() != NULL || !rsx_draw_engine_enabled() ||
+                                  s_rsx_trace;
+
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
      * offset in the control register), decoding method headers and following
@@ -2453,7 +2484,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         continue;
                     }
                     for (u32 i = 0; i < count; i++)
-                        gcm_3d_method(&s_state, type == 0 ? method + i * 4 : method, vm_read32(dea + i * 4));
+                        gcm_3d_method(&s_state, type == 0 ? method + i * 4 : method,
+                                      vm_read32(dea + i * 4), legacy_state_live);
                     s_fifo_getoff += 4 + count * 4;
                     continue;
                 }
@@ -2606,7 +2638,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    gcm_3d_method(&s_state, m, vm_read32(dea));
+                    gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
                 } else
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
