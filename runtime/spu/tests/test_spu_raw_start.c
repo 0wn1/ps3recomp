@@ -23,6 +23,8 @@ int g_spu_force_ch_block;
 void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
 PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 void spu_ch_wake(spu_context* c) { (void)c; }
+void spu_coh_unregister(spu_context* c) { (void)c; }
+void spu_mfc_release(spu_context* c) { (void)c; }
 void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*))
 { (void)nid; (void)name; (void)fn; }
 

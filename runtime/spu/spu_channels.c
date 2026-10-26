@@ -235,6 +235,17 @@ static void spu_float_mode_leave(uint64_t outer)
 #endif
 }
 
+/* An external stop (raw SPU SPU_RunCntl = 0) halts the SPU at its next
+ * channel operation. The SPU itself never sees the request; the host thread
+ * that runs it leaves through the spu_run_with_halt landing pad, which is what
+ * the stopping side waits for. */
+static void spu_honour_stop_request(spu_context* ctx)
+{
+    if (!ctx->stop_request) return;
+    ctx->status = SPU_STATUS_STOPPED;
+    spu_halt(ctx);
+}
+
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
@@ -904,8 +915,10 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * by paths that do not wake a stalled writer. A raw SPU's local store
          * is the guest window, not its own buffer. */
         if (ctx->ls != ctx->ls_store)
-            while (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && ctx->status != SPU_STATUS_STOPPED)
+            while (ctx->ch_out_mbox.count >= SPU_MBOX_DEPTH && ctx->status != SPU_STATUS_STOPPED) {
+                spu_honour_stop_request(ctx);
                 Sleep(0);
+            }
         spu_channel_write(&ctx->ch_out_mbox, v);
         /* SPU_DBG_MBOX=1: depth after the write. The image-1 SPUs publish their
          * LS work buffer here (LS 0x11D4) and then poll it, and the guest sets
@@ -1066,6 +1079,10 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     {
         unsigned long long start = GetTickCount64(), next_hb = 2000;
         while (!spu_ch_ready(ctx, channel)) {
+            if (ctx->stop_request) {
+                yz_lockstep_block_end(ctx);
+                spu_honour_stop_request(ctx);
+            }
             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             if (!spu_ch_ready(ctx, channel))
                 SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
@@ -1092,6 +1109,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    spu_honour_stop_request(ctx);
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
           r[channel & 127]++;
@@ -1184,6 +1202,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
  * ===========================================================================*/
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
+    spu_honour_stop_request(ctx);
     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
      * with the pc each SPU is sitting at.
      *
