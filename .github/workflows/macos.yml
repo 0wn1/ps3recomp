@@ -81,6 +81,25 @@ jobs:
                 -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
+      # runtime/spu/tests/test_spu_int_neon.c and test_spu_float_neon.c check the
+      # SIMD helper forms against the exact scalar references. linux.yml runs the
+      # float one under -mavx2; the integer one was referenced by no workflow at
+      # all, so neither had ever been compiled for NEON on a real arm64 host.
+      # v0.18.0 lands four SIMD rewrites of spu_helpers.h, and a mis-merge there
+      # produces silently wrong float results rather than a build error, so these
+      # are the acceptance gate for that wave and they need to actually run.
+      - name: Run the SPU integer helper test (NEON)
+        run: |
+          clang -std=gnu17 -O2 -I include -I runtime/spu \
+                -o /tmp/test_spu_int_neon runtime/spu/tests/test_spu_int_neon.c -lm
+          /tmp/test_spu_int_neon
+
+      - name: Run the SPU float fast-path test (NEON)
+        run: |
+          clang -std=gnu17 -O2 -I include -I runtime/spu \
+                -o /tmp/test_spu_float_neon runtime/spu/tests/test_spu_float_neon.c -lm
+          /tmp/test_spu_float_neon
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
