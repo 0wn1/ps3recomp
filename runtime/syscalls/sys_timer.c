@@ -17,6 +17,7 @@
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #endif
+#include "ps3emu/thread_name.h"
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -419,6 +420,7 @@ static uint64_t timer_now_us(void)
 static DWORD WINAPI timer_thread_proc(LPVOID param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
+    ps3_thread_name("lv2 timer");
 
     while (t->running) {
         DWORD ms = (DWORD)(t->period_usec / 1000);

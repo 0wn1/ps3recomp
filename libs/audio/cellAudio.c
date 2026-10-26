@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <math.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/thread_name.h"
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -563,6 +564,7 @@ static unsigned long long g_audio_underruns;
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
+    ps3_thread_name("audio mix");
     printf("[cellAudio] Mixing thread started\n");
 
     /* The device deadline is every few ms and the guest threads keep every
