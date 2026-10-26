@@ -79,7 +79,7 @@ static void outer(spu_context* c)
     raw->pc=0x2000;spu_task_launch_check(raw,(void*)to_return);
     CHECK(raw->steps==1);
     c->pc=0x1004;g_spu_trampoline_fn=nested_first;spu_drain_call(c,0x1010);
-    CHECK(c->drain_ret_pc==0);
+    CHECK(c->drain_ret_pc==0x101c);   /* #510: the enclosing drain's return pc again */
     raw->pc=0x2004;raw->gpr[6]=spu_link(0x2010);
     g_spu_trampoline_fn=to_return;spu_drain_call(raw,0x2010);CHECK(raw->steps==2);
     free(ls);raw->ls=raw->ls_store;release_context(raw);

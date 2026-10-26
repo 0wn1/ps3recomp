@@ -6051,11 +6051,10 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
                  * a quarter of the game's size had piled up presented one frame
                  * every four seconds or so while the movie's sound played on.
                  * Take the new size as the title's frame size. */
-                if (fc - s_last_present_flip < 2u)
+                if (fc - s_last_clear_boundary_flip < 2u)
                     return;   /* intermediate: keep accumulating, flip stays pending */
                 s_frame_draws_max = s_d3d.draw_count;
             }
-            s_last_present_flip = fc;
             s_last_clear_boundary_flip = fc;
         }
     }

@@ -341,7 +341,7 @@ bool translate(const char* hlsl, int stage, std::string& msl, char* log, u32 log
     std::vector<unsigned int> spirv;
     if (!hlsl_to_spirv(hlsl, lang, spirv, log, log_size)) return false;
     std::vector<char> out(512u * 1024u);
-    if (!spirv_to_msl(spirv, out.data(), (u32)out.size(), log, log_size)) return false;
+    if (!spirv_to_msl(spirv, stage == RSX_SHADER_STAGE_VERTEX, out.data(), (u32)out.size(), log, log_size)) return false;
     msl = out.data();
     return true;
 }
