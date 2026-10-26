@@ -1912,9 +1912,13 @@ static void wprof_note_walker(void)
 static void wprof_note_walker(void) {}
 #endif
 
+/* Host thread that last walked the FIFO, for PS3_SAMPLE_DRAIN. */
+volatile unsigned long g_gcm_drain_tid;
+
 void cellGcm_rsx_process_fifo(void)
 {
     wprof_note_walker();
+    g_gcm_drain_tid = GetCurrentThreadId();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     gcm_rsx_process_fifo_unlocked();
