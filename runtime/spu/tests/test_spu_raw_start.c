@@ -50,6 +50,14 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fp, int* image_id)
         }
     return NULL;
 }
+/* No program here is registered with a masked parameter area. */
+spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
+                                                 uint64_t* fp_out, int* image_id)
+{
+    (void)data; (void)n; (void)fp_out;
+    if (image_id) *image_id = 0;
+    return NULL;
+}
 int spu_run_with_halt(void (*fn)(spu_context*), spu_context* c) { fn(c); return 0; }
 
 static int g_fails;
