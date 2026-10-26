@@ -170,6 +170,8 @@ jobs:
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs) -lm
           /tmp/test_pad_rumble
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_sensor_mode libs/input/tests/test_pad_sensor_mode.c $(sdl2-config --libs) -lm
+          /tmp/test_pad_sensor_mode
 
       # cellPad SDL hot-plug: a controller switched off and on again is
       # reopened into its old port (fake SDL that behaves like sdl2-compat).
