@@ -7,8 +7,8 @@ authors:
 repository-code: "https://github.com/sp00nznet/ps3recomp"
 url: "https://github.com/sp00nznet/ps3recomp"
 license: MIT
-version: "0.17.0"
-date-released: "2026-10-21"
+version: "0.18.0"
+date-released: "2026-10-26"
 abstract: >-
   Static recompilation runtime libraries for PlayStation 3 titles: turns PS3
   binaries into native executables, with no emulator required.
