@@ -111,6 +111,20 @@ static unsigned long long  s_sdl_scan_ms;   /* last device-list scan (pad_now_ms
 static int s_sdl_inited = 0;
 #endif
 
+/* A port with no device behind it: nothing pressed and both sticks CENTRED.
+ * Zero is not neutral for a stick -- 0 is full deflection up / left. Port 0 is
+ * served even with no device (see cellPadGetData), and with the SDL2 backend
+ * and no controller plugged in its state was the zeroed array: every title
+ * read both sticks pushed to the top-left corner. Twisted Metal's car drove
+ * itself in circles and its chase camera pitched up at the sky, so the
+ * player's own vehicle left the screen within seconds of a match starting.
+ * A pad unplugged mid-game kept its last report the same way. */
+static void pad_host_release(PadHostState* hs)
+{
+    memset(hs, 0, sizeof(*hs));
+    hs->analog_lx = hs->analog_ly = 128;
+    hs->analog_rx = hs->analog_ry = 128;
+
 /* One poll at a time: the guest polls from several threads, and a poll that
  * opens or closes a controller must not race another one using it.
  * cellPadSetActDirect takes it too (it talks to the controller). */
@@ -319,7 +333,7 @@ static void pad_poll_xinput(void)
         DWORD result = p_xi_get_state ? p_xi_get_state((DWORD)i, &state)
                                       : ERROR_DEVICE_NOT_CONNECTED;
         if (result != ERROR_SUCCESS) {
-            s_host_state[i].connected = 0;
+            pad_host_release(&s_host_state[i]);
             continue;
         }
 
@@ -465,7 +479,7 @@ static void pad_sdl_close(int p, int gone)
     s_sdl_controllers[p] = NULL;
     s_sdl_ids[p] = -1;
     memset(&s_rumble[p], 0, sizeof s_rumble[p]);
-    s_host_state[p].connected = 0;
+    pad_host_release(&s_host_state[p]);
 }
 
 /* Open every game controller SDL lists that no port has yet. */
@@ -536,7 +550,7 @@ static void pad_poll_sdl2(void)
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         SDL_GameController* gc = s_sdl_controllers[i];
         if (!gc) {
-            s_host_state[i].connected = 0;
+            pad_host_release(&s_host_state[i]);
             memset(&s_rumble[i], 0, sizeof s_rumble[i]);
             continue;
         }
@@ -694,7 +708,8 @@ s32 cellPadInit(u32 max_connect)
     s_pad_initialized = 1;
     s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
     memset(s_port_setting, 0, sizeof(s_port_setting));
-    memset(s_host_state, 0, sizeof(s_host_state));
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+        pad_host_release(&s_host_state[i]);
 
     pad_lock();
     pad_init_backend();
