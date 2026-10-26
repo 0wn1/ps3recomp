@@ -287,6 +287,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * an earlier run would be restored over this job's arguments. */
     { extern void spu_irq_regs_forget(spu_context*); spu_irq_regs_forget(ctx); }
     ctx->steps = 0;   /* fresh run: step 0 is the entry */
+    if (g_spu_direct < 0) spu_direct_init();   /* PS3_SPU_DIRECT, spu_context.h */
     /* The host stack is empty here by definition, so no lifted caller frame
      * is live. A persistent context (a SPURS policy module re-entered every
      * scheduling quantum) otherwise carries the depth its last quantum
@@ -1938,14 +1939,21 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
  * writer and are immutable after publication. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
 unsigned g_spu_stack_reset_count;
+/* Nonzero at (entry >> 2) & 1023 of every registered entry, so SPU_DIRECT
+ * (spu_context.h) can tell with one load that a transfer needs the drain's
+ * stack-reset check. Collisions only cost a trampoline step. */
+uint8_t g_spu_stack_reset_hint[1024];
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
     /* Registrations have one writer; publish a complete new slot before a
-     * reader observes its count, including registration during a live run. */
+     * reader observes its count, including registration during a live run.
+     * The hint byte is written before that release store for the same reason:
+     * a reader that sees the new count must also see the hint. */
     unsigned n = __atomic_load_n(&g_spu_stack_reset_count, __ATOMIC_ACQUIRE);
     if (n < 16) {
         s_stack_reset[n].entry = entry & SPU_LS_MASK;
         s_stack_reset[n].image_id = image_id;
+        g_spu_stack_reset_hint[((entry & SPU_LS_MASK) >> 2) & 1023u] = 1;
         __atomic_store_n(&g_spu_stack_reset_count, n + 1, __ATOMIC_RELEASE);
     }
 }
