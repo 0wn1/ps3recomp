@@ -117,6 +117,31 @@ jobs:
             echo "no AVX2 on this runner: skipped"
           fi
 
+      # runtime/spu/tests/test_spu_int_x86.c checks #512's SSE4.1 and AVX2 integer
+      # and quadword-shift forms against their scalar spu_X_ref references. #512
+      # added the file and wired it into nothing -- no workflow step, no CMake
+      # target. This step is @rigaz29's from #550, retargeted: #550 covered the
+      # same helper set and was closed as a subset of #512, and carrying its CI
+      # wiring over was promised in that review.
+      - name: Run the SPU integer helper test (SSE4.1)
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -O2 -msse4.1 -I include -I runtime -I runtime/spu \
+            -o /tmp/test_spu_int_x86_sse41 runtime/spu/tests/test_spu_int_x86.c -lm
+          /tmp/test_spu_int_x86_sse41
+
+      # The AVX2 forms of the same helpers, where the runner has AVX2.
+      - name: Run the SPU integer helper test (AVX2)
+        run: |
+          if grep -q avx2 /proc/cpuinfo; then
+            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+              -std=gnu17 -O2 -mavx2 -mfma -I include -I runtime -I runtime/spu \
+              -o /tmp/test_spu_int_x86_avx2 runtime/spu/tests/test_spu_int_x86.c -lm
+            /tmp/test_spu_int_x86_avx2
+          else
+            echo "no AVX2 on this runner: skipped"
+          fi
+
       # The AVX2 estimate, interpolate and conversion helpers must match the scalar ones bit for bit.
       - name: Run the SPU estimate/conversion test (AVX2)
         run: |
