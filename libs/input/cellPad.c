@@ -124,6 +124,7 @@ static void pad_host_release(PadHostState* hs)
     memset(hs, 0, sizeof(*hs));
     hs->analog_lx = hs->analog_ly = 128;
     hs->analog_rx = hs->analog_ry = 128;
+}
 
 /* One poll at a time: the guest polls from several threads, and a poll that
  * opens or closes a controller must not race another one using it.
