@@ -340,7 +340,7 @@ static const char* input_expr(u32 input_src)
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
-    case 0x0: return "input.position"; /* WPOS */
+    case 0x0: return "_rsx_wpos(input.position)"; /* WPOS (window origin applied below) */
     /* RSX clamps fragment color-input reads before swizzle/abs/negate.
      * Texture coordinates and the vertex output registers remain unbounded. */
     case 0x1: return "saturate(input.col0)"; /* COL0 */
@@ -1276,6 +1276,18 @@ static int rsx_fp_decompile_internal(
             "#else\n"
             "#define _rsx_inv_w(p) (1.0 / (p).w)\n"
             "#endif\n");
+    /* WPOS in the RSX window convention. The host position has its origin at the
+     * top left; with SET_SHADER_WINDOW origin BOTTOM the RSX counts y up from the
+     * bottom edge. A full-screen pass that builds its UV from it, e.g.
+     * uv = wpos * (1/W, -1/H) + (0, 1), mirrored its source when it read the host y.
+     * The draw engine passes the window height in fp_alpha.y when the origin is
+     * BOTTOM (0 otherwise) and a pixel-center bias in fp_alpha.z (-0.5 for INTEGER
+     * centers, 0 for HALF). A backend that leaves both 0 gets the host position. */
+    if (strstr(o.p, "_rsx_wpos("))
+        out_puts(&p, buffered
+            ? "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
+              "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z, (p).z, (p).w)\n"
+            : "#define _rsx_wpos(p) (p)\n");
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the

@@ -3154,7 +3154,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
         memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
-      alpha[1] = alpha[2] = alpha[3] = 0.0f; }
+      /* Window convention for WPOS (rsx_fp_decompiler.c, _rsx_wpos): SET_SHADER_WINDOW
+       * height in bits 0-11, origin (1 = BOTTOM) in 12-15, pixel centers (1 = INTEGER)
+       * in 16-19. */
+      const u32 win = rsx_dsp_reg(&g.rsx, 0x1D88);
+      alpha[1] = ((win >> 12) & 0xFu) ? (float)(win & 0xFFFu) : 0.0f;
+      alpha[2] = ((win >> 16) & 0xFu) ? -0.5f : 0.0f;
+      alpha[3] = 0.0f; }
 
     pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
 
